@@ -1,0 +1,219 @@
+# Plan de projet — DAW en Rust (apprentissage audio temps réel)
+
+**Objectif du projet** : apprentissage profond de l'audio temps réel (architecture, DSP, concurrence), sans contrainte de deadline. Chaque phase a un critère de sortie mesurable — ne pas passer à la phase suivante tant que le critère n'est pas vérifié objectivement (mesure, pas impression).
+
+**Principe architectural non négociable** : le thread audio (callback `cpal`) ne fait jamais d'allocation, de lock, d'I/O disque/réseau, ni d'attente bloquante. Toute communication avec ce thread passe par des structures lock-free. C'est la règle centrale de tout le projet.
+
+---
+
+## Structure du projet (workspace Cargo)
+
+```
+daw/
+├── crates/
+│   ├── engine-core/      # graphe audio, nodes, scheduling sample-accurate
+│   ├── engine-io/        # cpal wrapper, gestion devices, callback
+│   ├── engine-dsp/       # filtres, effets, oscillateurs
+│   ├── engine-io-file/   # décodage via symphonia, streaming disque
+│   ├── engine-midi/      # I/O MIDI (midir), parsing (midly)
+│   ├── project-model/    # état projet, sérialisation, undo/redo
+│   ├── ui/               # egui/eframe
+│   └── plugin-host/      # phase 7, séparée
+├── tests/
+│   ├── dsp_validation/   # tests spectraux (rustfft)
+│   └── stress/           # charge CPU, nombre de pistes, durée
+└── docs/
+    └── architecture.md   # décisions d'architecture, journal de bord
+```
+
+Séparer `engine-core` de `ui` dès le départ, même en phase 0 — ça force la discipline de ne jamais coupler l'état audio à l'état UI, et ça évite une refonte douloureuse en phase 4.
+
+---
+
+## Phase 0 — Fondations du temps réel
+**Durée estimée** : 2-4 semaines
+**But** : comprendre la contrainte réelle du callback audio avant d'ajouter la moindre complexité métier.
+
+### Tâches
+- [x] Setup `cpal` : énumérer les devices, ouvrir un stream de sortie stéréo, callback vide qui écrit du silence.
+- [x] Générer un sinus dans le callback (état minimal : phase courante, incrémentée à chaque sample).
+- [x] Ajouter un canal de contrôle : `rtrb::RingBuffer` (SPSC) pour envoyer une nouvelle fréquence depuis un thread "contrôle" séparé (simulateur simple, pas encore d'UI).
+- [x] Mesurer et logger les xruns/underruns exposés par `cpal` (ou détectés manuellement via timestamp du callback).
+- [ ] Écrire un test de charge : stream ouvert 30 minutes, changement de fréquence toutes les secondes, aucun underrun.
+
+### Points d'attention
+- Le sample rate et la taille de buffer ne sont pas garantis stables sur tous les OS — gère le cas où `cpal` te donne un buffer de taille variable d'un callback à l'autre.
+- Ne fais **aucun** `println!` dans le callback (I/O bloquante) — logge via un ring buffer séparé lu par un thread dédié si tu veux du diagnostic en direct.
+
+### Critère de sortie
+Stream stable 10+ minutes sans underrun, changement de paramètre en direct sans clic ni glitch audible.
+
+### Ressources
+- Documentation `cpal` (exemples du repo GitHub `RustAudio/cpal`)
+- Article de référence : "Real-time audio programming 101" (Ross Bencina) — les principes s'appliquent tels quels en Rust.
+
+---
+
+## Phase 1 — Lecture mono-piste avec effet
+**Durée estimée** : 1-2 mois
+**But** : lire un vrai fichier audio avec transport complet, et faire vivre ton premier nœud DSP dans le flux temps réel.
+
+### Tâches
+- [ ] Intégrer `symphonia` pour décoder mp3/flac/wav en PCM.
+- [ ] Thread de préchargement disque : lit des chunks à l'avance dans un ring buffer plus grand (quelques secondes de marge), jamais dans le callback audio.
+- [ ] Transport : play / pause / seek / loop. Le seek doit vider proprement le ring buffer de préchargement et redémarrer la lecture au bon offset sans glitch.
+- [ ] Implémenter un filtre biquad résonant (RBJ cookbook — low-pass, high-pass) comme struct qui expose `process_sample(&mut self, x: f32) -> f32`.
+- [ ] Interpolation des coefficients du filtre entre deux mises à jour de paramètre (éviter le zipper noise) — recalcul progressif sur N samples, pas un switch brutal.
+- [ ] Test spectral : sweep sinusoïdal en entrée, FFT en sortie, vérifier la pente de coupure attendue (ex. -12dB/octave pour un biquad simple).
+
+### Points d'attention
+- Le seek pendant lecture est un point classique de bug : si tu ne resynchronises pas le thread de préchargement avec la nouvelle position, tu lis de l'audio obsolète pendant quelques centaines de ms.
+- VBR (bitrate variable) complique le mapping temps → position dans le fichier compressé — `symphonia` gère ça, mais comprends comment avant de debugger un seek qui dérive.
+
+### Critère de sortie
+Lecture d'un fichier de 10+ minutes avec seeks répétés sans clic audible ; filtre modulable en direct sans zipper noise, validé par mesure FFT et pas seulement à l'oreille.
+
+---
+
+## Phase 2 — Graphe audio multi-piste
+**Durée estimée** : 2-3 mois
+**But** : passer d'un flux linéaire à un vrai graphe de traitement, avec plusieurs pistes qui se mixent.
+
+### Tâches
+- [ ] Définir le trait `Node` : `fn process(&mut self, input: &mut AudioBuffer)`.
+- [ ] Implémenter le tri topologique du graphe (pistes → bus → master) — recalculé à chaque modification de routing, jamais dans le callback.
+- [ ] Nodes de base : gain, pan (loi de panoramique constante en puissance, pas linéaire), mute, solo (le solo doit couper les autres pistes sans qu'elles cessent de tourner en arrière-plan si tu veux un solo "safe" sans glitch au relâchement).
+- [ ] Automation : rampes de paramètres interpolées sample-accurate, écrites depuis un thread externe via message lock-free consommé au début de chaque callback.
+- [ ] Bus master avec limiteur simple en sortie (protection contre le clipping numérique pendant les tests).
+- [ ] Test de charge : 8, puis 16 pistes simultanées, mesure du CPU par piste, identification du goulot d'étranglement (allocation cachée, copie de buffer superflue).
+
+### Points d'attention
+- Le tri topologique doit être recalculé hors du thread audio et livré au thread audio via un swap atomique de graphe (double-buffering), jamais modifié en place pendant qu'il tourne.
+- Attention aux copies de buffer implicites (`Vec::clone` caché dans un `.collect()`) — chaque copie inutile dans le chemin audio est un risque de latence.
+
+### Critère de sortie
+8 pistes mixées simultanément, paramètres (gain/pan/mute/solo) modifiables en live sans glitch, usage CPU mesuré et stable sur 30 minutes de lecture continue.
+
+---
+
+## Phase 3 — Séquenceur & MIDI
+**Durée estimée** : 1-2 mois
+**But** : ajouter un synthé interne piloté par MIDI, avec scheduling sample-accurate.
+
+### Tâches
+- [ ] I/O MIDI externe via `midir` (réception de notes depuis un contrôleur/clavier).
+- [ ] Parsing de fichiers `.mid` via `midly` pour rejouer une séquence enregistrée.
+- [ ] Synthé simple : oscillateur (sine/saw/square) + enveloppe ADSR par voix, polyphonie basique (pool de voix réutilisables, pas d'allocation à chaque note).
+- [ ] Scheduling intra-buffer : une note qui démarre au milieu d'un buffer de 512 samples doit démarrer exactement au bon sample, pas au début du buffer suivant (sinon dérive audible sur un tempo rapide).
+- [ ] Piano roll minimal en mémoire (liste de notes avec timestamp/durée/pitch/vélocité) pour tester le scheduling sans dépendre du matériel MIDI.
+
+### Points d'attention
+- Le piège classique : traiter tout le buffer d'un coup puis "appliquer" les events MIDI au début du buffer suivant. Ça introduit jusqu'à ~10ms de latence perçable au tempo élevé. Découpe le buffer aux points d'arrivée des events si tu veux du vrai sample-accurate.
+
+### Critère de sortie
+Lecture d'un fichier MIDI sans décalage audible même à tempo élevé (160+ BPM), réaction en direct à un contrôleur externe avec latence perçue nulle.
+
+---
+
+## Phase 4 — Interface graphique
+**Durée estimée** : 2-3 mois (parallélisable avec la phase 5)
+**But** : rendre le projet utilisable sans terminal, sans jamais coupler l'UI à l'état audio directement.
+
+### Tâches
+- [ ] Setup `egui` + `eframe`, boucle de rendu à 60fps découplée du thread audio.
+- [ ] Vue transport (play/pause/stop/position) qui lit l'état audio via un canal de lecture seule (ex. `arc-swap` sur un snapshot d'état), jamais un accès direct partagé.
+- [ ] Mixer : faders de gain, pan, mute/solo par piste, écriture des changements via le même canal de contrôle lock-free que la phase 2.
+- [ ] Rendu de waveform : pré-calcule des min/max par bloc de N samples (peak file), ne recharge jamais le fichier entier pour l'affichage.
+- [ ] Timeline avec placement de clips (drag & drop basique).
+- [ ] Undo/redo : pile de commandes réversibles sur le `project-model` (état projet), complètement séparée de l'état temps réel du moteur audio.
+
+### Points d'attention
+- Ne mélange jamais "état projet" (ce qui est sauvegardé, undoable) et "état moteur audio temps réel" (ce qui tourne dans le callback) — ce sont deux sources de vérité différentes qui se synchronisent via messages, pas une seule structure partagée.
+
+### Critère de sortie
+UI fluide à 60fps avec 8 pistes en lecture, chaque action a un undo qui restaure l'état exact précédent, aucune interaction UI ne cause de glitch audio.
+
+---
+
+## Phase 5 — Effets intégrés
+**Durée estimée** : 1-2 mois
+**But** : enrichir la boîte à outils DSP avec des effets standards, testés rigoureusement.
+
+### Tâches
+- [ ] EQ paramétrique multi-bande (extension du biquad de la phase 1).
+- [ ] Compresseur (détection d'enveloppe RMS ou peak, ratio/threshold/attack/release).
+- [ ] Reverb algorithmique (Schroeder ou Freeverb — comb filters + all-pass en série).
+- [ ] Delay synchronisé au tempo (conversion BPM → samples de délai, avec feedback contrôlé).
+- [ ] Suite de tests DSP systématique : sweep sinusoïdal + FFT pour chaque effet, comparaison à la réponse théorique attendue.
+
+### Points d'attention
+- Ne valide jamais un effet "à l'oreille" seul — un compresseur qui semble bien sonner peut avoir un bug de détection d'enveloppe qui ne se voit qu'en traçant la courbe de gain réduction dans le temps.
+
+### Critère de sortie
+Chaque effet a une réponse mesurée (fréquentielle ou temporelle selon le type) conforme à la théorie, pas seulement une validation subjective.
+
+---
+
+## Phase 6 — Persistance de projet
+**Durée estimée** : 2-4 semaines
+**But** : sauvegarder et recharger un projet complet sans perte de données.
+
+### Tâches
+- [ ] Sérialisation `serde` de l'état `project-model` complet (pistes, clips, automation, routing).
+- [ ] Stratégie de versioning du format dès le premier commit (numéro de version dans le fichier, migration explicite si le format change).
+- [ ] Test de round-trip : sauvegarde → rechargement → comparaison bit-à-bit de l'état projet.
+- [ ] Gestion des chemins de fichiers audio relatifs vs absolus (portabilité d'un projet entre machines).
+
+### Critère de sortie
+Sauvegarde/rechargement d'un projet complexe (16 pistes, automation, effets) sans perte de données, y compris après un changement mineur de version du format (migration testée).
+
+---
+
+## Phase 7 — Hébergement de plugins VST3/CLAP (optionnelle, séparée)
+**Durée estimée** : 3-6+ mois
+**À ne démarrer que si les phases 1-3 sont stables sous charge réelle, pas juste sur ton exemple de test.**
+
+### Pourquoi c'est à part
+Le rapport apprentissage/effort est mauvais comparé aux phases précédentes : tu vas surtout apprendre de la plomberie FFI (binding C++ pour VST3, gestion de fenêtre GUI native d'un process tiers, isolation de crash) plutôt que de l'audio. Les phases 1-3 concentrent 80% de la valeur pédagogique du projet.
+
+### Tâches (si tu choisis de la faire quand même)
+- [ ] Étudier `vst3-sys` (binding FFI vers le SDK C++ Steinberg) — comprendre le modèle de composants VST3 (edit controller, processor, IPlugView).
+- [ ] Alternative plus propre : `clap-sys` (ABI en C, plus simple à binder) — écosystème de plugins existants plus restreint.
+- [ ] Isolation de crash : un plugin tiers qui segfault ne doit pas planter l'hôte (sandbox par process séparé, communication IPC — sujet à lui seul).
+- [ ] Embedding de la fenêtre GUI du plugin dans ta propre UI `egui` (gestion de handle de fenêtre natif, différent par OS).
+
+### Critère de sortie
+Chargement d'au moins un plugin VST3 ou CLAP réel, traitement audio à travers ce plugin sans glitch, crash du plugin isolé sans faire planter l'hôte.
+
+---
+
+## Vue d'ensemble et estimation
+
+| Phase | Durée estimée | Cumulé |
+|---|---|---|
+| 0 — Fondations temps réel | 2-4 semaines | 1 mois |
+| 1 — Lecture mono-piste | 1-2 mois | ~3 mois |
+| 2 — Graphe multi-piste | 2-3 mois | ~6 mois |
+| 3 — Séquenceur & MIDI | 1-2 mois | ~7,5 mois |
+| 4 — Interface graphique | 2-3 mois (parallèle) | ~9,5 mois |
+| 5 — Effets intégrés | 1-2 mois | ~11 mois |
+| 6 — Persistance | 2-4 semaines | ~12 mois |
+| **Total phases 0-6** | | **~9 à 14 mois** |
+| 7 — Plugin hosting (optionnel) | 3-6+ mois | +3 à 6 mois |
+
+**Estimation réaliste en temps partiel** (soirs/weekends) : applique une marge de type Hofstadter — compte **1,5 à 2 ans** pour un moteur stable phases 0-6, sans plugin hosting. Ce n'est pas pessimiste, c'est la norme documentée pour ce type de projet solo hors temps plein.
+
+---
+
+## Journal de bord (à tenir à jour)
+
+Section à compléter au fil du projet : décisions d'architecture prises, bugs non triviaux résolus (et pourquoi ils arrivaient), benchmarks CPU par phase. C'est ce journal qui devient la vraie preuve de compétence si tu veux en parler en entretien — pas le code final seul.
+
+| Date | Phase | Décision / bug résolu | Pourquoi |
+|---|---|---|---|
+| 2026-09-19 | 0 | Passage en workspace Cargo (`engine-dsp`, `engine-io`) dès la phase 0. | Force la séparation DSP pur / I/O ; `engine-dsp` se teste sans carte son. |
+| 2026-09-19 | 0 | Logique du callback isolée dans `SineProcessor`, indépendante de cpal ; callback enveloppé dans `assert_no_alloc` + test `no_alloc`. | Rend la règle « zéro allocation dans le thread audio » vérifiable automatiquement, pas par relecture. |
+| 2026-09-19 | 0 | Xruns détectés par deux voies : `ErrorKind::Xrun` de cpal 0.18 et saut de timestamp de playback expliqué par un callback en retard (sinon `LatencyShift`). | Le plugin ALSA `pulse` révise son estimation de latence au démarrage : un saut de playback seul donnait de faux xruns. |
+| 2026-09-19 | 0 | Error callback : compteurs atomiques par `ErrorKind`, sans formatage ni allocation. | Un compteur global cachait 3,9 M de `BackendError` (worker ALSA de cpal en boucle sur une erreur du plugin `pulse`). |
+| 2026-09-19 | 0 | **Bug environnement** : sous WSLg, le stream se dégrade systématiquement vers 70-80 s (ALSA 512/1365 frames, host PulseAudio défaut/1024). Callback < 3 % de charge mais appelé de moins en moins souvent. | Point commun unique : le sink RDP de WSLg. Validation temps réel de la phase 0 à faire en natif Windows (WASAPI). |
+| 2026-09-19 | 0 | Limite connue du détecteur : un ralentissement progressif des callbacks avec playback figé est classé `LatencyShift`, pas xrun. | À corriger par un suivi de dérive cumulée (frames livrées vs temps écoulé). |

@@ -1,0 +1,19 @@
+[package]
+name = "engine-io"
+description = "Audio device I/O: cpal stream, real-time callback, control and diagnostics channels."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+engine-dsp.workspace = true
+cpal.workspace = true
+rtrb.workspace = true
+assert_no_alloc.workspace = true
+
+[features]
+# Native PulseAudio host (pure Rust client), selectable with `EngineOptions::host`.
+pulseaudio = ["cpal/pulseaudio"]
+
+[lints]
+workspace = true
