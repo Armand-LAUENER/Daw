@@ -162,7 +162,13 @@ fn main() -> ExitCode {
         println!("PASS: no xrun");
         ExitCode::SUCCESS
     } else {
-        println!("FAIL: {} xrun(s) ({} backend, {} detected)", s.total_xruns(), s.backend_xruns, s.detected_xruns);
+        println!(
+            "FAIL: {} xrun(s) ({} backend, {} detected, {} starvation)",
+            s.total_xruns(),
+            s.backend_xruns,
+            s.detected_xruns,
+            s.starvations
+        );
         ExitCode::FAILURE
     }
 }
@@ -173,13 +179,14 @@ fn print_event(t: Duration, event: &RtEvent) {
 
 fn print_status(t: Duration, s: &StatsSnapshot) {
     println!(
-        "[{:>8.2}s] callbacks {} | frames {} | xruns {} (backend {}, detected {}) | latency shifts {} | overloads {} | max load {:.1}%",
+        "[{:>8.2}s] callbacks {} | frames {} | xruns {} (backend {}, detected {}, starvation {}) | latency shifts {} | overloads {} | max load {:.1}%",
         t.as_secs_f64(),
         s.callbacks,
         s.frames,
         s.total_xruns(),
         s.backend_xruns,
         s.detected_xruns,
+        s.starvations,
         s.latency_shifts,
         s.overloads,
         s.max_load_permille as f64 / 10.0,

@@ -14,7 +14,7 @@ mod stream;
 
 pub use control::Command;
 pub use diagnostics::{
-    CallbackTiming, RtEvent, STREAM_ERROR_KINDS, Stats, StatsSnapshot, TimingAnomaly, XrunDetector, XrunSource,
+    CallbackTiming, DriftMonitor, RtEvent, STREAM_ERROR_KINDS, Stats, StatsSnapshot, TimingAnomaly, XrunDetector, XrunSource,
 };
 pub use processor::SineProcessor;
 pub use stream::{AudioEngine, DeviceSummary, EngineError, EngineOptions, StreamInfo, list_output_devices};

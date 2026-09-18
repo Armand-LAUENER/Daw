@@ -7,7 +7,7 @@ use rtrb::{Consumer, Producer};
 
 use crate::control::Command;
 use crate::diagnostics::{
-    CallbackTiming, OVERLOAD_THRESHOLD_PERMILLE, RtEvent, Stats, TimingAnomaly, XrunDetector, XrunSource,
+    CallbackTiming, DriftMonitor, OVERLOAD_THRESHOLD_PERMILLE, RtEvent, Stats, TimingAnomaly, XrunDetector, XrunSource,
 };
 
 const FREQ_GLIDE_MS: f32 = 10.0;
@@ -27,6 +27,7 @@ pub struct SineProcessor {
     events: Producer<RtEvent>,
     stats: Arc<Stats>,
     xruns: XrunDetector,
+    drift: DriftMonitor,
     sample_rate: u32,
     callback_index: u64,
     last_frames: u32,
@@ -52,6 +53,7 @@ impl SineProcessor {
             events,
             stats,
             xruns: XrunDetector::new(sample_rate),
+            drift: DriftMonitor::new(sample_rate),
             sample_rate,
             callback_index: 0,
             last_frames: 0,
@@ -106,6 +108,13 @@ impl SineProcessor {
             });
         }
         self.last_frames = frames;
+
+        if let Some(t) = timing
+            && let Some(lost_frames) = self.drift.observe(t.callback_ns, frames)
+        {
+            self.stats.starvations.fetch_add(1, Ordering::Relaxed);
+            self.emit(RtEvent::Xrun { source: XrunSource::Starvation, callback_index: self.callback_index, lost_frames });
+        }
 
         let anomaly = timing.and_then(|t| self.xruns.observe(t, frames));
         match anomaly {
