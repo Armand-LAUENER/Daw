@@ -152,8 +152,13 @@ fn main() -> ExitCode {
     println!("\n=== summary ===");
     print_status(started.elapsed(), &s);
     println!(
-        "commands sent {sent}, applied {} | buffer frames min {} max {} | events dropped {} | other stream errors {}",
-        s.commands_applied, s.min_buffer_frames, s.max_buffer_frames, s.dropped_events, s.stream_errors
+        "commands sent {sent}, applied {}, rejected {} | buffer frames min {} max {} | events dropped {} | other stream errors {}",
+        s.commands_applied,
+        s.commands_rejected,
+        s.min_buffer_frames,
+        s.max_buffer_frames,
+        s.dropped_events,
+        s.stream_errors
     );
     for (kind, n) in s.error_breakdown() {
         println!("  stream error {kind}: {n}");
