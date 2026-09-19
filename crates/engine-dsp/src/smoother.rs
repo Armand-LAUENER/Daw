@@ -41,8 +41,9 @@ impl LinearSmoother {
         let out = self.current;
         if self.remaining > 0 {
             self.remaining -= 1;
-            // Land exactly on the target to avoid accumulated float error.
-            self.current = if self.remaining == 0 { self.target } else { self.current + self.step };
+            // Derived from the target instead of accumulated: rounding errors do not
+            // build up, the ramp never overshoots, and it lands exactly on the target.
+            self.current = self.target - self.step * self.remaining as f32;
         }
         out
     }

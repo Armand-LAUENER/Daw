@@ -32,6 +32,22 @@ impl Default for EngineOptions {
     }
 }
 
+impl EngineOptions {
+    /// Checks the values the audio thread would otherwise have to guard against.
+    pub fn validate(&self) -> Result<(), EngineError> {
+        if !(self.initial_freq.is_finite() && self.initial_freq >= 0.0) {
+            return Err(EngineError::InvalidOption("initial frequency must be finite and non-negative"));
+        }
+        if !(0.0..=1.0).contains(&self.gain) {
+            return Err(EngineError::InvalidOption("gain must be within 0..=1"));
+        }
+        if self.buffer_frames == Some(0) {
+            return Err(EngineError::InvalidOption("buffer size must be at least one frame"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StreamInfo {
     pub host: String,
@@ -55,6 +71,7 @@ pub enum EngineError {
     NoHost(String),
     NoDevice(Option<String>),
     UnsupportedFormat(SampleFormat),
+    InvalidOption(&'static str),
     Backend(cpal::Error),
 }
 
@@ -68,6 +85,7 @@ impl fmt::Display for EngineError {
             Self::NoDevice(None) => write!(f, "no default output device"),
             Self::NoDevice(Some(q)) => write!(f, "no output device matching {q:?}"),
             Self::UnsupportedFormat(fmt_) => write!(f, "unsupported sample format {fmt_}"),
+            Self::InvalidOption(msg) => write!(f, "invalid engine option: {msg}"),
             Self::Backend(e) => write!(f, "audio backend error: {e}"),
         }
     }
@@ -98,6 +116,7 @@ impl AudioEngine {
     /// Returns the command producer separately: it belongs to the control
     /// side and can be moved to any thread.
     pub fn start_sine(opts: &EngineOptions) -> Result<(Self, Producer<Command>), EngineError> {
+        opts.validate()?;
         let host = select_host(opts.host.as_deref())?;
         let device = find_output_device(&host, opts.device.as_deref())?;
         let supported = device.default_output_config()?;
@@ -158,7 +177,7 @@ where
             let timing = CallbackTiming { callback_ns: ts.callback.as_nanos(), playback_ns: ts.playback.as_nanos() };
             processor.process(out, channels, Some(timing));
             let elapsed = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-            processor.record_load(elapsed, (out.len() / channels) as u32);
+            processor.record_load(elapsed, (out.len() / channels.max(1)) as u32);
         });
     };
 
@@ -238,4 +257,54 @@ pub fn list_output_devices(host: Option<&str>) -> Result<Vec<DeviceSummary>, Eng
             }
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::STREAM_ERROR_KINDS;
+
+    #[test]
+    fn error_kind_labels_match_their_index() {
+        let kinds = [
+            ErrorKind::DeviceBusy,
+            ErrorKind::DeviceChanged,
+            ErrorKind::DeviceNotAvailable,
+            ErrorKind::HostUnavailable,
+            ErrorKind::InvalidInput,
+            ErrorKind::PermissionDenied,
+            ErrorKind::RealtimeDenied,
+            ErrorKind::ResourceExhausted,
+            ErrorKind::StreamInvalidated,
+            ErrorKind::UnsupportedConfig,
+            ErrorKind::UnsupportedOperation,
+            ErrorKind::Xrun,
+            ErrorKind::BackendError,
+            ErrorKind::Other,
+        ];
+        for kind in kinds {
+            assert_eq!(STREAM_ERROR_KINDS[error_kind_index(kind)], format!("{kind:?}"));
+        }
+    }
+
+    #[test]
+    fn default_options_are_valid() {
+        assert!(EngineOptions::default().validate().is_ok());
+    }
+
+    #[test]
+    fn invalid_options_are_rejected() {
+        let base = EngineOptions::default();
+        let invalid = [
+            EngineOptions { initial_freq: f32::NAN, ..base.clone() },
+            EngineOptions { initial_freq: -1.0, ..base.clone() },
+            EngineOptions { initial_freq: f32::INFINITY, ..base.clone() },
+            EngineOptions { gain: f32::NAN, ..base.clone() },
+            EngineOptions { gain: 1.5, ..base.clone() },
+            EngineOptions { buffer_frames: Some(0), ..base.clone() },
+        ];
+        for opts in invalid {
+            assert!(matches!(opts.validate(), Err(EngineError::InvalidOption(_))), "{opts:?} accepted");
+        }
+    }
 }

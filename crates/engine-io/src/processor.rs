@@ -42,12 +42,15 @@ impl SineProcessor {
         events: Producer<RtEvent>,
         stats: Arc<Stats>,
     ) -> Self {
+        // Runs on the control side, so failing loudly is fine: a NaN here would
+        // silence the stream for good (see `apply_commands`).
+        assert!(initial_freq.is_finite() && gain.is_finite(), "initial frequency and gain must be finite");
         let sr = sample_rate as f32;
         let mut fade_in = LinearSmoother::with_duration(0.0, GAIN_RAMP_MS, sr);
-        fade_in.set_target(gain);
+        fade_in.set_target(gain.clamp(0.0, 1.0));
         Self {
             osc: SineOsc::new(sr),
-            freq: LinearSmoother::with_duration(initial_freq, FREQ_GLIDE_MS, sr),
+            freq: LinearSmoother::with_duration(initial_freq.clamp(0.0, sr * 0.5), FREQ_GLIDE_MS, sr),
             gain: fade_in,
             commands,
             events,
@@ -67,6 +70,10 @@ impl SineProcessor {
         T: Sample + FromSample<f32>,
     {
         let frames = (out.len() / channels.max(1)) as u32;
+        if channels == 0 || frames == 0 {
+            // Nothing to play; ignoring it keeps the buffer-size and timing history intact.
+            return;
+        }
         self.track_buffer(frames, timing);
         self.apply_commands();
 
@@ -297,6 +304,29 @@ mod tests {
         h.proc.process(&mut buf, 1, None);
         h.proc.record_load(10_000_000, 480); // 10 ms for a 10 ms buffer
         assert_eq!(h.events.pop(), Ok(RtEvent::Overload { callback_index: 0, load_permille: 1000 }));
+    }
+
+    #[test]
+    fn empty_buffer_is_ignored() {
+        let mut h = harness(440.0);
+        let mut buf = vec![0.0f32; 512];
+        h.proc.process(&mut buf, 1, None);
+        h.proc.process(&mut [0.0f32; 0], 1, None);
+        h.proc.process(&mut [0.0f32; 1], 2, None); // less than one frame
+        h.proc.process(&mut [0.0f32; 4], 0, None);
+        h.proc.process(&mut buf, 1, None);
+
+        assert!(h.events.pop().is_err(), "an empty buffer was reported as a size change");
+        let s = h.stats.snapshot();
+        assert_eq!((s.callbacks, s.min_buffer_frames), (2, 512));
+    }
+
+    #[test]
+    #[should_panic(expected = "must be finite")]
+    fn non_finite_initial_gain_is_refused() {
+        let (_, cmd_rx) = RingBuffer::new(1);
+        let (ev_tx, _) = RingBuffer::new(1);
+        SineProcessor::new(SR, 440.0, f32::NAN, cmd_rx, ev_tx, Arc::new(Stats::new()));
     }
 
     #[test]

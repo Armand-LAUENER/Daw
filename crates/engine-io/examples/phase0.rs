@@ -32,7 +32,10 @@ struct Args {
     engine: EngineOptions,
 }
 
-fn parse_args() -> Result<Args, String> {
+const USAGE: &str = "usage: phase0 [--list] [--minutes N | --seconds N] [--change-ms MS] \
+                     [--report-s S] [--buffer FRAMES] [--host NAME] [--device SUBSTR] [--gain 0..1]";
+
+fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut args = Args {
         list: false,
         duration: Duration::from_secs(60),
@@ -40,25 +43,43 @@ fn parse_args() -> Result<Args, String> {
         report_every: Duration::from_secs(10),
         engine: EngineOptions::default(),
     };
-    let mut it = std::env::args().skip(1);
+    let mut it = argv.into_iter();
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
-        let number = |v: String| v.parse::<f64>().map_err(|e| format!("{flag}: {e}"));
+        // Durations must be positive: zero would spin the control loop forever,
+        // and `Duration::from_secs_f64` panics on negative or NaN input.
+        let seconds = |v: String, scale: f64| -> Result<Duration, String> {
+            let n = v.parse::<f64>().map_err(|e| format!("{flag}: {e}"))?;
+            Duration::try_from_secs_f64(n * scale)
+                .ok()
+                .filter(|d| !d.is_zero())
+                .ok_or_else(|| format!("{flag}: expected a positive duration, got {v}"))
+        };
         match flag.as_str() {
             "--list" => args.list = true,
-            "--minutes" => args.duration = Duration::from_secs_f64(number(value()?)? * 60.0),
-            "--seconds" => args.duration = Duration::from_secs_f64(number(value()?)?),
-            "--change-ms" => args.change_every = Duration::from_millis(number(value()?)? as u64),
-            "--report-s" => args.report_every = Duration::from_secs_f64(number(value()?)?),
-            "--buffer" => args.engine.buffer_frames = Some(number(value()?)? as u32),
+            "--minutes" => args.duration = seconds(value()?, 60.0)?,
+            "--seconds" => args.duration = seconds(value()?, 1.0)?,
+            "--change-ms" => {
+                args.change_every = seconds(value()?, 1e-3)?;
+                if args.change_every < Duration::from_millis(1) {
+                    return Err("--change-ms: minimum is 1 ms".into());
+                }
+            }
+            "--report-s" => args.report_every = seconds(value()?, 1.0)?,
+            "--buffer" => {
+                let v = value()?;
+                let frames = v.parse::<u32>().ok().filter(|&n| n > 0);
+                args.engine.buffer_frames =
+                    Some(frames.ok_or_else(|| format!("--buffer: expected frames > 0, got {v}"))?);
+            }
             "--host" => args.engine.host = Some(value()?),
             "--device" => args.engine.device = Some(value()?),
-            "--gain" => args.engine.gain = number(value()?)? as f32,
-            "-h" | "--help" => {
-                return Err("usage: phase0 [--list] [--minutes N | --seconds N] [--change-ms MS] \
-                            [--report-s S] [--buffer FRAMES] [--host NAME] [--device SUBSTR] [--gain 0..1]"
-                    .into());
+            "--gain" => {
+                let v = value()?;
+                let gain = v.parse::<f32>().ok().filter(|g| (0.0..=1.0).contains(g));
+                args.engine.gain = gain.ok_or_else(|| format!("--gain: expected 0..1, got {v}"))?;
             }
+            "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument {other:?} (try --help)")),
         }
     }
@@ -66,7 +87,7 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() -> ExitCode {
-    let args = match parse_args() {
+    let args = match parse_args(std::env::args().skip(1)) {
         Ok(a) => a,
         Err(msg) => {
             eprintln!("{msg}");
@@ -202,4 +223,75 @@ fn print_status(t: Duration, s: &StatsSnapshot) {
         s.overloads,
         s.max_load_permille as f64 / 10.0,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Args, String> {
+        parse_args(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn defaults_without_arguments() {
+        let a = parse(&[]).unwrap();
+        assert_eq!((a.duration, a.change_every, a.list), (Duration::from_secs(60), Duration::from_secs(1), false));
+    }
+
+    #[test]
+    fn parses_every_flag() {
+        let a = parse(&[
+            "--minutes",
+            "0.5",
+            "--change-ms",
+            "250",
+            "--report-s",
+            "2",
+            "--buffer",
+            "256",
+            "--host",
+            "alsa",
+            "--device",
+            "pulse",
+            "--gain",
+            "0.1",
+            "--list",
+        ])
+        .unwrap();
+        assert_eq!(a.duration, Duration::from_secs(30));
+        assert_eq!(a.change_every, Duration::from_millis(250));
+        assert_eq!(a.report_every, Duration::from_secs(2));
+        assert_eq!(a.engine.buffer_frames, Some(256));
+        assert_eq!((a.engine.host.as_deref(), a.engine.device.as_deref()), (Some("alsa"), Some("pulse")));
+        assert_eq!(a.engine.gain, 0.1);
+        assert!(a.list);
+    }
+
+    #[test]
+    fn rejects_values_that_would_hang_or_panic() {
+        for bad in [
+            &["--change-ms", "0"][..],
+            &["--change-ms", "0.0001"],
+            &["--minutes", "-1"],
+            &["--seconds", "NaN"],
+            &["--seconds", "inf"],
+            &["--report-s", "0"],
+            &["--buffer", "0"],
+            &["--buffer", "-1"],
+            &["--buffer", "12.5"],
+            &["--gain", "nan"],
+            &["--gain", "2"],
+            &["--seconds"],
+            &["--bogus"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} accepted");
+        }
+    }
+
+    #[test]
+    fn parsed_options_pass_engine_validation() {
+        let a = parse(&["--gain", "1", "--buffer", "1"]).unwrap();
+        assert!(a.engine.validate().is_ok());
+    }
 }
