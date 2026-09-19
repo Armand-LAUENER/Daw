@@ -39,7 +39,7 @@ Séparer `engine-core` de `ui` dès le départ, même en phase 0 — ça force l
 - [x] Générer un sinus dans le callback (état minimal : phase courante, incrémentée à chaque sample).
 - [x] Ajouter un canal de contrôle : `rtrb::RingBuffer` (SPSC) pour envoyer une nouvelle fréquence depuis un thread "contrôle" séparé (simulateur simple, pas encore d'UI).
 - [x] Mesurer et logger les xruns/underruns exposés par `cpal` (ou détectés manuellement via timestamp du callback).
-- [ ] Écrire un test de charge : stream ouvert 30 minutes, changement de fréquence toutes les secondes, aucun underrun.
+- [x] Écrire un test de charge : stream ouvert 30 minutes, changement de fréquence toutes les secondes, aucun underrun.
 
 ### Points d'attention
 - Le sample rate et la taille de buffer ne sont pas garantis stables sur tous les OS — gère le cas où `cpal` te donne un buffer de taille variable d'un callback à l'autre.
@@ -47,6 +47,8 @@ Séparer `engine-core` de `ui` dès le départ, même en phase 0 — ça force l
 
 ### Critère de sortie
 Stream stable 10+ minutes sans underrun, changement de paramètre en direct sans clic ni glitch audible.
+
+**✅ Validé le 2026-09-19** en natif Windows (WASAPI) : 10 min puis 30 min sans xrun, aucun clic audible aux changements de note (voir journal).
 
 ### Ressources
 - Documentation `cpal` (exemples du repo GitHub `RustAudio/cpal`)
@@ -220,3 +222,5 @@ Section à compléter au fil du projet : décisions d'architecture prises, bugs 
 | 2026-09-19 | 0 | Détecteur de starvation `DriftMonitor` : avance cumulée (frames livrées − temps écoulé × SR) comparée à une référence à fuite de 1000 ppm. | Le host PulseAudio fige les timestamps de playback pendant un décrochage : le détecteur par timestamps classait le ralentissement progressif en `LatencyShift`. Validé sur WSLg : 0 événement sur 0-55 s, starvation détectée dès 55,8 s. |
 | 2026-09-19 | 0 | Tests de propriétés (`proptest`) sur le DSP, les détecteurs et le processeur ; `scripts/check.sh` (fmt, clippy `-D warnings`, tests debug + release, doc) branché sur des hooks git et une CI Linux + Windows. | Les tests unitaires ne couvrent que des valeurs choisies à la main. proptest a trouvé dès le premier run un défaut que ces tests ne voyaient pas. |
 | 2026-09-19 | 0 | `LinearSmoother` calcule chaque valeur depuis la cible (`target - step × remaining`) au lieu d'accumuler `current += step`. | L'accumulation en f32 dérivait jusqu'à dépasser la cible (≈ 0,009 Hz à 4,4 kHz ; un gain à 1,0 pouvait dépasser 1,0) avant le recalage final, ce qui cassait la monotonie de la rampe. |
+| 2026-09-19 | 0 | **Phase 0 validée en natif Windows (WASAPI, casque PRO X 2 en 7.1, 48 kHz, buffer imposé à 480 frames = 10 ms).** 10 min puis 30 min : 0 xrun, 0 erreur de flux, 1800/1800 commandes appliquées, 86 404 032 frames en 1800,1 s (48 000/s, pas de dérive), charge max 1,4-6,1 %. Aucun clic aux changements de note ni pendant les rafales ci-dessous (écoute). | Confirme que les décrochages de WSL venaient de WSLg, pas de l'architecture. Tests temps réel désormais lancés depuis WSL par `scripts/windows.sh phase0` (logs dans `target/windows-logs/`). |
+| 2026-09-19 | 0 | Rafales de rattrapage WASAPI (buffers de 960/1056 frames, parfois `LatencyShift` jusqu'à +820 frames) **toutes les 10 min pile, à xx:x0:26 heure murale**, prédites puis vérifiées (1591,18 s). Sans perte : le débit total reste exact, et aucun détecteur ne se déclenche. | Tâche périodique de Windows qui retarde un callback (hypothèse non vérifiée : G HUB interroge le casque sans fil). Inaudible à 10 ms de buffer, mais à surveiller quand les buffers seront plus petits (phase 2+). |
