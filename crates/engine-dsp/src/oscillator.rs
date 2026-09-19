@@ -15,10 +15,7 @@ pub struct SineOsc {
 impl SineOsc {
     pub fn new(sample_rate: f32) -> Self {
         assert!(sample_rate > 0.0, "sample rate must be positive");
-        Self {
-            phase: 0.0,
-            inv_sample_rate: 1.0 / f64::from(sample_rate),
-        }
+        Self { phase: 0.0, inv_sample_rate: 1.0 / f64::from(sample_rate) }
     }
 
     /// Returns the current sample, then advances the phase by one sample at `freq_hz`.

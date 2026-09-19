@@ -11,10 +11,20 @@ pub enum RtEvent {
     },
     /// The playback timestamp jumped while callbacks stayed on time: the backend's
     /// latency estimate moved, no audio was lost. Informational only.
-    LatencyShift { callback_index: u64, delta_frames: i64 },
-    BufferSizeChanged { callback_index: u64, from: u32, to: u32 },
+    LatencyShift {
+        callback_index: u64,
+        delta_frames: i64,
+    },
+    BufferSizeChanged {
+        callback_index: u64,
+        from: u32,
+        to: u32,
+    },
     /// Callback processing took more than [`OVERLOAD_THRESHOLD_PERMILLE`] of the buffer duration.
-    Overload { callback_index: u64, load_permille: u32 },
+    Overload {
+        callback_index: u64,
+        load_permille: u32,
+    },
 }
 
 /// Fraction of the buffer duration (in ‰) above which a callback is reported as overloaded.
@@ -97,10 +107,7 @@ pub struct StatsSnapshot {
 
 impl Stats {
     pub fn new() -> Self {
-        Self {
-            min_buffer_frames: AtomicU64::new(u64::MAX),
-            ..Self::default()
-        }
+        Self { min_buffer_frames: AtomicU64::new(u64::MAX), ..Self::default() }
     }
 
     pub fn snapshot(&self) -> StatsSnapshot {

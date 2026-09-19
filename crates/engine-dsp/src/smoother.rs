@@ -16,13 +16,7 @@ pub struct LinearSmoother {
 impl LinearSmoother {
     /// `ramp_len` is the ramp duration in samples; 0 means changes apply immediately.
     pub fn new(initial: f32, ramp_len: u32) -> Self {
-        Self {
-            current: initial,
-            target: initial,
-            step: 0.0,
-            remaining: 0,
-            ramp_len,
-        }
+        Self { current: initial, target: initial, step: 0.0, remaining: 0, ramp_len }
     }
 
     /// Builds a smoother whose ramp lasts `ramp_ms` at `sample_rate`.

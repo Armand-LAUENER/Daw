@@ -100,8 +100,14 @@ fn main() -> ExitCode {
     let info = &engine.info;
     println!(
         "host {} | device {}\n{} Hz, {} ch, {} | buffer: {}\nrunning {:?}, frequency change every {:?}",
-        info.host, info.device, info.sample_rate, info.channels, info.sample_format, info.buffer_size,
-        args.duration, args.change_every
+        info.host,
+        info.device,
+        info.sample_rate,
+        info.channels,
+        info.sample_format,
+        info.buffer_size,
+        args.duration,
+        args.change_every
     );
 
     let started = Instant::now();

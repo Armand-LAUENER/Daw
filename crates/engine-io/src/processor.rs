@@ -117,7 +117,11 @@ impl SineProcessor {
             && !matches!(anomaly, Some(TimingAnomaly::Xrun { .. }))
         {
             self.stats.starvations.fetch_add(1, Ordering::Relaxed);
-            self.emit(RtEvent::Xrun { source: XrunSource::Starvation, callback_index: self.callback_index, lost_frames });
+            self.emit(RtEvent::Xrun {
+                source: XrunSource::Starvation,
+                callback_index: self.callback_index,
+                lost_frames,
+            });
         }
 
         match anomaly {
