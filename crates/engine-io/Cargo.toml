@@ -15,5 +15,13 @@ assert_no_alloc.workspace = true
 # Native PulseAudio host (pure Rust client), selectable with `EngineOptions::host`.
 pulseaudio = ["cpal/pulseaudio"]
 
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true
+
+[[example]]
+name = "phase0"
+# Run the argument-parsing tests with `cargo test`.
+test = true

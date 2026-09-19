@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b16c54959aec22137774335419ff78a605c5f07350f83f13f1a3b8562a2727f8 # shrinks to buf = 64, stall = 1.777435806570151
+cc 07e178c0e3a1a6def52f7bee0bea583968aec538eedc1e8c8e4e92355a115135 # shrinks to callbacks = [([SetFrequency(NaN)], 0, 1)]
