@@ -2,6 +2,8 @@
 # Every check CI runs, in order of cost. `--fast` stops after lints.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# Git hooks and IDEs may run without the login shell's PATH.
+command -v cargo > /dev/null || source "$HOME/.cargo/env" 2> /dev/null || true
 
 # The pulseaudio feature only makes sense on Linux.
 features=()
