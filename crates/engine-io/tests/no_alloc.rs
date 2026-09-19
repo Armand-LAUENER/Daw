@@ -2,6 +2,9 @@
 //!
 //! `AllocDisabler` aborts the process if anything allocates inside
 //! `assert_no_alloc`, so a regression fails this test loudly (debug builds).
+//! In release, `assert_no_alloc` compiles to nothing and `AllocDisabler`
+//! does not exist, hence the gate.
+#![cfg(debug_assertions)]
 
 use std::sync::Arc;
 

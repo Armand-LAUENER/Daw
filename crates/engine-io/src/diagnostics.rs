@@ -63,6 +63,8 @@ pub struct Stats {
     pub overloads: AtomicU64,
     pub latency_shifts: AtomicU64,
     pub commands_applied: AtomicU64,
+    /// Commands ignored because their value was not finite (NaN, infinity).
+    pub commands_rejected: AtomicU64,
     /// Events lost because the event ring buffer was full.
     pub dropped_events: AtomicU64,
     /// Stream errors reported by the backend other than xruns.
@@ -84,6 +86,7 @@ pub struct StatsSnapshot {
     pub overloads: u64,
     pub latency_shifts: u64,
     pub commands_applied: u64,
+    pub commands_rejected: u64,
     pub dropped_events: u64,
     pub stream_errors: u64,
     pub error_kinds: [u64; STREAM_ERROR_KINDS.len()],
@@ -111,6 +114,7 @@ impl Stats {
             overloads: get(&self.overloads),
             latency_shifts: get(&self.latency_shifts),
             commands_applied: get(&self.commands_applied),
+            commands_rejected: get(&self.commands_rejected),
             dropped_events: get(&self.dropped_events),
             stream_errors: get(&self.stream_errors),
             error_kinds: std::array::from_fn(|i| get(&self.error_kinds[i])),
@@ -122,6 +126,8 @@ impl Stats {
 }
 
 impl StatsSnapshot {
+    /// Distinct xruns: a stall seen by both the timestamp and the starvation
+    /// detector is only counted once, as a timestamp gap.
     pub fn total_xruns(&self) -> u64 {
         self.backend_xruns + self.detected_xruns + self.starvations
     }

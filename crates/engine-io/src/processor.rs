@@ -91,7 +91,8 @@ impl SineProcessor {
         if permille > u64::from(OVERLOAD_THRESHOLD_PERMILLE) {
             self.stats.overloads.fetch_add(1, Ordering::Relaxed);
             self.emit(RtEvent::Overload {
-                callback_index: self.callback_index,
+                // `process` already advanced the index past the measured callback.
+                callback_index: self.callback_index.saturating_sub(1),
                 load_permille: permille.min(u64::from(u32::MAX)) as u32,
             });
         }
@@ -109,14 +110,16 @@ impl SineProcessor {
         }
         self.last_frames = frames;
 
-        if let Some(t) = timing
-            && let Some(lost_frames) = self.drift.observe(t.callback_ns, frames)
+        let anomaly = timing.and_then(|t| self.xruns.observe(t, frames));
+        let starved = timing.and_then(|t| self.drift.observe(t.callback_ns, frames));
+        // A late callback that left a playback gap is also a lead drop: report it once.
+        if let Some(lost_frames) = starved
+            && !matches!(anomaly, Some(TimingAnomaly::Xrun { .. }))
         {
             self.stats.starvations.fetch_add(1, Ordering::Relaxed);
             self.emit(RtEvent::Xrun { source: XrunSource::Starvation, callback_index: self.callback_index, lost_frames });
         }
 
-        let anomaly = timing.and_then(|t| self.xruns.observe(t, frames));
         match anomaly {
             None => {}
             Some(TimingAnomaly::Xrun { lost_frames }) => {
@@ -137,6 +140,12 @@ impl SineProcessor {
     fn apply_commands(&mut self) {
         // Bounded by the ring buffer capacity, so this loop is bounded too.
         while let Ok(cmd) = self.commands.pop() {
+            // `clamp` passes NaN through, and a NaN phase never recovers.
+            let (Command::SetFrequency(value) | Command::SetGain(value)) = cmd;
+            if !value.is_finite() {
+                self.stats.commands_rejected.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             match cmd {
                 Command::SetFrequency(hz) => {
                     let nyquist = self.sample_rate as f32 * 0.5;
@@ -239,6 +248,51 @@ mod tests {
             lost_frames: 1536,
         }));
         assert_eq!(h.stats.snapshot().detected_xruns, 1);
+    }
+
+    #[test]
+    fn non_finite_commands_are_rejected() {
+        let mut h = harness(440.0);
+        for cmd in [Command::SetFrequency(f32::NAN), Command::SetGain(f32::NAN), Command::SetGain(f32::INFINITY)] {
+            h.commands.push(cmd).unwrap();
+        }
+        let mut buf = vec![0.0f32; 4800];
+        h.proc.process(&mut buf, 1, None);
+        h.commands.push(Command::SetFrequency(880.0)).unwrap();
+        h.proc.process(&mut buf, 1, None);
+
+        assert!(buf.iter().all(|s| s.is_finite()));
+        let s = h.stats.snapshot();
+        assert_eq!((s.commands_rejected, s.commands_applied), (3, 1));
+    }
+
+    #[test]
+    fn late_callback_is_one_xrun_not_also_a_starvation() {
+        let mut h = harness(440.0);
+        let ns = |frames: f64| (frames * 1e9 / SR as f64) as u128;
+        let at = |frames: f64| CallbackTiming { callback_ns: ns(frames), playback_ns: ns(frames + 4800.0) };
+        let mut buf = vec![0.0f32; 512];
+        // One second of punctual callbacks arms the starvation detector.
+        let mut t = 0.0;
+        for _ in 0..100 {
+            h.proc.process(&mut buf, 1, Some(at(t)));
+            t += 512.0;
+        }
+        // 200 ms stall: both detectors see it.
+        t += 9600.0;
+        h.proc.process(&mut buf, 1, Some(at(t)));
+
+        let s = h.stats.snapshot();
+        assert_eq!((s.detected_xruns, s.starvations, s.total_xruns()), (1, 0, 1));
+    }
+
+    #[test]
+    fn overload_is_tagged_with_the_measured_callback() {
+        let mut h = harness(440.0);
+        let mut buf = vec![0.0f32; 480];
+        h.proc.process(&mut buf, 1, None);
+        h.proc.record_load(10_000_000, 480); // 10 ms for a 10 ms buffer
+        assert_eq!(h.events.pop(), Ok(RtEvent::Overload { callback_index: 0, load_permille: 1000 }));
     }
 
     #[test]
