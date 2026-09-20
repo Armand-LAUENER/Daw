@@ -144,6 +144,36 @@ Deux limites connues, assumées et documentées dans le code :
   tests de propriétés bornent donc le *pas* de sortie seulement pour Q ≤ 1/√2,
   et la bornitude séparément pour les Q résonants.
 
+### Performance mesurée
+
+Deux mesures, deux questions. En marche : `Stats` tient un histogramme de la
+charge par callback, et `phase0` affiche p50 / p99 / max — le pic seul ne dit
+rien, un unique dépassement le fixe pour tout le run. Hors ligne :
+`scripts/windows.sh bench` (ou `cargo run --release -p engine-dsp --example
+bench`) donne le débit en ns/échantillon.
+
+Relevé du 2026-09-20, ns/échantillon :
+
+| cas | WSL | Windows natif |
+|---|---|---|
+| SineOsc | 9,01 | 4,10 |
+| LinearSmoother | 0,47 | 0,42 |
+| Biquad | 4,52 | **2,25** |
+| SmoothedBiquad, au repos | 4,49 | **4,00** |
+| SmoothedBiquad, en balayage | 6,04 | 4,68 |
+
+**Ne jamais conclure sur des chiffres WSL.** Sous WSL, `SmoothedBiquad` au repos
+semblait coûter exactement le prix d'un `Biquad` nu, d'où la conclusion — fausse
+— que l'arrêt des mises à jour était gratuit. Sous Windows le `Biquad` descend à
+2,25 ns et le surcoût réel apparaît : **environ 75 %**, masqué par une baseline
+WSL deux fois trop lente.
+
+Cause probable, non encore vérifiée : les branches `stale` et `gliding` peuvent
+écrire les coefficients, donc le compilateur les recharge depuis la mémoire à
+chaque échantillon au lieu de les garder en registres. Correction attendue : un
+`process_block`, qui teste l'état une fois par buffer puis déroule une boucle
+serrée — c'est de toute façon la forme qu'appelle le callback.
+
 ### Décisions prises
 
 - **Objectif** : une application utilisable et performante. Ce n'est plus un

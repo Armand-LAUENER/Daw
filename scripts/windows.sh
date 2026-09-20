@@ -4,6 +4,7 @@
 #
 #   scripts/windows.sh test               # cargo test --workspace
 #   scripts/windows.sh check              # clippy -D warnings + tests (debug and release)
+#   scripts/windows.sh bench              # DSP throughput, on the real target CPU
 #   scripts/windows.sh phase0 [ARGS...]   # real-time run on the Windows audio device
 #
 # The Windows side is a clone of this repository (DAW_WIN_DIR, default
@@ -67,6 +68,9 @@ case "$cmd" in
         cargo_win test --workspace
         cargo_win test --workspace --release
         ;;
+    bench)
+        cargo_win run --release -q -p engine-dsp --example bench
+        ;;
     phase0)
         mkdir -p target/windows-logs
         log="target/windows-logs/phase0-$(date +%Y%m%d-%H%M%S).log"
@@ -74,7 +78,7 @@ case "$cmd" in
         cargo_win run --release -q -p engine-io --example phase0 -- "$@" | tee "$log"
         ;;
     *)
-        echo "unknown command $cmd (test | check | phase0 [ARGS...])" >&2
+        echo "unknown command $cmd (test | check | bench | phase0 [ARGS...])" >&2
         exit 2
         ;;
 esac
