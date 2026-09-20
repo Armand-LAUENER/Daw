@@ -95,6 +95,7 @@ impl SineProcessor {
         let budget_ns = u64::from(frames) * 1_000_000_000 / u64::from(self.sample_rate);
         let permille = elapsed_ns * 1000 / budget_ns.max(1);
         self.stats.max_load_permille.fetch_max(permille, Ordering::Relaxed);
+        self.stats.record_load_bucket(permille);
         if permille > u64::from(OVERLOAD_THRESHOLD_PERMILLE) {
             self.stats.overloads.fetch_add(1, Ordering::Relaxed);
             self.emit(RtEvent::Overload {

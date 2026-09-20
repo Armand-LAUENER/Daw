@@ -211,7 +211,7 @@ fn print_event(t: Duration, event: &RtEvent) {
 
 fn print_status(t: Duration, s: &StatsSnapshot) {
     println!(
-        "[{:>8.2}s] callbacks {} | frames {} | xruns {} (backend {}, detected {}, starvation {}) | latency shifts {} | overloads {} | max load {:.1}%",
+        "[{:>8.2}s] callbacks {} | frames {} | xruns {} (backend {}, detected {}, starvation {}) | latency shifts {} | overloads {} | load p50 {:.1}% p99 {:.1}% max {:.1}%",
         t.as_secs_f64(),
         s.callbacks,
         s.frames,
@@ -221,6 +221,8 @@ fn print_status(t: Duration, s: &StatsSnapshot) {
         s.starvations,
         s.latency_shifts,
         s.overloads,
+        s.load_percentile(0.5) as f64 / 10.0,
+        s.load_percentile(0.99) as f64 / 10.0,
         s.max_load_permille as f64 / 10.0,
     );
 }

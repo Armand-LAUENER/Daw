@@ -30,6 +30,14 @@ pub enum RtEvent {
 /// Fraction of the buffer duration (in ‰) above which a callback is reported as overloaded.
 pub const OVERLOAD_THRESHOLD_PERMILLE: u32 = 700;
 
+/// Width of one [`Stats::load_histogram`] bucket, in ‰ of the buffer duration.
+pub const LOAD_BUCKET_PERMILLE: u64 = 25;
+/// Number of load buckets. The last one collects everything at or above
+/// `(LOAD_BUCKETS - 1) * LOAD_BUCKET_PERMILLE`, which sits just above
+/// [`OVERLOAD_THRESHOLD_PERMILLE`]: past that point the exact figure no longer
+/// matters, only that the deadline is in danger.
+pub const LOAD_BUCKETS: usize = 32;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XrunSource {
     /// Reported by cpal through the stream error callback.
@@ -82,6 +90,11 @@ pub struct Stats {
     /// All backend stream errors by kind, see [`STREAM_ERROR_KINDS`].
     pub error_kinds: [AtomicU64; STREAM_ERROR_KINDS.len()],
     pub max_load_permille: AtomicU64,
+    /// Distribution of the per-callback load, see [`LOAD_BUCKETS`]. The maximum
+    /// alone says nothing about the usual case: one outlier fixes it for the rest
+    /// of the run, while what decides whether the engine is comfortable is where
+    /// the bulk of the callbacks sit and how long the tail is.
+    pub load_histogram: [AtomicU64; LOAD_BUCKETS],
     pub min_buffer_frames: AtomicU64,
     pub max_buffer_frames: AtomicU64,
 }
@@ -101,6 +114,7 @@ pub struct StatsSnapshot {
     pub stream_errors: u64,
     pub error_kinds: [u64; STREAM_ERROR_KINDS.len()],
     pub max_load_permille: u64,
+    pub load_histogram: [u64; LOAD_BUCKETS],
     pub min_buffer_frames: u64,
     pub max_buffer_frames: u64,
 }
@@ -108,6 +122,13 @@ pub struct StatsSnapshot {
 impl Stats {
     pub fn new() -> Self {
         Self { min_buffer_frames: AtomicU64::new(u64::MAX), ..Self::default() }
+    }
+
+    /// Files one callback's load into [`Stats::load_histogram`].
+    #[inline]
+    pub fn record_load_bucket(&self, permille: u64) {
+        let bucket = (permille / LOAD_BUCKET_PERMILLE).min(LOAD_BUCKETS as u64 - 1) as usize;
+        self.load_histogram[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> StatsSnapshot {
@@ -126,6 +147,7 @@ impl Stats {
             stream_errors: get(&self.stream_errors),
             error_kinds: std::array::from_fn(|i| get(&self.error_kinds[i])),
             max_load_permille: get(&self.max_load_permille),
+            load_histogram: std::array::from_fn(|i| get(&self.load_histogram[i])),
             min_buffer_frames: get(&self.min_buffer_frames),
             max_buffer_frames: get(&self.max_buffer_frames),
         }
@@ -142,6 +164,34 @@ impl StatsSnapshot {
     /// Non-zero error counters as `(kind, count)`.
     pub fn error_breakdown(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
         STREAM_ERROR_KINDS.iter().zip(self.error_kinds).filter(|(_, n)| *n > 0).map(|(k, n)| (*k, n))
+    }
+
+    /// Callbacks the load histogram accounts for. Lower than [`StatsSnapshot::callbacks`]
+    /// by the empty buffers, which carry no load worth recording.
+    pub fn measured_callbacks(&self) -> u64 {
+        self.load_histogram.iter().sum()
+    }
+
+    /// Load in ‰ of the buffer duration that `fraction` of callbacks stayed under.
+    ///
+    /// Reported at bucket resolution, so it rounds up to the bucket's upper edge
+    /// — `load_percentile(0.5)` of 50 means half the callbacks finished within
+    /// 5% of their deadline, not that the median is exactly 5%. Returns 0 when
+    /// nothing has been measured yet.
+    pub fn load_percentile(&self, fraction: f64) -> u64 {
+        let total = self.measured_callbacks();
+        if total == 0 {
+            return 0;
+        }
+        let wanted = (total as f64 * fraction).ceil().max(1.0) as u64;
+        let mut seen = 0;
+        for (i, count) in self.load_histogram.iter().enumerate() {
+            seen += count;
+            if seen >= wanted {
+                return (i as u64 + 1) * LOAD_BUCKET_PERMILLE;
+            }
+        }
+        LOAD_BUCKETS as u64 * LOAD_BUCKET_PERMILLE
     }
 }
 
@@ -295,6 +345,65 @@ mod tests {
     use super::*;
 
     const SR: u32 = 48_000;
+
+    mod load {
+        use super::*;
+
+        fn with_loads(permille: &[u64]) -> StatsSnapshot {
+            let stats = Stats::new();
+            for p in permille {
+                stats.record_load_bucket(*p);
+            }
+            stats.snapshot()
+        }
+
+        #[test]
+        fn an_empty_histogram_reports_zero() {
+            let s = with_loads(&[]);
+            assert_eq!(s.measured_callbacks(), 0);
+            assert_eq!(s.load_percentile(0.5), 0);
+        }
+
+        #[test]
+        fn percentiles_round_up_to_the_bucket_edge() {
+            // 30‰ lands in the second bucket, whose upper edge is 50‰.
+            let s = with_loads(&[30]);
+            assert_eq!(s.load_percentile(0.5), 2 * LOAD_BUCKET_PERMILLE);
+        }
+
+        #[test]
+        fn a_single_outlier_does_not_move_the_median() {
+            // The case the histogram exists for: 99 comfortable callbacks and one
+            // that nearly missed its deadline. The maximum says 97.5%, the median
+            // says the engine is idle, and both are true.
+            let mut loads = vec![10; 99];
+            loads.push(980);
+            let s = with_loads(&loads);
+            assert_eq!(s.load_percentile(0.5), LOAD_BUCKET_PERMILLE);
+            assert_eq!(s.load_percentile(1.0), LOAD_BUCKETS as u64 * LOAD_BUCKET_PERMILLE);
+        }
+
+        #[test]
+        fn the_tail_shows_up_in_p99() {
+            // 98 callbacks at 1%, then two at 60%: p99 must see the tail that p50 misses.
+            let mut loads = vec![10; 98];
+            loads.extend([600, 600]);
+            let s = with_loads(&loads);
+            assert_eq!(s.load_percentile(0.5), LOAD_BUCKET_PERMILLE);
+            assert!(s.load_percentile(0.99) > 600, "p99 = {}", s.load_percentile(0.99));
+        }
+
+        #[test]
+        fn everything_past_the_last_edge_lands_in_the_top_bucket() {
+            // Beyond the overload threshold the exact figure stops mattering.
+            let s = with_loads(&[5_000]);
+            assert_eq!(s.load_histogram[LOAD_BUCKETS - 1], 1);
+            assert!(
+                (LOAD_BUCKETS as u64 - 1) * LOAD_BUCKET_PERMILLE > u64::from(OVERLOAD_THRESHOLD_PERMILLE),
+                "the top bucket must start above the overload threshold"
+            );
+        }
+    }
 
     fn ns(frames: i64) -> u128 {
         (frames as f64 * 1e9 / f64::from(SR)) as u128
