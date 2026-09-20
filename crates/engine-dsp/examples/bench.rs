@@ -61,6 +61,43 @@ fn main() {
 
     println!();
 
+    // Denormals. Once the audio stops, a filter's state decays geometrically
+    // through the denormal range on its way to zero, and some CPUs handle those
+    // in microcode at a large penalty.
+    //
+    // Reaching that range takes patience. A 30 Hz low-pass has poles of radius
+    // 0.9972, so the state needs about 31_500 samples to fall from full scale
+    // to the smallest normal f32 (1.2e-38) and another 5_700 to underflow to
+    // zero. Re-exciting sooner than that measures nothing: the state never gets
+    // there. With a period of 40_000 the tail spends roughly one sample in
+    // seven denormal, which is what makes the penalty visible at all.
+    //
+    // The two controls do the same work on values that never leave the normal
+    // range: one re-excited often enough to stay well above it, one held there
+    // by a tiny constant input.
+    for (name, period, floor) in [
+        ("Biquad, tail decaying to zero", 40_000usize, 0.0f32),
+        ("Biquad, tail kept normal by a floor", 40_000, 1e-15),
+        ("Biquad, re-excited before it decays", 8_192, 0.0),
+    ] {
+        let mut filter = Biquad::new(Coefficients::low_pass(30.0, 0.707, SR));
+        let mut i = 0usize;
+        let mut subnormal = 0usize;
+        bench(name, || {
+            let x = if i.is_multiple_of(period) { 1.0 } else { floor };
+            i += 1;
+            let y = filter.process_sample(x);
+            // Counting them is what makes this a measurement rather than an
+            // assumption: a case that never reaches the denormal range would
+            // prove nothing about the cost of being in it.
+            subnormal += usize::from(y.is_subnormal());
+            y
+        });
+        println!("{:<34} {subnormal} subnormal outputs of {SAMPLES}", "");
+    }
+
+    println!();
+
     // Filtering in place would feed each block its own output and decay into
     // denormals, so the harness refills the buffer every time. That refill is
     // inside the timing: this row is what it costs, to be subtracted from the

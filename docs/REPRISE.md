@@ -145,9 +145,17 @@ Quatre croyances fausses, chacune démolie par un test et gardée comme test :
 
 Deux limites connues, assumées et documentées dans le code :
 
-- **Dénormaux** : après un passage en silence l'état du filtre décroît vers des
-  dénormaux, coûteux sur x86 et candidats à un xrun. Rien n'a été ajouté sans
-  mesure — à mesurer en branchant le filtre sur `engine-io`.
+- **Dénormaux : mesurés, rien à faire.** Le banc contient trois cas à coupure
+  30 Hz, dont un où la queue descend réellement dans la zone dénormale — vérifié
+  par un compteur, 591 470 sorties dénormales sur 2 000 000, soit 29,6 %. Il
+  coûte **+14 % à +23 %** selon le run, contre deux témoins sans dénormaux qui
+  s'accordent à 2,23 ns. La pénalité est donc réelle, mais le filtre pèse
+  0,011 % d'un buffer : +20 % le porte à 0,014 %, et cent filtres à 1,4 %. Payer
+  une comparaison par échantillon sur *tous* les échantillons pour ça serait un
+  mauvais échange, et le FTZ matériel demanderait du `unsafe`, interdit par
+  `unsafe_code = "forbid"`. Leçon de méthode : sans le compteur, un premier
+  relevé donnait « 2,84 contre 2,82 » et concluait à tort qu'il n'y avait rien —
+  le bruit de mesure tourne autour de 10 %.
 - **Rampe contre temps d'établissement** : lisser un paramètre n'aide que tant
   que le filtre s'établit plus vite que la rampe ne défile. Une rampe de 10 ms
   vaut `1/(2π·0,01)` ≈ 16 Hz : en dessous de ~20 Hz de coupure, le changement
