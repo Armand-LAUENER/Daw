@@ -6,17 +6,93 @@
 //!
 //!   cargo run --release -p engine-io --example phase1 -- track.flac --minutes 10
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::{env, process, thread};
 
 use engine_dsp::{FilterKind, SmoothedBiquad};
 use engine_io::{AudioEngine, EngineOptions, StatsSnapshot, default_output_config, list_output_devices, map_frames};
-use engine_io_file::{MemorySource, Shared, TransportCommand, TransportOptions, decode_file, start};
+use engine_io_file::{MemorySource, Shared, Source, TransportCommand, TransportOptions, decode_file, start};
 
-const USAGE: &str = "usage: phase1 FILE [--list] [--minutes N | --seconds N] [--seek-every S] \
-                     [--cutoff HZ] [--loop] [--host NAME] [--device SUBSTR] [--gain 0..1]";
+const USAGE: &str = "usage: phase1 [FILE | --self-test] [--list] [--minutes N | --seconds N] \
+                     [--seek-every S] [--cutoff HZ] [--loop] [--host NAME] [--device SUBSTR] [--gain 0..1]";
+
+/// Tone the self test plays. Low enough that its own slope stays small next to
+/// the anti-click fade, so the two are easy to tell apart in the bound.
+const SELF_TEST_HZ: f32 = 100.0;
+
+/// A [`Source`] that synthesises a tone instead of reading a file.
+///
+/// The phase comes from the absolute frame index, so a seek lands exactly where
+/// it was asked to — and jumps the phase, which is the discontinuity the
+/// transport's fades exist to cover. That is the point: the self test provokes
+/// the very thing it then checks for.
+struct SineSource {
+    position: u64,
+    frames: u64,
+    channels: u16,
+    sample_rate: u32,
+}
+
+impl Source for SineSource {
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn frames(&self) -> Option<u64> {
+        Some(self.frames)
+    }
+
+    fn read(&mut self, out: &mut [f32]) -> usize {
+        let channels = usize::from(self.channels);
+        let wanted = (out.len() / channels) as u64;
+        let take = wanted.min(self.frames - self.position) as usize;
+        for (i, frame) in out.chunks_exact_mut(channels).take(take).enumerate() {
+            // f64 keeps the phase exact over an hour; f32 would drift.
+            let t = (self.position + i as u64) as f64 / f64::from(self.sample_rate);
+            let value = (std::f64::consts::TAU * f64::from(SELF_TEST_HZ) * t).sin() as f32;
+            frame.fill(value);
+        }
+        self.position += take as u64;
+        take
+    }
+
+    fn seek(&mut self, frame: u64) {
+        self.position = frame.min(self.frames);
+    }
+}
+
+/// Discontinuities seen in the rendered output, published to the control side.
+///
+/// Only meaningful against a known signal: in music a snare hit is a perfectly
+/// legitimate vertical step, and no threshold tells it apart from a click. That
+/// is why this is tied to `--self-test` rather than offered on its own.
+#[derive(Debug)]
+struct ClickCheck {
+    violations: AtomicU64,
+    /// Worst step seen at all, in billionths, so a plain `fetch_max` tracks it.
+    /// On a healthy run it settles at the tone's own slope, which is what shows
+    /// the check was looking at audio rather than at silence.
+    worst_step_nano: AtomicU64,
+    /// Frame the first violation landed on; `u64::MAX` while there is none.
+    first_frame: AtomicU64,
+}
+
+impl Default for ClickCheck {
+    fn default() -> Self {
+        Self {
+            violations: AtomicU64::new(0),
+            worst_step_nano: AtomicU64::new(0),
+            first_frame: AtomicU64::new(u64::MAX),
+        }
+    }
+}
 
 struct Args {
     file: Option<PathBuf>,
@@ -25,6 +101,7 @@ struct Args {
     seek_every: Option<Duration>,
     cutoff: f32,
     looping: bool,
+    self_test: bool,
     engine: EngineOptions,
 }
 
@@ -53,40 +130,49 @@ fn main() {
         return;
     }
 
-    let Some(file) = args.file.clone() else {
+    if args.file.is_none() && !args.self_test {
         eprintln!("{USAGE}");
         process::exit(2);
-    };
+    }
 
-    if let Err(e) = run(&file, &args) {
+    if let Err(e) = run(&args) {
         eprintln!("{e}");
         process::exit(1);
     }
 }
 
-fn run(file: &Path, args: &Args) -> Result<(), String> {
+fn run(args: &Args) -> Result<(), String> {
     // The device decides the rate: decoding to anything else would detune the
     // file or need a second resampler inside the callback.
     let (rate, device_channels) = default_output_config(args.engine.host.as_deref(), args.engine.device.as_deref())
         .map_err(|e| format!("cannot query the output device: {e}"))?;
     println!("device: {rate} Hz, {device_channels} channels");
 
-    let started_decode = Instant::now();
-    let audio = decode_file(file, rate).map_err(|e| format!("{}: {e}", file.display()))?;
-    let file_channels = usize::from(audio.channels);
-    println!(
-        "decoded {} in {:.2}s: {file_channels} channels, {:.1}s",
-        file.display(),
-        started_decode.elapsed().as_secs_f64(),
-        audio.duration().as_secs_f64()
-    );
-    let total_frames = audio.frames() as u64;
-    if total_frames == 0 {
-        return Err("the file holds no audio".into());
-    }
+    let (source, total_frames, file_channels): (Box<dyn Source>, u64, usize) = if args.self_test {
+        // An hour of tone, so the run never reaches the end and the seek
+        // targets have somewhere to go.
+        let frames = u64::from(rate) * 3_600;
+        println!("self test: {SELF_TEST_HZ} Hz tone, discontinuity check on");
+        (Box::new(SineSource { position: 0, frames, channels: 2, sample_rate: rate }), frames, 2)
+    } else {
+        let file = args.file.as_ref().expect("main checked that a file was given");
+        let started_decode = Instant::now();
+        let audio = decode_file(file, rate).map_err(|e| format!("{}: {e}", file.display()))?;
+        let channels = usize::from(audio.channels);
+        println!(
+            "decoded {} in {:.2}s: {channels} channels, {:.1}s",
+            file.display(),
+            started_decode.elapsed().as_secs_f64(),
+            audio.duration().as_secs_f64()
+        );
+        let frames = audio.frames() as u64;
+        if frames == 0 {
+            return Err("the file holds no audio".into());
+        }
+        (Box::new(MemorySource::new(audio)), frames, channels)
+    };
 
-    let (mut transport, mut playback) =
-        start(Box::new(MemorySource::new(audio)), TransportOptions { buffer_ms: 500.0, ..Default::default() });
+    let (mut transport, mut playback) = start(source, TransportOptions { buffer_ms: 500.0, ..Default::default() });
     let shared = transport.shared().clone();
 
     // Everything the callback needs is built here and moved in: allocating
@@ -95,6 +181,16 @@ fn run(file: &Path, args: &Args) -> Result<(), String> {
         .map(|_| SmoothedBiquad::new(FilterKind::LowPass, args.cutoff, 0.707, rate as f32, 10.0))
         .collect();
     let mut from_file = vec![0.0f32; 8_192 * file_channels];
+
+    // A 100 Hz tone of unit amplitude cannot move faster than this on its own;
+    // the fade adds its share; the rest is slack. Anything above is a step the
+    // signal path invented, which is what a click is.
+    let fade_frames = engine_io_file::FADE_MS * 1e-3 * rate as f32;
+    let bound = 1.0 / fade_frames + std::f32::consts::TAU * SELF_TEST_HZ / rate as f32 + 1e-3;
+    let checking = args.self_test;
+    let check = Arc::new(ClickCheck::default());
+    let callback_check = Arc::clone(&check);
+    let (mut previous, mut frame_index) = (0.0f32, 0u64);
 
     let (mut engine, _commands) = AudioEngine::start_with(&args.engine, move |out, channels| {
         let frames = out.len() / channels.max(1);
@@ -107,6 +203,23 @@ fn run(file: &Path, args: &Args) -> Result<(), String> {
             }
         }
         map_frames(src, file_channels, out, channels);
+
+        if checking {
+            // One comparison per frame on the channel that carries the tone.
+            for frame in out.chunks_exact(channels) {
+                let step = (frame[0] - previous).abs();
+                // Tracked whatever it is, not only when it trips: a run that
+                // reports a worst step of zero would look identical whether the
+                // path was clean or the detector was watching silence.
+                callback_check.worst_step_nano.fetch_max((step * 1e9) as u64, Ordering::Relaxed);
+                if step > bound {
+                    callback_check.violations.fetch_add(1, Ordering::Relaxed);
+                    callback_check.first_frame.fetch_min(frame_index, Ordering::Relaxed);
+                }
+                previous = frame[0];
+                frame_index += 1;
+            }
+        }
     })
     .map_err(|e| format!("failed to start audio: {e}"))?;
 
@@ -153,6 +266,7 @@ fn run(file: &Path, args: &Args) -> Result<(), String> {
 
     let stats = engine.stats.snapshot();
     let underruns = shared.underruns.load(Ordering::Relaxed);
+    let violations = check.violations.load(Ordering::Relaxed);
     println!("\n=== summary ===");
     print_status(started.elapsed(), &stats, &shared, rate);
     println!("seeks {seeks} | underruns {underruns}");
@@ -160,11 +274,20 @@ fn run(file: &Path, args: &Args) -> Result<(), String> {
         println!("  stream error {kind}: {n}");
     }
 
-    if stats.total_xruns() == 0 && underruns == 0 {
-        println!("PASS: no xrun, no underrun");
+    if checking {
+        let worst = check.worst_step_nano.load(Ordering::Relaxed) as f32 / 1e9;
+        println!("discontinuities {violations} | worst step {worst:.6} | limit {bound:.6}");
+        if violations > 0 {
+            let at = check.first_frame.load(Ordering::Relaxed);
+            println!("  first at frame {at} ({:.2}s into the run)", at as f64 / f64::from(rate));
+        }
+    }
+
+    if stats.total_xruns() == 0 && underruns == 0 && violations == 0 {
+        println!("PASS: no xrun, no underrun, no discontinuity");
         Ok(())
     } else {
-        Err(format!("FAIL: {} xruns, {underruns} underruns", stats.total_xruns()))
+        Err(format!("FAIL: {} xruns, {underruns} underruns, {violations} discontinuities", stats.total_xruns()))
     }
 }
 
@@ -190,6 +313,7 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Args, String> {
         seek_every: None,
         cutoff: 20_000.0,
         looping: false,
+        self_test: false,
         engine: EngineOptions::default(),
     };
     let mut argv = argv.into_iter();
@@ -198,6 +322,7 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Args, String> {
         match arg.as_str() {
             "--list" => args.list = true,
             "--loop" => args.looping = true,
+            "--self-test" => args.self_test = true,
             "--minutes" => args.duration = seconds(value()?, 60.0)?,
             "--seconds" => args.duration = seconds(value()?, 1.0)?,
             "--seek-every" => args.seek_every = Some(seconds(value()?, 1.0)?),
@@ -241,6 +366,13 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Args, String> {
         parse_args(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn self_test_needs_no_file() {
+        let args = parse(&["--self-test"]).unwrap();
+        assert!(args.self_test);
+        assert_eq!(args.file, None);
     }
 
     #[test]
