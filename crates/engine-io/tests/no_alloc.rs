@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use assert_no_alloc::{AllocDisabler, assert_no_alloc};
-use engine_io::{CallbackTiming, Command, SineProcessor, Stats};
+use engine_io::{CallbackTiming, Command, Stats, StreamProcessor};
 use rtrb::RingBuffer;
 
 #[global_allocator]
@@ -20,7 +20,7 @@ fn processing_path_does_not_allocate() {
     let (mut commands, cmd_rx) = RingBuffer::new(64);
     let (ev_tx, mut events) = RingBuffer::new(8);
     let stats = Arc::new(Stats::new());
-    let mut proc = SineProcessor::new(48_000, 440.0, 0.2, cmd_rx, ev_tx, Arc::clone(&stats));
+    let mut proc = StreamProcessor::new(48_000, 440.0, 0.2, cmd_rx, ev_tx, Arc::clone(&stats));
     let mut buf = vec![0.0f32; 2 * 1024];
 
     for i in 0..500u32 {

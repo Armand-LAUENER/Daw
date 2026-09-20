@@ -24,8 +24,11 @@ vers le taux du périphérique.
 **Incrément 4 fait** : thread de préchargement et transport (lecture, pause,
 seek, boucle), avec poignée de main de flush et rampes anti-clic.
 
-**Prochaine étape : incrément 5**, l'intégration dans `engine-io` et un exemple
-`phase1` lancé via `scripts/windows.sh`.
+**Incrément 5 fait** : tout est branché sur le périphérique, avec l'exemple
+`phase1` et le mappage des canaux vers un périphérique 7.1.
+
+**Phase 1 terminée côté code.** Reste à valider le critère de sortie sur la vraie
+sortie audio : `scripts/windows.sh phase1 FICHIER --minutes 10 --seek-every 5`.
 
 Le dépôt est sur GitHub (`Armand-LAUENER/Daw`, privé) et la CI y tourne sur
 Linux et Windows.
@@ -41,11 +44,13 @@ crates/
 │   ├── smoothed_biquad.rs  SmoothedBiquad : coupure lissée en octaves, coefficients interpolés
 │   └── test_util.rs        Banc de mesure des tests : gain par sonde à sinus, plus grand pas de sortie
 ├── engine-io/    cpal + thread audio
-│   ├── processor.rs    SineProcessor : tout ce que le callback possède (indépendant de cpal)
+│   ├── processor.rs    StreamProcessor : tout ce que le callback possède (sinus ou rendu externe)
 │   ├── stream.rs       AudioEngine : ouverture du device, EngineOptions::validate
 │   ├── diagnostics.rs  Stats (atomiques + histogramme de charge), XrunDetector, DriftMonitor
 │   ├── control.rs      Command (Copy, sans tas) : SetFrequency, SetGain
-│   └── examples/phase0.rs   driver + test de charge (exit 1 si xrun)
+│   ├── channels.rs     map_frames : pose les canaux du fichier sur ceux du périphérique
+│   ├── examples/phase0.rs   driver sinus + test de charge (exit 1 si xrun)
+│   └── examples/phase1.rs   driver fichier : décodage, transport, filtre, seeks
 └── engine-io-file/   fichiers et transport
     ├── decode.rs     symphonia + rubato : DecodedAudio, FileError (alloue, hors thread audio)
     └── transport.rs  Preloader (thread dédié) + Playback (temps réel, sans allocation)
@@ -69,6 +74,7 @@ Règles non négociables, déjà outillées :
 | `scripts/check.sh` | fmt, clippy `-D warnings`, tests debug + release, rustdoc `-D warnings`. `--fast` s'arrête après les lints. |
 | `scripts/windows.sh test\|check` | Même chose **sous Windows**, lancé depuis WSL, sur un instantané de l'arbre de travail (y compris le non commité). |
 | `scripts/windows.sh phase0 --minutes 30 --gain 0.05` | Run temps réel sur la vraie sortie audio Windows. Log dans `target/windows-logs/`. |
+| `scripts/windows.sh bench` | Débit du DSP sur la cible réelle. |
 | Hooks git (`.githooks/`) | `pre-commit` → `check.sh --fast` ; `pre-push` → `check.sh`. Activés par `git config core.hooksPath .githooks` (à refaire après un nouveau clone). |
 | CI (`.github/workflows/ci.yml`) | `check.sh` sur Linux + Windows, sur le dépôt privé `Armand-LAUENER/Daw`. |
 
@@ -90,9 +96,10 @@ exécution.
   960/1056 frames pour rattraper un callback retardé. Inaudibles et sans perte
   à 10 ms de buffer. Cause probable, non vérifiée : G HUB (casque sans fil).
   À surveiller quand les buffers seront plus petits.
-- **Le casque PRO X 2 s'expose en 7.1 (8 canaux).** Le sinus est dupliqué sur
-  les 8. En phase 1, il faudra mapper les fichiers stéréo vers les canaux
-  avant gauche/droite.
+- **Le casque PRO X 2 s'expose en 7.1 (8 canaux).** Le sinus de `phase0` est
+  dupliqué sur les 8, ce qui est voulu pour un signal de test. Depuis
+  l'incrément 5, `map_frames` pose la stéréo sur la paire avant et met les six
+  autres à zéro ; `phase1` passe par là.
 - **WASAPI en mode partagé** impose 480 frames (10 ms) : `--buffer` est ignoré.
 - **Le plugin ALSA `pulse`** (hôte par défaut sous WSL) inonde le callback
   d'erreurs de `BackendError`, qui sont comptées par type (`error_kinds`).
@@ -111,9 +118,8 @@ Incréments, chacun testé et commité séparément :
    **Fait**, voir ci-dessous.
 4. ~~**Thread de préchargement et transport** (lecture, pause, seek, boucle).~~
    **Fait**, voir ci-dessous.
-5. **Intégration dans `engine-io`** et exemple `phase1` lancé via
-   `scripts/windows.sh`. S'y ajoute un rendu hors ligne du pipeline dans les
-   tests, pour mesurer l'absence de discontinuité aux seeks.
+5. ~~**Intégration dans `engine-io`** et exemple `phase1`.~~ **Fait**, voir
+   ci-dessous.
 
 ### Ce que les mesures ont corrigé
 
@@ -151,6 +157,39 @@ Deux limites connues, assumées et documentées dans le code :
   transitoirement son pic en régime établi. C'est physique, pas un clic. Les
   tests de propriétés bornent donc le *pas* de sortie seulement pour Q ≤ 1/√2,
   et la bornitude séparément pour les Q résonants.
+
+### Incrément 5 — fait
+
+`AudioEngine::start_with(opts, render)` ouvre le périphérique et joue ce que
+produit une closure, avec **exactement les mêmes diagnostics** que le sinus —
+détection de xrun, dérive, histogramme de charge — parce que c'est le même
+processeur en dessous. `SineProcessor` est donc devenu `StreamProcessor`, avec
+un enum `Renderer` : le sinus de la phase 0 d'un côté, un rendu externe de
+l'autre. Le chemin sinus est inchangé, y compris ses performances : il écrit
+directement dans le format du périphérique, seul le rendu externe passe par un
+tampon f32 intermédiaire.
+
+`engine-io` ne dépend **pas** d'`engine-io-file` : la bibliothèque reste
+device-only, et seuls l'exemple `phase1` et le test de pipeline tirent la couche
+fichier, en dev-dependency.
+
+`map_frames` (dans `channels.rs`) pose les canaux du fichier sur ceux du
+périphérique par index — la stéréo atterrit sur la paire avant d'un 7.1, et les
+canaux non alimentés sont mis à zéro plutôt que laissés avec ce qui traînait
+dans le buffer.
+
+`tests/pipeline.rs` rend la chaîne complète hors ligne — transport, filtre,
+mappage — et c'est le critère de sortie de la phase sous forme de test : des
+seeks répétés sous une coupure en mouvement ne doivent produire aucune marche
+audible.
+
+**Un vrai clic trouvé par ce test** : en sous-alimentation, `Playback::fill`
+remplissait la fin du buffer de zéros en comptant sur la rampe de gain pour
+adoucir. Mais la rampe met 240 échantillons à descendre alors que les zéros
+commencent immédiatement — si l'audio s'arrêtait après 10 échantillons, le gain
+valait encore 0,99 et la marche faisait la pleine amplitude (mesuré : 0,147).
+`Playback` **tient désormais la dernière trame** et laisse la rampe l'emmener à
+zéro.
 
 ### Incrément 4 — fait
 

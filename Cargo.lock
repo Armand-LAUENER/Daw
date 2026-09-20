@@ -216,6 +216,7 @@ dependencies = [
  "assert_no_alloc",
  "cpal",
  "engine-dsp",
+ "engine-io-file",
  "proptest",
  "rtrb",
 ]

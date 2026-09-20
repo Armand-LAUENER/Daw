@@ -13,15 +13,37 @@ use crate::diagnostics::{
 const FREQ_GLIDE_MS: f32 = 10.0;
 /// Gain ramp, also used as the initial fade-in so the stream never starts on a step.
 const GAIN_RAMP_MS: f32 = 50.0;
+/// Size of the conversion buffer an external renderer writes into, in samples.
+///
+/// Covers eight channels of 8192 frames, far above the 480 WASAPI asks for in
+/// shared mode and the ~1056 of its catch-up bursts. A larger callback is
+/// rendered in several passes rather than allocating.
+const MAX_RENDER_SAMPLES: usize = 8_192 * 8;
+
+/// An external source of audio, called once per callback with an interleaved
+/// buffer and the device's channel count.
+pub type RenderFn = Box<dyn FnMut(&mut [f32], usize) + Send>;
+
+/// What fills the buffer.
+///
+/// The oscillator is the phase-0 test tone; an external renderer is anything
+/// else — a file transport today, a mixer later. It is called from the audio
+/// thread, so it carries the same no-allocation contract as this module.
+enum Renderer {
+    Sine { osc: SineOsc, freq: LinearSmoother },
+    External(RenderFn),
+}
 
 /// Everything the audio callback owns. Built on the control side, then moved
 /// into the callback; after that it is only touched by the audio thread.
 ///
-/// Real-time contract of [`SineProcessor::process`]: no allocation, no lock,
+/// Real-time contract of [`StreamProcessor::process`]: no allocation, no lock,
 /// no syscall other than what cpal itself does, bounded time per frame.
-pub struct SineProcessor {
-    osc: SineOsc,
-    freq: LinearSmoother,
+pub struct StreamProcessor {
+    renderer: Renderer,
+    /// Where an external renderer writes before conversion to the device format.
+    /// Allocated once, on the control side.
+    scratch: Vec<f32>,
     gain: LinearSmoother,
     commands: Consumer<Command>,
     events: Producer<RtEvent>,
@@ -33,7 +55,7 @@ pub struct SineProcessor {
     last_frames: u32,
 }
 
-impl SineProcessor {
+impl StreamProcessor {
     pub fn new(
         sample_rate: u32,
         initial_freq: f32,
@@ -48,10 +70,47 @@ impl SineProcessor {
         let sr = sample_rate as f32;
         let mut fade_in = LinearSmoother::with_duration(0.0, GAIN_RAMP_MS, sr);
         fade_in.set_target(gain.clamp(0.0, 1.0));
-        Self {
+        let renderer = Renderer::Sine {
             osc: SineOsc::new(sr),
             freq: LinearSmoother::with_duration(initial_freq.clamp(0.0, sr * 0.5), FREQ_GLIDE_MS, sr),
-            gain: fade_in,
+        };
+        Self::build(renderer, Vec::new(), fade_in, sample_rate, commands, events, stats)
+    }
+
+    /// Builds a processor whose audio comes from `render` instead of the test
+    /// oscillator.
+    ///
+    /// `render` is handed an interleaved buffer and the channel count, and must
+    /// fill all of it — silence included. It runs on the audio thread, so it may
+    /// not allocate, lock or do I/O.
+    pub fn with_renderer(
+        sample_rate: u32,
+        gain: f32,
+        render: RenderFn,
+        commands: Consumer<Command>,
+        events: Producer<RtEvent>,
+        stats: Arc<Stats>,
+    ) -> Self {
+        assert!(gain.is_finite(), "gain must be finite");
+        let mut fade_in = LinearSmoother::with_duration(0.0, GAIN_RAMP_MS, sample_rate as f32);
+        fade_in.set_target(gain.clamp(0.0, 1.0));
+        let scratch = vec![0.0; MAX_RENDER_SAMPLES];
+        Self::build(Renderer::External(render), scratch, fade_in, sample_rate, commands, events, stats)
+    }
+
+    fn build(
+        renderer: Renderer,
+        scratch: Vec<f32>,
+        gain: LinearSmoother,
+        sample_rate: u32,
+        commands: Consumer<Command>,
+        events: Producer<RtEvent>,
+        stats: Arc<Stats>,
+    ) -> Self {
+        Self {
+            renderer,
+            scratch,
+            gain,
             commands,
             events,
             stats,
@@ -77,9 +136,29 @@ impl SineProcessor {
         self.track_buffer(frames, timing);
         self.apply_commands();
 
-        for frame in out.chunks_exact_mut(channels) {
-            let s = self.osc.next_sample(self.freq.next_value()) * self.gain.next_value();
-            frame.fill(T::from_sample(s));
+        match &mut self.renderer {
+            Renderer::Sine { osc, freq } => {
+                for frame in out.chunks_exact_mut(channels) {
+                    let s = osc.next_sample(freq.next_value()) * self.gain.next_value();
+                    frame.fill(T::from_sample(s));
+                }
+            }
+            Renderer::External(render) => {
+                // Rendered in f32 then converted, in passes no larger than the
+                // scratch buffer, so an unusually big callback costs an extra
+                // round rather than an allocation.
+                let per_pass = (self.scratch.len() / channels).max(1);
+                for chunk in out.chunks_mut(per_pass * channels) {
+                    let buf = &mut self.scratch[..chunk.len()];
+                    render(buf, channels);
+                    for (out_frame, in_frame) in chunk.chunks_exact_mut(channels).zip(buf.chunks_exact(channels)) {
+                        let g = self.gain.next_value();
+                        for (dst, src) in out_frame.iter_mut().zip(in_frame) {
+                            *dst = T::from_sample(*src * g);
+                        }
+                    }
+                }
+            }
         }
 
         self.callback_index += 1;
@@ -160,8 +239,13 @@ impl SineProcessor {
             }
             match cmd {
                 Command::SetFrequency(hz) => {
-                    let nyquist = self.sample_rate as f32 * 0.5;
-                    self.freq.set_target(hz.clamp(0.0, nyquist));
+                    // Meaningless for an external renderer, which owns its own
+                    // pitch; still counted as applied so the caller is not told
+                    // the command was rejected as invalid.
+                    if let Renderer::Sine { freq, .. } = &mut self.renderer {
+                        let nyquist = self.sample_rate as f32 * 0.5;
+                        freq.set_target(hz.clamp(0.0, nyquist));
+                    }
                 }
                 Command::SetGain(g) => {
                     self.gain.set_target(g.clamp(0.0, 1.0));
@@ -186,7 +270,7 @@ mod tests {
     const SR: u32 = 48_000;
 
     struct Harness {
-        proc: SineProcessor,
+        proc: StreamProcessor,
         commands: Producer<Command>,
         events: Consumer<RtEvent>,
         stats: Arc<Stats>,
@@ -196,7 +280,7 @@ mod tests {
         let (commands, cmd_rx) = RingBuffer::new(64);
         let (ev_tx, events) = RingBuffer::new(64);
         let stats = Arc::new(Stats::new());
-        let proc = SineProcessor::new(SR, freq, 0.5, cmd_rx, ev_tx, Arc::clone(&stats));
+        let proc = StreamProcessor::new(SR, freq, 0.5, cmd_rx, ev_tx, Arc::clone(&stats));
         Harness { proc, commands, events, stats }
     }
 
@@ -327,7 +411,7 @@ mod tests {
     fn non_finite_initial_gain_is_refused() {
         let (_, cmd_rx) = RingBuffer::new(1);
         let (ev_tx, _) = RingBuffer::new(1);
-        SineProcessor::new(SR, 440.0, f32::NAN, cmd_rx, ev_tx, Arc::new(Stats::new()));
+        StreamProcessor::new(SR, 440.0, f32::NAN, cmd_rx, ev_tx, Arc::new(Stats::new()));
     }
 
     #[test]

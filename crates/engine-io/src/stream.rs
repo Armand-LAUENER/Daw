@@ -9,7 +9,7 @@ use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::control::Command;
 use crate::diagnostics::{CallbackTiming, RtEvent, Stats};
-use crate::processor::SineProcessor;
+use crate::processor::StreamProcessor;
 
 const COMMAND_QUEUE_CAPACITY: usize = 256;
 const EVENT_QUEUE_CAPACITY: usize = 1024;
@@ -130,7 +130,68 @@ impl AudioEngine {
         let (ev_tx, events) = RingBuffer::new(EVENT_QUEUE_CAPACITY);
         let stats = Arc::new(Stats::new());
         let processor =
-            SineProcessor::new(config.sample_rate, opts.initial_freq, opts.gain, cmd_rx, ev_tx, Arc::clone(&stats));
+            StreamProcessor::new(config.sample_rate, opts.initial_freq, opts.gain, cmd_rx, ev_tx, Arc::clone(&stats));
+
+        let info = StreamInfo {
+            host: host.id().name().to_string(),
+            device: device_label(&device),
+            sample_rate: config.sample_rate,
+            channels: config.channels,
+            sample_format: sample_format.to_string(),
+            buffer_size: match config.buffer_size {
+                BufferSize::Default => format!("backend default {:?}", supported.buffer_size()),
+                BufferSize::Fixed(n) => format!("{n} frames (requested)"),
+            },
+        };
+
+        let stream = match sample_format {
+            SampleFormat::F32 => build::<f32>(&device, &config, processor, &stats)?,
+            SampleFormat::F64 => build::<f64>(&device, &config, processor, &stats)?,
+            SampleFormat::I16 => build::<i16>(&device, &config, processor, &stats)?,
+            SampleFormat::I32 => build::<i32>(&device, &config, processor, &stats)?,
+            SampleFormat::U16 => build::<u16>(&device, &config, processor, &stats)?,
+            other => return Err(EngineError::UnsupportedFormat(other)),
+        };
+        stream.play()?;
+
+        Ok((Self { events, stats, info, _stream: stream }, commands))
+    }
+
+    /// Opens the output device and plays whatever `render` produces.
+    ///
+    /// `render` is handed an interleaved f32 buffer and the device's channel
+    /// count, and must fill all of it. It runs on the audio thread: no
+    /// allocation, no locking, no I/O. Everything else — xrun detection, drift,
+    /// the load histogram — behaves exactly as it does for the test tone,
+    /// because it is the same processor underneath.
+    ///
+    /// The returned command producer still carries [`Command::SetGain`];
+    /// `SetFrequency` is ignored, the renderer owning its own pitch.
+    pub fn start_with<F>(opts: &EngineOptions, render: F) -> Result<(Self, Producer<Command>), EngineError>
+    where
+        F: FnMut(&mut [f32], usize) + Send + 'static,
+    {
+        opts.validate()?;
+        let host = select_host(opts.host.as_deref())?;
+        let device = find_output_device(&host, opts.device.as_deref())?;
+        let supported = device.default_output_config()?;
+        let sample_format = supported.sample_format();
+        let mut config: StreamConfig = supported.config();
+        if let Some(frames) = opts.buffer_frames {
+            config.buffer_size = BufferSize::Fixed(frames);
+        }
+
+        let (commands, cmd_rx) = RingBuffer::new(COMMAND_QUEUE_CAPACITY);
+        let (ev_tx, events) = RingBuffer::new(EVENT_QUEUE_CAPACITY);
+        let stats = Arc::new(Stats::new());
+        let processor = StreamProcessor::with_renderer(
+            config.sample_rate,
+            opts.gain,
+            Box::new(render),
+            cmd_rx,
+            ev_tx,
+            Arc::clone(&stats),
+        );
 
         let info = StreamInfo {
             host: host.id().name().to_string(),
@@ -158,10 +219,22 @@ impl AudioEngine {
     }
 }
 
+/// The sample rate and channel count the output device will run at.
+///
+/// Needed before opening the stream: audio has to be decoded and resampled to
+/// the device's rate, and guessing 48 kHz would detune everything on a device
+/// that runs at 44.1.
+pub fn default_output_config(host: Option<&str>, device: Option<&str>) -> Result<(u32, u16), EngineError> {
+    let host = select_host(host)?;
+    let device = find_output_device(&host, device)?;
+    let config = device.default_output_config()?.config();
+    Ok((config.sample_rate, config.channels))
+}
+
 fn build<T>(
     device: &cpal::Device,
     config: &StreamConfig,
-    mut processor: SineProcessor,
+    mut processor: StreamProcessor,
     stats: &Arc<Stats>,
 ) -> Result<cpal::Stream, EngineError>
 where

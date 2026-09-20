@@ -17,9 +17,17 @@ pulseaudio = ["cpal/pulseaudio"]
 
 [dev-dependencies]
 proptest.workspace = true
+# Only the phase1 example and the pipeline test play files; the library stays
+# device-only, so the file layer never becomes a runtime dependency.
+engine-io-file.workspace = true
 
 [lints]
 workspace = true
+
+[[example]]
+name = "phase1"
+# Run the argument-parsing tests with `cargo test`.
+test = true
 
 [[example]]
 name = "phase0"

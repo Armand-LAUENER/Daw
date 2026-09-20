@@ -208,7 +208,15 @@ pub struct Playback {
     /// Frames played since that flush, used to report the position.
     since_flush: u64,
     flush_position: u64,
+    /// The last frame handed out, held over a starved buffer so the fade has
+    /// something to work on. Zeroing instead would step to silence at whatever
+    /// sample the audio ran out on, long before the ramp could get there.
+    hold: [f32; MAX_HELD_CHANNELS],
 }
+
+/// Channels the underrun hold covers. Beyond this a starved buffer falls back
+/// to silence, which is audible but affects no device in common use.
+const MAX_HELD_CHANNELS: usize = 8;
 
 impl Playback {
     pub fn channels(&self) -> u16 {
@@ -250,7 +258,22 @@ impl Playback {
             out[head.len()..take].copy_from_slice(&tail[..take - head.len()]);
             chunk.commit_all();
         }
-        out[take..].fill(0.0);
+        // Hold the last frame rather than dropping to zero: the ramp below needs
+        // somewhere to fade from, and it cannot fade a step that already
+        // happened mid-buffer.
+        if take < out.len() {
+            if take >= channels {
+                self.hold[..channels.min(MAX_HELD_CHANNELS)]
+                    .copy_from_slice(&out[take - channels..][..channels.min(MAX_HELD_CHANNELS)]);
+            }
+            let held = &self.hold[..channels.min(MAX_HELD_CHANNELS)];
+            for frame in out[take..].chunks_exact_mut(channels) {
+                frame[..held.len()].copy_from_slice(held);
+                frame[held.len()..].fill(0.0);
+            }
+        } else if channels <= MAX_HELD_CHANNELS {
+            self.hold[..channels].copy_from_slice(&out[out.len() - channels..]);
+        }
 
         // Running dry at the end of the source is not the preloader falling
         // behind, and counting it would blunt the one number that says so.
@@ -358,6 +381,7 @@ pub fn start(source: Box<dyn Source>, opts: TransportOptions) -> (TransportHandl
         flushed: 0,
         since_flush: 0,
         flush_position: 0,
+        hold: [0.0; MAX_HELD_CHANNELS],
     };
 
     (TransportHandle { commands: commands_tx, shared, thread: Some(thread) }, playback)

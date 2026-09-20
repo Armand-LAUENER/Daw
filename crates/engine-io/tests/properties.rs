@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use engine_io::{CallbackTiming, Command, DRIFT_LEAK, DriftMonitor, SineProcessor, Stats, TimingAnomaly, XrunDetector};
+use engine_io::{
+    CallbackTiming, Command, DRIFT_LEAK, DriftMonitor, Stats, StreamProcessor, TimingAnomaly, XrunDetector,
+};
 use proptest::collection::vec;
 use proptest::prelude::*;
 use rtrb::RingBuffer;
@@ -42,7 +44,7 @@ proptest! {
         let (mut tx, cmd_rx) = RingBuffer::new(256);
         let (ev_tx, _events) = RingBuffer::new(64);
         let stats = Arc::new(Stats::new());
-        let mut proc = SineProcessor::new(SR, 440.0, 0.5, cmd_rx, ev_tx, Arc::clone(&stats));
+        let mut proc = StreamProcessor::new(SR, 440.0, 0.5, cmd_rx, ev_tx, Arc::clone(&stats));
         let (mut pushed, mut non_finite) = (0u64, 0u64);
 
         for (commands, frames, channels) in callbacks {
