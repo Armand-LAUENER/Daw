@@ -1,13 +1,20 @@
 use std::f64::consts::PI;
 
 /// Lowest cutoff accepted, in Hz. Below this the filter is inaudible anyway.
-const MIN_CUTOFF_HZ: f32 = 1.0;
+pub(crate) const MIN_CUTOFF_HZ: f32 = 1.0;
 /// Highest cutoff as a fraction of the sample rate. The bilinear transform maps
 /// the analogue prototype onto `[0, Nyquist)`, and the coefficients degenerate as
 /// the cutoff approaches Nyquist, so it is kept short of it.
 const MAX_CUTOFF_RATIO: f32 = 0.49;
 /// Lowest Q accepted. Q divides the RBJ `alpha` term, so it may never reach zero.
 const MIN_Q: f32 = 0.01;
+
+/// Which of the RBJ responses a set of coefficients describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterKind {
+    LowPass,
+    HighPass,
+}
 
 /// Biquad coefficients, already normalised by `a0`.
 ///
@@ -29,6 +36,15 @@ pub struct Coefficients {
 }
 
 impl Coefficients {
+    /// Dispatches to [`Coefficients::low_pass`] or [`Coefficients::high_pass`],
+    /// for callers that carry the kind as a value.
+    pub fn new(kind: FilterKind, cutoff_hz: f32, q: f32, sample_rate: f32) -> Self {
+        match kind {
+            FilterKind::LowPass => Self::low_pass(cutoff_hz, q, sample_rate),
+            FilterKind::HighPass => Self::high_pass(cutoff_hz, q, sample_rate),
+        }
+    }
+
     /// Two-pole low-pass. `q` of `1/sqrt(2)` gives the maximally flat (Butterworth)
     /// response, -3 dB at the cutoff; higher values resonate around it.
     pub fn low_pass(cutoff_hz: f32, q: f32, sample_rate: f32) -> Self {
@@ -42,6 +58,32 @@ impl Coefficients {
         let (cos_w0, alpha) = rbj_terms(cutoff_hz, q, sample_rate);
         let b = (1.0 + cos_w0) / 2.0;
         Self::normalised(b, -(1.0 + cos_w0), b, 1.0 + alpha, -2.0 * cos_w0, 1.0 - alpha)
+    }
+
+    /// The per-sample increment that walks `self` onto `target` in `samples`.
+    ///
+    /// Coefficients are recomputed only every so many samples, because each one
+    /// costs a sine and a cosine; gliding between those points costs five adds
+    /// and removes the staircase they would otherwise leave in the output.
+    pub(crate) fn glide_to(&self, target: &Self, samples: u32) -> Self {
+        let n = samples as f32;
+        Self {
+            b0: (target.b0 - self.b0) / n,
+            b1: (target.b1 - self.b1) / n,
+            b2: (target.b2 - self.b2) / n,
+            a1: (target.a1 - self.a1) / n,
+            a2: (target.a2 - self.a2) / n,
+        }
+    }
+
+    /// Adds one step of a glide produced by [`Coefficients::glide_to`].
+    #[inline]
+    pub(crate) fn advance(&mut self, step: &Self) {
+        self.b0 += step.b0;
+        self.b1 += step.b1;
+        self.b2 += step.b2;
+        self.a1 += step.a1;
+        self.a2 += step.a2;
     }
 
     fn normalised(b0: f64, b1: f64, b2: f64, a0: f64, a1: f64, a2: f64) -> Self {
@@ -113,40 +155,16 @@ impl Biquad {
 mod tests {
     use super::*;
     use crate::SineOsc;
+    use crate::test_util::{BUTTERWORTH_Q, SR, db, max_step, measured_gain};
 
-    const SR: f32 = 48_000.0;
-    /// Maximally flat: -3.01 dB at the cutoff, no resonant peak.
-    const BUTTERWORTH_Q: f32 = std::f32::consts::FRAC_1_SQRT_2;
-
-    fn db(gain: f32) -> f32 {
-        20.0 * gain.log10()
-    }
-
-    /// Magnitude response at `freq_hz`, measured the way it would be on a bench:
-    /// drive the filter with a sine, wait for the transient to decay, then compare
-    /// output and input RMS over the same window. Measuring the input rather than
-    /// assuming `1/sqrt(2)` cancels most of the error of a non-integer cycle count.
-    fn measured_gain(filter: &mut Biquad, freq_hz: f32) -> f32 {
-        let mut osc = SineOsc::new(SR);
-        // A biquad settles in a few hundred samples; this is a wide margin.
-        for _ in 0..8_192 {
-            filter.process_sample(osc.next_sample(freq_hz));
-        }
-        let len = ((64.0 * SR / freq_hz) as usize).max(4_096);
-        let (mut sum_in, mut sum_out) = (0.0f64, 0.0f64);
-        for _ in 0..len {
-            let x = osc.next_sample(freq_hz);
-            let y = filter.process_sample(x);
-            sum_in += f64::from(x) * f64::from(x);
-            sum_out += f64::from(y) * f64::from(y);
-        }
-        (sum_out / sum_in).sqrt() as f32
+    fn gain(filter: &mut Biquad, freq_hz: f32) -> f32 {
+        measured_gain(|x| filter.process_sample(x), freq_hz)
     }
 
     #[test]
     fn low_pass_leaves_the_passband_alone() {
         let mut f = Biquad::new(Coefficients::low_pass(1_000.0, BUTTERWORTH_Q, SR));
-        let gain = db(measured_gain(&mut f, 50.0));
+        let gain = db(gain(&mut f, 50.0));
         assert!(gain.abs() < 0.1, "passband gain is {gain} dB, expected 0");
     }
 
@@ -154,7 +172,7 @@ mod tests {
     fn low_pass_is_minus_3_db_at_the_cutoff() {
         // The bilinear transform is prewarped at the cutoff, so this point is exact.
         let mut f = Biquad::new(Coefficients::low_pass(1_000.0, BUTTERWORTH_Q, SR));
-        let gain = db(measured_gain(&mut f, 1_000.0));
+        let gain = db(gain(&mut f, 1_000.0));
         assert!((gain + 3.01).abs() < 0.2, "cutoff gain is {gain} dB, expected -3.01");
     }
 
@@ -164,8 +182,8 @@ mod tests {
         // well above the cutoff but far enough below Nyquist that the frequency
         // warping of the bilinear transform stays under a few tenths of a dB.
         let coeffs = Coefficients::low_pass(500.0, BUTTERWORTH_Q, SR);
-        let at_2k = db(measured_gain(&mut Biquad::new(coeffs), 2_000.0));
-        let at_4k = db(measured_gain(&mut Biquad::new(coeffs), 4_000.0));
+        let at_2k = db(gain(&mut Biquad::new(coeffs), 2_000.0));
+        let at_4k = db(gain(&mut Biquad::new(coeffs), 4_000.0));
         let slope = at_4k - at_2k;
         assert!((slope + 12.0).abs() < 1.0, "slope is {slope} dB/octave, expected -12");
     }
@@ -183,15 +201,15 @@ mod tests {
     #[test]
     fn high_pass_is_minus_3_db_at_the_cutoff() {
         let mut f = Biquad::new(Coefficients::high_pass(1_000.0, BUTTERWORTH_Q, SR));
-        let gain = db(measured_gain(&mut f, 1_000.0));
+        let gain = db(gain(&mut f, 1_000.0));
         assert!((gain + 3.01).abs() < 0.2, "cutoff gain is {gain} dB, expected -3.01");
     }
 
     #[test]
     fn high_pass_rolls_off_at_12_db_per_octave() {
         let coeffs = Coefficients::high_pass(4_000.0, BUTTERWORTH_Q, SR);
-        let at_1k = db(measured_gain(&mut Biquad::new(coeffs), 1_000.0));
-        let at_500 = db(measured_gain(&mut Biquad::new(coeffs), 500.0));
+        let at_1k = db(gain(&mut Biquad::new(coeffs), 1_000.0));
+        let at_500 = db(gain(&mut Biquad::new(coeffs), 500.0));
         let slope = at_500 - at_1k;
         assert!((slope + 12.0).abs() < 1.0, "slope is {slope} dB/octave, expected -12");
     }
@@ -200,7 +218,7 @@ mod tests {
     fn resonance_peaks_at_the_cutoff() {
         // At high Q the low-pass overshoots around the cutoff, by roughly Q itself.
         let mut f = Biquad::new(Coefficients::low_pass(1_000.0, 8.0, SR));
-        let gain = db(measured_gain(&mut f, 1_000.0));
+        let gain = db(gain(&mut f, 1_000.0));
         assert!((gain - db(8.0)).abs() < 0.5, "resonant peak is {gain} dB, expected ~18");
     }
 
@@ -240,20 +258,20 @@ mod tests {
     /// from 0 to 1 over the run.
     fn max_output_step(cutoff_at: impl Fn(f32) -> f32, updates: usize) -> f32 {
         let mut f = Biquad::new(Coefficients::low_pass(cutoff_at(0.0), BUTTERWORTH_Q, SR));
-        let mut osc = SineOsc::new(SR);
-        let (mut prev, mut worst) = (0.0f32, 0.0f32);
-        for i in 0..RUN_LEN {
-            if i % (RUN_LEN / updates) == 0 {
-                let cutoff = cutoff_at(i as f32 / RUN_LEN as f32);
-                f.set_coefficients(Coefficients::low_pass(cutoff, BUTTERWORTH_Q, SR));
-            }
-            let y = f.process_sample(osc.next_sample(PROBE_HZ));
-            if i > SETTLE {
-                worst = worst.max((y - prev).abs());
-            }
-            prev = y;
-        }
-        worst
+        let mut i = 0usize;
+        max_step(
+            |x| {
+                if i.is_multiple_of(RUN_LEN / updates) {
+                    let cutoff = cutoff_at(i as f32 / RUN_LEN as f32);
+                    f.set_coefficients(Coefficients::low_pass(cutoff, BUTTERWORTH_Q, SR));
+                }
+                i += 1;
+                f.process_sample(x)
+            },
+            PROBE_HZ,
+            RUN_LEN,
+            SETTLE,
+        )
     }
 
     /// The step the signal is responsible for on its own, cutoff held still.

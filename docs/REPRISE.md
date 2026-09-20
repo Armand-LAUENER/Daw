@@ -1,4 +1,4 @@
-# Reprise — état du projet au 2026-09-19
+# Reprise — état du projet au 2026-09-20
 
 À lire en premier en reprenant le projet. Le plan complet et le journal de bord
 sont dans [`plan-daw-rust.md`](../plan-daw-rust.md).
@@ -9,16 +9,31 @@ sont dans [`plan-daw-rust.md`](../plan-daw-rust.md).
 un thread de contrôle, 10 min puis 30 min sans xrun en natif Windows (WASAPI),
 aucun clic audible aux changements de note.
 
-**Prochaine étape : phase 1** (lecture de fichier + filtre). Le plan d'attaque
-est prêt, mais trois décisions restent à prendre (voir en bas).
+**Phase 1, incréments 1 et 2 faits** (`engine-dsp` uniquement, rien n'est encore
+branché sur le thread audio) :
+
+1. **Biquad RBJ** passe-bas et passe-haut, forme directe II transposée. Validé
+   par sonde à sinus, sans dépendance : -3,01 dB à la coupure, -12 dB/octave,
+   pic de résonance ≈ Q, blocage du continu.
+2. **`SmoothedBiquad`** : coupure lissée et coefficients interpolés, de sorte
+   qu'un balayage bouge moins que le signal lui-même.
+
+**Prochaine étape : incrément 3**, la lecture de fichier (`engine-io-file`). La
+décision sur les dépendances de décodage reste à prendre (voir en bas).
+
+Le dépôt est sur GitHub (`Armand-LAUENER/Daw`, privé) et la CI y tourne sur
+Linux et Windows.
 
 ## Architecture actuelle
 
 ```
 crates/
 ├── engine-dsp/   DSP pur, sans I/O, testable sans carte son
-│   ├── oscillator.rs   SineOsc : phase f64 normalisée, continue aux changements de fréquence
-│   └── smoother.rs     LinearSmoother : rampe dérivée de la cible (pas d'accumulation f32)
+│   ├── oscillator.rs       SineOsc : phase f64 normalisée, continue aux changements de fréquence
+│   ├── smoother.rs         LinearSmoother : rampe dérivée de la cible (pas d'accumulation f32)
+│   ├── biquad.rs           Coefficients RBJ (calcul f64, stockage f32) + Biquad en forme directe II transposée
+│   ├── smoothed_biquad.rs  SmoothedBiquad : coupure lissée en octaves, coefficients interpolés
+│   └── test_util.rs        Banc de mesure des tests : gain par sonde à sinus, plus grand pas de sortie
 └── engine-io/    cpal + thread audio
     ├── processor.rs    SineProcessor : tout ce que le callback possède (indépendant de cpal)
     ├── stream.rs       AudioEngine : ouverture du device, EngineOptions::validate
@@ -80,11 +95,9 @@ exécution.
 
 Incréments, chacun testé et commité séparément :
 
-1. **Biquad RBJ** passe-bas et passe-haut dans `engine-dsp`. Validation par mesure de la
-   réponse (pente -12 dB/oct, gain à la coupure).
-2. **Modulation de la coupure sans zipper** : coupure lissée par
-   `LinearSmoother`, coefficients recalculés tous les N samples. Tests de
-   continuité et de stabilité pendant un balayage.
+1. ~~**Biquad RBJ** passe-bas et passe-haut dans `engine-dsp`.~~ **Fait.**
+2. ~~**Modulation de la coupure sans zipper.**~~ **Fait**, mais pas comme prévu :
+   voir « Ce que les mesures ont corrigé » ci-dessous.
 3. **Crate `engine-io-file`** : décodage avec `symphonia`, et rééchantillonnage
    44,1 → 48 kHz.
 4. **Thread de préchargement et transport** (lecture, pause, seek, boucle).
@@ -94,14 +107,48 @@ Incréments, chacun testé et commité séparément :
    `scripts/windows.sh`. S'y ajoute un rendu hors ligne du pipeline dans les
    tests, pour mesurer l'absence de discontinuité aux seeks.
 
-### Décisions en attente (à trancher au début de la prochaine session)
+### Ce que les mesures ont corrigé
 
-1. **Qui écrit le code ?** Claude, ou l'utilisateur guidé par Claude sur les
-   parties clés (biquad, protocole de seek). Le projet vise l'apprentissage.
-2. **Dépendances** : `symphonia` (décodage) et `rubato` (rééchantillonnage) ?
-   Alternative temporaire : n'accepter que des fichiers à 48 kHz.
-3. **Validation du biquad** : sonde à sinus, sans dépendance, ou FFT
-   (`rustfft` en dev-dependency), comme le prévoit le plan ?
+Quatre croyances fausses, chacune démolie par un test et gardée comme test :
 
-Par défaut, si rien n'est précisé : Claude code l'incrément 1 avec la sonde à
-sinus, sans nouvelle dépendance.
+1. **« Changer les coefficients garde la sortie continue. »** Faux :
+   `y = b0·x + z1`, donc un saut de `b0` fait sauter la sortie de `Δb0·x`. Ce
+   qui est vrai, c'est que le saut est *proportionnel* au changement — d'où le
+   lissage.
+2. **« La sortie reste bornée sous n'importe quelle modulation. »** Faux : un
+   filtre calé près du continu garde son transitoire des secondes, et des
+   commutations brutales successives pompent jusqu'à +40 dB (mesuré : 105× à
+   1 Hz). Seule la **finitude** tient inconditionnellement.
+3. **« Lisser la coupure en hertz suffit. »** Faux : de 20 kHz à 20 Hz, une
+   rampe linéaire en hertz passe neuf dixièmes du temps au-dessus de 1 kHz puis
+   traverse toute la bande audible en une fraction de ms — un saut déguisé.
+   `SmoothedBiquad` lisse donc `log2(coupure)`.
+4. **« Recalculer les coefficients tous les N samples suffit. »** Faux : 15
+   recalculs sur une rampe de 480 samples restent 15 marches. Il faut
+   **interpoler** les coefficients entre deux recalculs (5 additions par sample
+   contre un sinus). Effet de bord mesuré : l'intervalle de recalcul devient
+   presque indifférent, la CPU se règle donc librement.
+
+Deux limites connues, assumées et documentées dans le code :
+
+- **Dénormaux** : après un passage en silence l'état du filtre décroît vers des
+  dénormaux, coûteux sur x86 et candidats à un xrun. Rien n'a été ajouté sans
+  mesure — à mesurer en branchant le filtre sur `engine-io`.
+- **Rampe contre temps d'établissement** : lisser un paramètre n'aide que tant
+  que le filtre s'établit plus vite que la rampe ne défile. Une rampe de 10 ms
+  vaut `1/(2π·0,01)` ≈ 16 Hz : en dessous de ~20 Hz de coupure, le changement
+  dépasse le filtre et ce qu'on mesure est son transitoire propre. Les tests de
+  propriétés restent donc au-dessus de 100 Hz.
+- **Résonance en balayage** : à Q > 1/√2, un filtre balayé dépasse
+  transitoirement son pic en régime établi. C'est physique, pas un clic. Les
+  tests de propriétés bornent donc le *pas* de sortie seulement pour Q ≤ 1/√2,
+  et la bornitude séparément pour les Q résonants.
+
+### Décisions en attente
+
+1. **Dépendances de décodage** : `symphonia` (décodage) et `rubato`
+   (rééchantillonnage) ? Alternative temporaire : n'accepter que des fichiers à
+   48 kHz. **C'est la seule décision qui bloque l'incrément 3.**
+
+Tranché depuis : Claude écrit le code (Armand relit) ; validation par sonde à
+sinus, sans `rustfft`.

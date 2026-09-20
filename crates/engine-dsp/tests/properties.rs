@@ -1,9 +1,9 @@
 //! Property tests: invariants that must hold for any parameter sequence,
 //! not just the hand-picked values of the unit tests.
 
-use std::f32::consts::TAU;
+use std::f32::consts::{FRAC_1_SQRT_2, TAU};
 
-use engine_dsp::{Biquad, Coefficients, LinearSmoother, SineOsc};
+use engine_dsp::{Biquad, Coefficients, FilterKind, LinearSmoother, SineOsc, SmoothedBiquad};
 use proptest::collection::vec;
 use proptest::prelude::*;
 
@@ -148,6 +148,50 @@ proptest! {
                 f.set_coefficients(Coefficients::low_pass(cutoff.next_value(), q, SR));
                 let y = f.process_sample(osc.next_sample(1_000.0));
                 prop_assert!(y.abs() < 3.0 * q.max(1.0), "q {q}, cutoff {target}: output {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_smoothed_biquad_never_clicks(
+        // The ramp only helps while the filter settles faster than the ramp runs.
+        // A 10 ms ramp is 1/(2*pi*0.01) = 16 Hz, so below ~20 Hz a cutoff change
+        // outruns the filter and what shows up is its own transient, not zipper
+        // noise. 100 Hz keeps a factor of six between the two.
+        moves in vec((100.0f32..20_000.0, 1usize..2_000), 1..24),
+        q in 0.1f32..=FRAC_1_SQRT_2,
+        low_pass in any::<bool>(),
+    ) {
+        // The phase 1 exit criterion in miniature: whatever the control thread
+        // asks for, a 200 Hz unit sine must come out moving no faster than it
+        // went in. That bounds the click a cutoff change can produce, whereas
+        // `biquad_never_produces_non_finite_samples` only bounds the damage.
+        //
+        // Q stops at 1/sqrt(2), where the response is still flat. Above it the
+        // filter resonates, and a resonant filter being swept overshoots its own
+        // steady-state peak as the energy stored at the old resonance comes back
+        // out — real behaviour, not a click, but not a bound this test can state.
+        // Resonant modulation is covered by `a_smoothly_modulated_biquad_stays_bounded`.
+        const PROBE_HZ: f32 = 200.0;
+        let kind = if low_pass { FilterKind::LowPass } else { FilterKind::HighPass };
+        let mut f = SmoothedBiquad::new(kind, 1_000.0, q, SR, 10.0);
+        let mut osc = SineOsc::new(SR);
+        // Let the start-up transient pass before watching for steps.
+        let mut prev = (0..2_048).map(|_| f.process_sample(osc.next_sample(PROBE_HZ))).last().unwrap_or(0.0);
+        // No resonant peak below 1/sqrt(2), so the probe never comes out louder
+        // than it went in, and the headroom is the modulation's own share. A
+        // click is an order-of-magnitude event, so what this pins down is that
+        // modulation stays a minor part of the motion, never the dominant one;
+        // the exact fraction for one nominal sweep is pinned by the unit test
+        // `a_ramped_sweep_is_lost_in_the_signal`, which holds it under 5%.
+        let headroom = 1.25;
+        for (cutoff, hold) in moves {
+            f.set_cutoff(cutoff);
+            for _ in 0..hold {
+                let y = f.process_sample(osc.next_sample(PROBE_HZ));
+                let step = (y - prev).abs();
+                prop_assert!(step <= TAU * PROBE_HZ / SR * headroom, "step {step} at cutoff {cutoff}, q {q}");
+                prev = y;
             }
         }
     }

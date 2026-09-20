@@ -5,8 +5,12 @@
 
 mod biquad;
 mod oscillator;
+mod smoothed_biquad;
 mod smoother;
+#[cfg(test)]
+mod test_util;
 
-pub use biquad::{Biquad, Coefficients};
+pub use biquad::{Biquad, Coefficients, FilterKind};
 pub use oscillator::SineOsc;
+pub use smoothed_biquad::{DEFAULT_UPDATE_INTERVAL, SmoothedBiquad};
 pub use smoother::LinearSmoother;
