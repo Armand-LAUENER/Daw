@@ -119,6 +119,23 @@ impl SmoothedBiquad {
         self.filter.process_sample(x)
     }
 
+    /// Filters a buffer in place.
+    ///
+    /// Only the samples that actually carry a coefficient change go through the
+    /// per-sample path; as soon as the ramp has landed, the rest of the buffer
+    /// runs through [`Biquad::process_block`]. A filter nobody is touching
+    /// therefore costs exactly a plain biquad, which per-sample calls cannot
+    /// deliver: the branches here may write the coefficients, so on that path
+    /// they are reloaded from memory for every sample.
+    pub fn process_block(&mut self, buf: &mut [f32]) {
+        let mut i = 0;
+        while i < buf.len() && (self.stale || self.gliding > 0) {
+            buf[i] = self.process_sample(buf[i]);
+            i += 1;
+        }
+        self.filter.process_block(&mut buf[i..]);
+    }
+
     /// Clears the delay line and snaps the cutoff to its target, as when starting
     /// playback at a new position: there is no previous audio to glide away from.
     pub fn reset(&mut self) {
@@ -249,6 +266,32 @@ mod tests {
             let x = osc.next_sample(PROBE_HZ);
             assert_eq!(f.process_sample(x), plain.process_sample(x), "diverged at sample {i}");
         }
+    }
+
+    #[test]
+    fn blocks_match_the_samples_they_hold_across_a_sweep() {
+        // The case the split exists for: a cutoff change lands at a block
+        // boundary, so the next blocks are part modulated, part settled. Bit
+        // equality, because process_block may only change the speed.
+        const CHUNK: usize = 37;
+        let mut osc = SineOsc::new(SR);
+        let input: Vec<f32> = (0..2_000).map(|_| osc.next_sample(PROBE_HZ)).collect();
+
+        let (mut by_sample, mut by_block) = (low_pass(800.0, RAMP_MS), low_pass(800.0, RAMP_MS));
+        let mut expected = Vec::with_capacity(input.len());
+        let mut got = input.clone();
+        for (n, block) in got.chunks_mut(CHUNK).enumerate() {
+            if n == 3 {
+                by_sample.set_cutoff(4_000.0);
+                by_block.set_cutoff(4_000.0);
+            }
+            let start = n * CHUNK;
+            for k in 0..block.len() {
+                expected.push(by_sample.process_sample(input[start + k]));
+            }
+            by_block.process_block(block);
+        }
+        assert_eq!(got, expected);
     }
 
     #[test]

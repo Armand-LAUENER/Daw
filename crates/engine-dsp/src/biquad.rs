@@ -144,6 +144,25 @@ impl Biquad {
         y
     }
 
+    /// Filters a buffer in place.
+    ///
+    /// Prefer this to [`Biquad::process_sample`] in a loop. Pulling the
+    /// coefficients and the delay line into locals lets them stay in registers
+    /// for the whole buffer; called one sample at a time, the compiler has to
+    /// assume the caller may have changed them and reloads them every time.
+    pub fn process_block(&mut self, buf: &mut [f32]) {
+        let Coefficients { b0, b1, b2, a1, a2 } = self.coeffs;
+        let (mut z1, mut z2) = (self.z1, self.z2);
+        for x in buf.iter_mut() {
+            let y = b0 * *x + z1;
+            z1 = b1 * *x - a1 * y + z2;
+            z2 = b2 * *x - a2 * y;
+            *x = y;
+        }
+        self.z1 = z1;
+        self.z2 = z2;
+    }
+
     /// Clears the delay line, as when starting playback at a new position.
     pub fn reset(&mut self) {
         self.z1 = 0.0;
@@ -234,6 +253,35 @@ mod tests {
                 assert!(y.is_finite() && y.abs() < 100.0, "cutoff {cutoff}, q {q}: output {y}");
             }
         }
+    }
+
+    #[test]
+    fn blocks_match_the_samples_they_hold() {
+        // The whole point of process_block is that it only changes the speed, so
+        // this asks for bit equality rather than closeness.
+        let coeffs = Coefficients::low_pass(1_000.0, BUTTERWORTH_Q, SR);
+        let mut osc = SineOsc::new(SR);
+        let input: Vec<f32> = (0..1_000).map(|_| osc.next_sample(200.0)).collect();
+
+        let mut one_at_a_time = Biquad::new(coeffs);
+        let expected: Vec<f32> = input.iter().map(|x| one_at_a_time.process_sample(*x)).collect();
+
+        // An odd chunk size, so the delay line has to carry across boundaries
+        // and the last block is short.
+        let mut in_blocks = Biquad::new(coeffs);
+        let mut got = input;
+        for chunk in got.chunks_mut(37) {
+            in_blocks.process_block(chunk);
+        }
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn an_empty_block_leaves_the_filter_alone() {
+        let coeffs = Coefficients::low_pass(1_000.0, BUTTERWORTH_Q, SR);
+        let mut f = Biquad::new(coeffs);
+        f.process_block(&mut []);
+        assert_eq!(f.process_sample(1.0), Biquad::new(coeffs).process_sample(1.0));
     }
 
     #[test]

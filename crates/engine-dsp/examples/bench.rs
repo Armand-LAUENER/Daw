@@ -58,6 +58,52 @@ fn main() {
         z = sweeping.process_sample(z).mul_add(0.5, 0.25);
         z
     });
+
+    println!();
+
+    // Filtering in place would feed each block its own output and decay into
+    // denormals, so the harness refills the buffer every time. That refill is
+    // inside the timing: this row is what it costs, to be subtracted from the
+    // ones below.
+    bench_block("(buffer refill, subtract this)", |_| {});
+
+    let mut biquad_block = Biquad::new(Coefficients::low_pass(1_000.0, 0.707, SR));
+    bench_block("Biquad, block", |buf| biquad_block.process_block(buf));
+
+    let mut settled_block = SmoothedBiquad::new(FilterKind::LowPass, 1_000.0, 0.707, SR, 10.0);
+    bench_block("SmoothedBiquad settled, block", |buf| settled_block.process_block(buf));
+
+    let mut sweeping_block = SmoothedBiquad::new(FilterKind::LowPass, 200.0, 0.707, SR, 10.0);
+    let mut n = 0usize;
+    bench_block("SmoothedBiquad sweeping, block", |buf| {
+        sweeping_block.set_cutoff(if n.is_multiple_of(2) { 8_000.0 } else { 200.0 });
+        n += 1;
+        sweeping_block.process_block(buf);
+    });
+}
+
+/// Same measurement, for code that takes a whole buffer at a time.
+fn bench_block(name: &str, mut run: impl FnMut(&mut [f32])) {
+    let mut buf = vec![0.0f32; BUFFER_FRAMES as usize];
+    let blocks = SAMPLES / buf.len();
+    let fill = |buf: &mut Vec<f32>| {
+        // Refill from a bounded signal so the filter never decays into denormals.
+        for (i, x) in buf.iter_mut().enumerate() {
+            *x = if i % 2 == 0 { 0.5 } else { -0.5 };
+        }
+    };
+    for _ in 0..blocks / 10 {
+        fill(&mut buf);
+        run(black_box(&mut buf));
+    }
+    let started = Instant::now();
+    for _ in 0..blocks {
+        fill(&mut buf);
+        run(black_box(&mut buf));
+    }
+    black_box(&buf);
+    let ns = started.elapsed().as_secs_f64() * 1e9 / (blocks * buf.len()) as f64;
+    report(name, ns);
 }
 
 fn bench(name: &str, mut run: impl FnMut() -> f32) {
@@ -69,7 +115,10 @@ fn bench(name: &str, mut run: impl FnMut() -> f32) {
     for _ in 0..SAMPLES {
         black_box(run());
     }
-    let ns = started.elapsed().as_secs_f64() * 1e9 / SAMPLES as f64;
+    report(name, started.elapsed().as_secs_f64() * 1e9 / SAMPLES as f64);
+}
+
+fn report(name: &str, ns: f64) {
     let buffer_ns = BUFFER_FRAMES / f64::from(SR) * 1e9;
     let share = ns * BUFFER_FRAMES / buffer_ns * 100.0;
     println!("{name:<34} {ns:>10.2} {:>13.1} {share:>15.3}%", 1_000.0 / ns);

@@ -152,27 +152,35 @@ rien, un unique dépassement le fixe pour tout le run. Hors ligne :
 `scripts/windows.sh bench` (ou `cargo run --release -p engine-dsp --example
 bench`) donne le débit en ns/échantillon.
 
-Relevé du 2026-09-20, ns/échantillon :
+Relevé du 2026-09-20 sous Windows natif, ns/échantillon (les chiffres par bloc
+sont nets du remplissage de buffer, que le banc affiche à part) :
 
-| cas | WSL | Windows natif |
+| cas | par échantillon | par bloc |
 |---|---|---|
-| SineOsc | 9,01 | 4,10 |
-| LinearSmoother | 0,47 | 0,42 |
-| Biquad | 4,52 | **2,25** |
-| SmoothedBiquad, au repos | 4,49 | **4,00** |
-| SmoothedBiquad, en balayage | 6,04 | 4,68 |
+| SineOsc | 4,52 | — |
+| LinearSmoother | 0,41 | — |
+| Biquad | 2,25 | 2,44 |
+| SmoothedBiquad, au repos | 3,98 | **2,32** |
+| SmoothedBiquad, en balayage | 4,64 | 3,44 |
 
-**Ne jamais conclure sur des chiffres WSL.** Sous WSL, `SmoothedBiquad` au repos
-semblait coûter exactement le prix d'un `Biquad` nu, d'où la conclusion — fausse
-— que l'arrêt des mises à jour était gratuit. Sous Windows le `Biquad` descend à
-2,25 ns et le surcoût réel apparaît : **environ 75 %**, masqué par une baseline
-WSL deux fois trop lente.
+**Utiliser `process_block`, pas `process_sample` en boucle.** Appelé échantillon
+par échantillon, `SmoothedBiquad` coûte 75 % de plus qu'un `Biquad` nu : ses
+branches `stale` et `gliding` peuvent écrire les coefficients, que le compilateur
+recharge donc depuis la mémoire à chaque tour. Par blocs il teste l'état une fois
+par buffer, et l'enveloppe redevient gratuite — 2,39 contre 2,51 pour le biquad
+nu dans le même harnais, soit du bruit.
 
-Cause probable, non encore vérifiée : les branches `stale` et `gliding` peuvent
-écrire les coefficients, donc le compilateur les recharge depuis la mémoire à
-chaque échantillon au lieu de les garder en registres. Correction attendue : un
-`process_block`, qui teste l'état une fois par buffer puis déroule une boucle
-serrée — c'est de toute façon la forme qu'appelle le callback.
+Deux pièges de méthode, payés une fois chacun :
+
+- **Ne jamais conclure sur des chiffres WSL.** Sous WSL, `SmoothedBiquad` au
+  repos semblait coûter exactement le prix d'un `Biquad` nu (4,49 contre 4,52),
+  d'où la conclusion — fausse — que l'arrêt des mises à jour était gratuit. La
+  baseline WSL était deux fois trop lente et masquait le surcoût.
+- **Ne comparer qu'à l'intérieur d'un même harnais.** Le cas par échantillon
+  entretient une dépendance de données artificielle pour empêcher l'optimiseur
+  de sortir la boucle ; le cas par bloc lit un buffer rempli. Les deux colonnes
+  ci-dessus ne mesurent donc pas le même travail et ne se comparent pas ligne
+  à ligne.
 
 ### Décisions prises
 
