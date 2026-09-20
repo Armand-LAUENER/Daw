@@ -10,6 +10,8 @@ engine-dsp.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# Holds Graph::process to the audio thread's no-allocation rule.
+assert_no_alloc.workspace = true
 
 [lints]
 workspace = true

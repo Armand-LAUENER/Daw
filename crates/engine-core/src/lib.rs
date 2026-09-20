@@ -10,7 +10,9 @@
 //! strided; the device's interleaved shape is converted once at each end.
 
 mod buffer;
+mod graph;
 mod node;
 
 pub use buffer::AudioBuffer;
+pub use graph::{Graph, GraphBuilder, GraphError, NodeId};
 pub use node::{Gain, Mute, Node, PARAM_RAMP_MS, Pan};
