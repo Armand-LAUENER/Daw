@@ -3,11 +3,30 @@
 
 use std::f32::consts::TAU;
 
-use engine_dsp::{LinearSmoother, SineOsc};
+use engine_dsp::{Biquad, Coefficients, LinearSmoother, SineOsc};
 use proptest::collection::vec;
 use proptest::prelude::*;
 
 const SR: f32 = 48_000.0;
+/// Maximally flat: -3.01 dB at the cutoff, whatever the cutoff.
+const BUTTERWORTH_Q: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+/// Magnitude response at `freq_hz`, from the output/input RMS ratio once the
+/// filter's transient has decayed. Fixed lengths keep the cost per case flat.
+fn gain_at(filter: &mut Biquad, freq_hz: f32) -> f32 {
+    let mut osc = SineOsc::new(SR);
+    for _ in 0..8_192 {
+        filter.process_sample(osc.next_sample(freq_hz));
+    }
+    let (mut sum_in, mut sum_out) = (0.0f64, 0.0f64);
+    for _ in 0..16_384 {
+        let x = osc.next_sample(freq_hz);
+        let y = filter.process_sample(x);
+        sum_in += f64::from(x) * f64::from(x);
+        sum_out += f64::from(y) * f64::from(y);
+    }
+    (sum_out / sum_in).sqrt() as f32
+}
 
 proptest! {
     #[test]
@@ -83,5 +102,66 @@ proptest! {
                 prev = v;
             }
         }
+    }
+
+    #[test]
+    fn biquad_never_produces_non_finite_samples(
+        params in vec((1.0f32..20_000.0, 0.1f32..10.0, 0usize..64), 1..32),
+        low_pass in any::<bool>(),
+    ) {
+        // Whatever the control thread throws at it — including cutoffs past
+        // Nyquist, which the coefficients clamp — the filter must never hand the
+        // device a NaN or an infinity. Note that this says nothing about level:
+        // retuning abruptly injects a transient, and a filter tuned near DC holds
+        // it for seconds, so repeated jumps can pile up tens of dB. Bounded output
+        // is a property of *smooth* modulation, covered by the next test.
+        let mut f = Biquad::new(Coefficients::low_pass(1_000.0, BUTTERWORTH_Q, SR));
+        let mut osc = SineOsc::new(SR);
+        for (cutoff, q, hold) in params {
+            f.set_coefficients(if low_pass {
+                Coefficients::low_pass(cutoff, q, SR)
+            } else {
+                Coefficients::high_pass(cutoff, q, SR)
+            });
+            for _ in 0..hold {
+                let y = f.process_sample(osc.next_sample(1_000.0));
+                prop_assert!(y.is_finite(), "cutoff {cutoff}, q {q}: output {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_smoothly_modulated_biquad_stays_bounded(
+        targets in vec((20.0f32..20_000.0, 1u32..480), 1..16),
+        q in 0.1f32..10.0,
+    ) {
+        // The intended way to modulate: the cutoff goes through a smoother and the
+        // coefficients are recomputed every sample. A 1 kHz unit sine can then only
+        // come out at the resonant gain, which is about Q; the bound leaves a factor
+        // of three for the sweep's own transient.
+        let mut cutoff = LinearSmoother::with_duration(1_000.0, 10.0, SR);
+        let mut f = Biquad::new(Coefficients::low_pass(1_000.0, q, SR));
+        let mut osc = SineOsc::new(SR);
+        for (target, hold) in targets {
+            cutoff.set_target(target);
+            for _ in 0..hold {
+                f.set_coefficients(Coefficients::low_pass(cutoff.next_value(), q, SR));
+                let y = f.process_sample(osc.next_sample(1_000.0));
+                prop_assert!(y.abs() < 3.0 * q.max(1.0), "q {q}, cutoff {target}: output {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn butterworth_is_minus_3_db_at_any_cutoff(cutoff in 200.0f32..8_000.0, low_pass in any::<bool>()) {
+        // The bilinear transform is prewarped at the cutoff, so this holds across
+        // the range, not just where the unit tests happen to sample it.
+        let coeffs = if low_pass {
+            Coefficients::low_pass(cutoff, BUTTERWORTH_Q, SR)
+        } else {
+            Coefficients::high_pass(cutoff, BUTTERWORTH_Q, SR)
+        };
+        let db = 20.0 * gain_at(&mut Biquad::new(coeffs), cutoff).log10();
+        prop_assert!((db + 3.01).abs() < 0.2, "{db} dB at {cutoff} Hz, expected -3.01");
     }
 }
