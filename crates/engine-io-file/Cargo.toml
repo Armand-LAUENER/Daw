@@ -1,0 +1,20 @@
+[package]
+name = "engine-io-file"
+description = "Audio file decoding and sample-rate conversion, off the audio thread."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Formats worth having on day one. Every extra decoder is build time and attack
+# surface, so the list stays explicit rather than pulling "all-codecs".
+# `wav` is only the container: without `pcm` the samples inside it have no
+# decoder. Same split for `isomp4` and `aac`.
+symphonia = { workspace = true, features = ["wav", "pcm", "flac", "mp3", "isomp4", "aac"] }
+rubato.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

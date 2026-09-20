@@ -99,7 +99,7 @@ Incréments, chacun testé et commité séparément :
 2. ~~**Modulation de la coupure sans zipper.**~~ **Fait**, mais pas comme prévu :
    voir « Ce que les mesures ont corrigé » ci-dessous.
 3. **Crate `engine-io-file`** : décodage avec `symphonia`, et rééchantillonnage
-   44,1 → 48 kHz.
+   44,1 → 48 kHz. **Échafaudage posé, décodeur à écrire** — voir ci-dessous.
 4. **Thread de préchargement et transport** (lecture, pause, seek, boucle).
    Un compteur de génération sert à jeter l'audio obsolète après un seek, et
    des micro-fondus évitent les clics sur les pauses et les seeks.
@@ -143,6 +143,40 @@ Deux limites connues, assumées et documentées dans le code :
   transitoirement son pic en régime établi. C'est physique, pas un clic. Les
   tests de propriétés bornent donc le *pas* de sortie seulement pour Q ≤ 1/√2,
   et la bornitude séparément pour les Q résonants.
+
+### Incrément 3 — où exactement il est arrêté
+
+Le crate `crates/engine-io-file` existe, les dépendances sont en place et
+`cargo build --workspace` passe. `src/lib.rs` ne contient que la documentation
+de module : **le décodeur reste à écrire**.
+
+Dépendances retenues, `default-features = false` au niveau workspace pour que
+chaque crate nomme ses formats au lieu d'embarquer tous les décodeurs :
+
+- `symphonia 0.6.1`, features `wav`, `pcm`, `flac`, `mp3`, `isomp4`, `aac`.
+  Attention : `wav` n'est que le conteneur, sans `pcm` les échantillons qu'il
+  contient n'ont pas de décodeur. Même découpage pour `isomp4` / `aac`.
+- `rubato 5.0.0`.
+
+**Les deux API ont été fortement remaniées** par rapport aux versions
+couramment documentées en ligne. Notes relevées dans les sources, à reprendre
+telles quelles plutôt que de coder de mémoire :
+
+- `symphonia 0.6` : `FormatReader` porte une lifetime (`Box<dyn FormatReader + 's>`) ;
+  `next_packet()` renvoie `Result<Option<Packet>>` ; les codecs audio ont leur
+  propre registre (`make_audio_decoder`, `AudioDecoderOptions`) ; les buffers
+  passent par `GenericAudioBufferRef`, avec `spec()`, `frames()` et
+  `copy_to_slice_interleaved` / `copy_to_vec_interleaved` pour sortir du f32
+  entrelacé. `Track::codec_params` est un `Option<CodecParameters>`.
+  Point d'entrée : `symphonia::default::get_probe().probe(&hint, mss, fmt_opts, meta_opts)`.
+- `rubato 5.0` : plus de `FftFixedIn`. Les types sont `Fft`, `FixedSync`,
+  `Async`, `FixedAsync` ; les buffers passent par le crate `audioadapter`. Le
+  trait `Resampler` expose `process_all_into_buffer`, `input_frames_next`,
+  `output_frames_max`.
+
+Pour les tests, prévoir de construire un WAV en mémoire (sinus à 44,1 kHz) et de
+le passer par un `Cursor<Vec<u8>>` : ça évite un fichier binaire dans le dépôt et
+permet de vérifier que la fréquence survit au rééchantillonnage vers 48 kHz.
 
 ### Performance mesurée
 
