@@ -12,7 +12,9 @@
 mod buffer;
 mod graph;
 mod node;
+mod swap;
 
 pub use buffer::AudioBuffer;
 pub use graph::{Graph, GraphBuilder, GraphError, NodeId};
 pub use node::{Gain, Mute, Node, PARAM_RAMP_MS, Pan};
+pub use swap::{GraphPlayer, GraphSwapper, SWAP_FADE_MS, graph_channel};

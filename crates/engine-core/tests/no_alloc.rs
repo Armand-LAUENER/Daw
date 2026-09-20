@@ -9,7 +9,7 @@
 #![cfg(debug_assertions)]
 
 use assert_no_alloc::{AllocDisabler, assert_no_alloc};
-use engine_core::{AudioBuffer, Gain, GraphBuilder, Mute, Node, Pan};
+use engine_core::{AudioBuffer, Gain, GraphBuilder, Mute, Node, Pan, graph_channel};
 
 #[global_allocator]
 static ALLOC: AllocDisabler = AllocDisabler;
@@ -65,4 +65,43 @@ fn processing_a_graph_does_not_allocate() {
 
     assert!(out.iter().any(|s| *s != 0.0), "the graph produced silence, so it proved nothing");
     assert!(out.iter().all(|s| s.is_finite()), "the mix went non-finite");
+}
+
+/// Builds a one-node graph at `level`, for swapping in.
+fn constant_graph(level: f32) -> Box<engine_core::Graph> {
+    struct Constant(f32);
+    impl Node for Constant {
+        fn process(&mut self, buffer: &mut AudioBuffer<'_>) {
+            for channel in buffer.channels_mut() {
+                channel.fill(self.0);
+            }
+        }
+    }
+    let mut builder = GraphBuilder::new();
+    let node = builder.add(Box::new(Constant(level)));
+    builder.output(node);
+    Box::new(builder.build(CHANNELS, MAX_FRAMES).expect("a one-node graph is always routable"))
+}
+
+#[test]
+fn swapping_a_graph_does_not_allocate() {
+    // The reason retired graphs travel back to the control side at all: freeing
+    // one means freeing every buffer in it, and that is allocator work. If the
+    // audio thread ever drops a graph itself, this aborts.
+    let (mut swapper, mut player) = graph_channel(Some(constant_graph(0.1)), CHANNELS, MAX_FRAMES, SR);
+    let mut out = vec![0.0f32; MAX_FRAMES * CHANNELS];
+
+    for i in 0..300usize {
+        if i.is_multiple_of(40) {
+            // Ignored when the queue is full, which is the swapper's business.
+            let _ = swapper.swap(constant_graph(0.1 + i as f32 / 1_000.0));
+        }
+        let frames = 64 + (i * 53) % 900;
+        let block = &mut out[..frames * CHANNELS];
+        assert_no_alloc(|| player.process(block));
+        // Dropping the retired graphs here is the point; doing it above is not.
+        while swapper.collect().is_some() {}
+    }
+
+    assert!(out.iter().any(|s| *s != 0.0), "nothing played, so nothing was proved");
 }

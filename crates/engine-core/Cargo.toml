@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 engine-dsp.workspace = true
+# Carries graphs to the audio thread and retired ones back off it.
+rtrb.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

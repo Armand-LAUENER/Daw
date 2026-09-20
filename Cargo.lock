@@ -209,6 +209,7 @@ dependencies = [
  "assert_no_alloc",
  "engine-dsp",
  "proptest",
+ "rtrb",
 ]
 
 [[package]]
