@@ -46,7 +46,7 @@ Règles non négociables, déjà outillées :
 | `scripts/windows.sh test\|check` | Même chose **sous Windows**, lancé depuis WSL, sur un instantané de l'arbre de travail (y compris le non commité). |
 | `scripts/windows.sh phase0 --minutes 30 --gain 0.05` | Run temps réel sur la vraie sortie audio Windows. Log dans `target/windows-logs/`. |
 | Hooks git (`.githooks/`) | `pre-commit` → `check.sh --fast` ; `pre-push` → `check.sh`. Activés par `git config core.hooksPath .githooks` (à refaire après un nouveau clone). |
-| CI (`.github/workflows/ci.yml`) | `check.sh` sur Linux + Windows. **Inactive : pas encore de remote GitHub.** |
+| CI (`.github/workflows/ci.yml`) | `check.sh` sur Linux + Windows, sur le dépôt privé `Armand-LAUENER/Daw`. |
 
 Tests : unitaires dans chaque module, tests de propriétés `proptest` dans
 `crates/*/tests/properties.rs`. Les fichiers `*.proptest-regressions` sont
