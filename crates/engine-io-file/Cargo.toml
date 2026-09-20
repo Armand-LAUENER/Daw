@@ -12,9 +12,14 @@ license.workspace = true
 # decoder. Same split for `isomp4` and `aac`.
 symphonia = { workspace = true, features = ["wav", "pcm", "flac", "mp3", "isomp4", "aac"] }
 rubato.workspace = true
+# The transport's real-time half: SPSC queues and the anti-click gain ramp.
+rtrb.workspace = true
+engine-dsp.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# Holds Playback::fill to the same no-allocation rule as the audio callback.
+assert_no_alloc.workspace = true
 
 [lints]
 workspace = true

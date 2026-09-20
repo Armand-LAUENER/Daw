@@ -1,10 +1,14 @@
-//! Audio file decoding and sample-rate conversion.
+//! Audio file decoding, sample-rate conversion and playback transport.
 //!
-//! Unlike `engine-dsp`, nothing here is real-time safe: decoding allocates,
-//! reads from disk and takes unbounded time. It belongs on the preload thread,
-//! which hands finished buffers to the audio thread through a ring buffer —
-//! never the other way round.
+//! Decoding allocates, reads from disk and takes unbounded time, so it belongs
+//! on the preload thread. The transport is what connects that thread to the
+//! audio one: [`start`] launches it, and the [`Playback`] half it hands back is
+//! real-time safe — the only thing here the audio callback may touch.
 
 mod decode;
+mod transport;
 
 pub use decode::{DecodedAudio, FileError, decode, decode_file};
+pub use transport::{
+    FADE_MS, MemorySource, Playback, Shared, Source, TransportCommand, TransportHandle, TransportOptions, start,
+};

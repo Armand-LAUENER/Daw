@@ -21,8 +21,11 @@ branché sur le thread audio) :
 **Incrément 3 fait** : `engine-io-file` décode WAV/FLAC/MP3/MP4-AAC et convertit
 vers le taux du périphérique.
 
-**Prochaine étape : incrément 4**, le thread de préchargement et le transport
-(lecture, pause, seek, boucle).
+**Incrément 4 fait** : thread de préchargement et transport (lecture, pause,
+seek, boucle), avec poignée de main de flush et rampes anti-clic.
+
+**Prochaine étape : incrément 5**, l'intégration dans `engine-io` et un exemple
+`phase1` lancé via `scripts/windows.sh`.
 
 Le dépôt est sur GitHub (`Armand-LAUENER/Daw`, privé) et la CI y tourne sur
 Linux et Windows.
@@ -43,8 +46,9 @@ crates/
 │   ├── diagnostics.rs  Stats (atomiques + histogramme de charge), XrunDetector, DriftMonitor
 │   ├── control.rs      Command (Copy, sans tas) : SetFrequency, SetGain
 │   └── examples/phase0.rs   driver + test de charge (exit 1 si xrun)
-└── engine-io-file/   décodage et rééchantillonnage — hors thread audio, alloue
-    └── decode.rs     symphonia + rubato : DecodedAudio, FileError
+└── engine-io-file/   fichiers et transport
+    ├── decode.rs     symphonia + rubato : DecodedAudio, FileError (alloue, hors thread audio)
+    └── transport.rs  Preloader (thread dédié) + Playback (temps réel, sans allocation)
 ```
 
 Règles non négociables, déjà outillées :
@@ -105,9 +109,8 @@ Incréments, chacun testé et commité séparément :
    voir « Ce que les mesures ont corrigé » ci-dessous.
 3. ~~**Crate `engine-io-file`** : décodage et rééchantillonnage 44,1 → 48 kHz.~~
    **Fait**, voir ci-dessous.
-4. **Thread de préchargement et transport** (lecture, pause, seek, boucle).
-   Un compteur de génération sert à jeter l'audio obsolète après un seek, et
-   des micro-fondus évitent les clics sur les pauses et les seeks.
+4. ~~**Thread de préchargement et transport** (lecture, pause, seek, boucle).~~
+   **Fait**, voir ci-dessous.
 5. **Intégration dans `engine-io`** et exemple `phase1` lancé via
    `scripts/windows.sh`. S'y ajoute un rendu hors ligne du pipeline dans les
    tests, pour mesurer l'absence de discontinuité aux seeks.
@@ -148,6 +151,45 @@ Deux limites connues, assumées et documentées dans le code :
   transitoirement son pic en régime établi. C'est physique, pas un clic. Les
   tests de propriétés bornent donc le *pas* de sortie seulement pour Q ≤ 1/√2,
   et la bornitude séparément pour les Q résonants.
+
+### Incrément 4 — fait
+
+`transport.rs` fait tourner un thread de préchargement qui alimente le thread
+audio par un ring buffer. `start(source, opts)` rend un `TransportHandle`
+(`Play`, `Pause`, `Seek`, `SetLoop`, `Stop`) et un `Playback`, dont `fill()` est
+le seul point que le callback audio touche — sans allocation, vérifié par
+`crates/engine-io-file/tests/no_alloc.rs`.
+
+Le transport lit une **`Source`** (trait) et non un décodeur : `MemorySource`
+couvre le clip en mémoire de l'incrément 3, un décodeur en flux se branchera
+sans toucher au transport. C'est aussi ce qui rend le protocole de seek testable
+de façon déterministe, sans carte son.
+
+**Le seek passe par une poignée de main**, pas par un compteur de génération
+comme le prévoyait le plan. Au moment du seek le ring contient déjà l'audio de
+l'ancienne position, et seul le consommateur peut le jeter. Le préchargeur lève
+donc `flush_request` puis **cesse d'écrire** jusqu'à ce que le consommateur ait
+vidé et répondu sur `flush_ack`. Rien de la nouvelle position n'est écrit tant
+que de l'audio périmé est en file : les deux ne peuvent pas se mélanger, et un
+consommateur qui ne tourne jamais bloque le préchargeur au lieu de corrompre le
+flux. La boucle, elle, n'est pas un seek : le préchargeur revient en arrière
+pendant qu'il remplit, l'audio reste continu, aucun flush.
+
+Trois bugs trouvés en écrivant les tests, tous gardés comme tests :
+
+- **Le consommateur vidait le ring en pause**, donc la position avançait en
+  silence et l'audio en file était mangé. Une fois le fondu terminé il ne
+  consomme plus rien. Conséquence assumée : le fondu lui-même consomme, donc
+  reprendre repart 5 ms plus loin.
+- **Course sur `position`** : les deux moitiés y écrivaient. Le préchargeur
+  publie désormais `seek_position`, le consommateur seul écrit `position`.
+- **La fin du morceau était comptée comme un underrun.** Ce n'est pas un
+  préchargeur en retard, et ça polluait le seul compteur qui signale un vrai
+  problème.
+
+Piège de test à connaître : le canal droit des clips de test porte l'indice de
+trame, mais il est multiplié par le gain du fondu. Le lire au premier échantillon
+après un seek donne 0 — il faut attendre la fin de la rampe.
 
 ### Incrément 3 — fait
 
