@@ -18,8 +18,11 @@ branché sur le thread audio) :
 2. **`SmoothedBiquad`** : coupure lissée et coefficients interpolés, de sorte
    qu'un balayage bouge moins que le signal lui-même.
 
-**Prochaine étape : incrément 3**, la lecture de fichier (`engine-io-file`). La
-décision sur les dépendances de décodage reste à prendre (voir en bas).
+**Incrément 3 fait** : `engine-io-file` décode WAV/FLAC/MP3/MP4-AAC et convertit
+vers le taux du périphérique.
+
+**Prochaine étape : incrément 4**, le thread de préchargement et le transport
+(lecture, pause, seek, boucle).
 
 Le dépôt est sur GitHub (`Armand-LAUENER/Daw`, privé) et la CI y tourne sur
 Linux et Windows.
@@ -34,12 +37,14 @@ crates/
 │   ├── biquad.rs           Coefficients RBJ (calcul f64, stockage f32) + Biquad en forme directe II transposée
 │   ├── smoothed_biquad.rs  SmoothedBiquad : coupure lissée en octaves, coefficients interpolés
 │   └── test_util.rs        Banc de mesure des tests : gain par sonde à sinus, plus grand pas de sortie
-└── engine-io/    cpal + thread audio
-    ├── processor.rs    SineProcessor : tout ce que le callback possède (indépendant de cpal)
-    ├── stream.rs       AudioEngine : ouverture du device, EngineOptions::validate
-    ├── diagnostics.rs  Stats (atomiques), XrunDetector (timestamps), DriftMonitor (starvation)
-    ├── control.rs      Command (Copy, sans tas) : SetFrequency, SetGain
-    └── examples/phase0.rs   driver + test de charge (exit 1 si xrun)
+├── engine-io/    cpal + thread audio
+│   ├── processor.rs    SineProcessor : tout ce que le callback possède (indépendant de cpal)
+│   ├── stream.rs       AudioEngine : ouverture du device, EngineOptions::validate
+│   ├── diagnostics.rs  Stats (atomiques + histogramme de charge), XrunDetector, DriftMonitor
+│   ├── control.rs      Command (Copy, sans tas) : SetFrequency, SetGain
+│   └── examples/phase0.rs   driver + test de charge (exit 1 si xrun)
+└── engine-io-file/   décodage et rééchantillonnage — hors thread audio, alloue
+    └── decode.rs     symphonia + rubato : DecodedAudio, FileError
 ```
 
 Règles non négociables, déjà outillées :
@@ -98,8 +103,8 @@ Incréments, chacun testé et commité séparément :
 1. ~~**Biquad RBJ** passe-bas et passe-haut dans `engine-dsp`.~~ **Fait.**
 2. ~~**Modulation de la coupure sans zipper.**~~ **Fait**, mais pas comme prévu :
    voir « Ce que les mesures ont corrigé » ci-dessous.
-3. **Crate `engine-io-file`** : décodage avec `symphonia`, et rééchantillonnage
-   44,1 → 48 kHz. **Échafaudage posé, décodeur à écrire** — voir ci-dessous.
+3. ~~**Crate `engine-io-file`** : décodage et rééchantillonnage 44,1 → 48 kHz.~~
+   **Fait**, voir ci-dessous.
 4. **Thread de préchargement et transport** (lecture, pause, seek, boucle).
    Un compteur de génération sert à jeter l'audio obsolète après un seek, et
    des micro-fondus évitent les clics sur les pauses et les seeks.
@@ -144,11 +149,35 @@ Deux limites connues, assumées et documentées dans le code :
   tests de propriétés bornent donc le *pas* de sortie seulement pour Q ≤ 1/√2,
   et la bornitude séparément pour les Q résonants.
 
-### Incrément 3 — où exactement il est arrêté
+### Incrément 3 — fait
 
-Le crate `crates/engine-io-file` existe, les dépendances sont en place et
-`cargo build --workspace` passe. `src/lib.rs` ne contient que la documentation
-de module : **le décodeur reste à écrire**.
+`engine-io-file` décode et rééchantillonne : `decode_file(path, target_rate)` et
+`decode(source, extension, target_rate)` rendent un `DecodedAudio` (f32
+entrelacés, `channels`, `sample_rate`). Les erreurs passent par `FileError`, qui
+implémente `Error` et `Display` — aucun panic sur un fichier corrompu.
+
+Trois choix à connaître :
+
+- **Le fichier entier tient en mémoire.** Délibéré : le streaming disque
+  appartient au thread de préchargement (incrément 4), le faire ici éclaterait
+  la logique de transport sur deux crates.
+- **Le délai d'encodeur est retiré.** En 0.6 il n'y a plus de `enable_gapless` :
+  chaque paquet porte `trim_start` / `trim_end`, appliqués à la main. Sans ça un
+  fichier compressé commence par un filet de silence et finit sur une queue
+  inventée — et les albums prévus sans blanc claquent entre les pistes.
+- **Le taux et le nombre de canaux viennent des buffers décodés**, pas de
+  l'entête de piste, qui ne les porte pas toujours.
+
+Tests : `crates/engine-io-file/tests/decode.rs` construit des WAV en mémoire
+plutôt que de commiter un binaire, ce qui garde la fréquence, le taux et le
+contenu de chaque canal sous contrôle. Ils vérifient le 44,1 → 48 kHz sans
+déplacement de hauteur, la séparation des canaux, l'absence de discontinuité aux
+frontières de blocs, et le rejet propre d'octets qui ne sont pas de l'audio.
+
+Piège de mesure rencontré : compter les passages par zéro quantifie au cycle
+entier, et un sinus démarrant à la phase 0 n'a pas d'échantillon négatif avant
+son premier passage — le compte est donc un cycle trop bas. Sur une fenêtre
+d'une seconde, aucune tolérance sous 1 Hz n'est tenable, quoi que fasse l'audio.
 
 Dépendances retenues, `default-features = false` au niveau workspace pour que
 chaque crate nomme ses formats au lieu d'embarquer tous les décodeurs :
