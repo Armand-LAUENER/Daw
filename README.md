@@ -1,9 +1,8 @@
 # Daw
 
-Moteur audio temps réel en Rust, écrit comme projet d'apprentissage : architecture,
-DSP et concurrence, sans contrainte de deadline. Chaque phase a un critère de sortie
-mesurable — on ne passe à la suivante qu'une fois le critère vérifié par une mesure,
-pas par une impression.
+Moteur audio temps réel en Rust, avec pour but une station audio utilisable et
+performante. Chaque phase a un critère de sortie mesurable — on ne passe à la
+suivante qu'une fois le critère vérifié par une mesure, pas par une impression.
 
 **Règle centrale, non négociable** : le thread audio (callback `cpal`) ne fait jamais
 d'allocation, de lock, d'I/O ni d'attente bloquante. Toute communication avec ce thread

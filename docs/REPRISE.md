@@ -144,11 +144,22 @@ Deux limites connues, assumées et documentées dans le code :
   tests de propriétés bornent donc le *pas* de sortie seulement pour Q ≤ 1/√2,
   et la bornitude séparément pour les Q résonants.
 
+### Décisions prises
+
+- **Objectif** : une application utilisable et performante. Ce n'est plus un
+  projet d'apprentissage, donc on prend la dépendance mûre plutôt que de
+  réécrire, et un détour ne se justifie que par de la performance ou de la
+  fiabilité mesurable.
+- **Décodage** : `symphonia` (formats) et `rubato` (rééchantillonnage
+  44,1 → 48 kHz). Écrire son propre rééchantillonneur n'était motivé que par
+  l'apprentissage ; n'accepter que du 48 kHz rendrait l'application inutilisable
+  sur la moitié d'une discothèque.
+- Claude écrit le code, Armand relit.
+- Validation du DSP par sonde à sinus, sans `rustfft`.
+
 ### Décisions en attente
 
-1. **Dépendances de décodage** : `symphonia` (décodage) et `rubato`
-   (rééchantillonnage) ? Alternative temporaire : n'accepter que des fichiers à
-   48 kHz. **C'est la seule décision qui bloque l'incrément 3.**
-
-Tranché depuis : Claude écrit le code (Armand relit) ; validation par sonde à
-sinus, sans `rustfft`.
+Aucune ne bloque l'incrément 3. Elles se posent au moment d'écrire le code
+concerné : placement des micro-fondus (préchargement ou callback), marge du ring
+buffer de préchargement, mapping des canaux vers un périphérique 7.1, et
+traitement des dénormaux — à mesurer avant de trancher.

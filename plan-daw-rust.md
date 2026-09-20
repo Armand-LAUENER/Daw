@@ -1,6 +1,8 @@
-# Plan de projet — DAW en Rust (apprentissage audio temps réel)
+# Plan de projet — DAW en Rust
 
-**Objectif du projet** : apprentissage profond de l'audio temps réel (architecture, DSP, concurrence), sans contrainte de deadline. Chaque phase a un critère de sortie mesurable — ne pas passer à la phase suivante tant que le critère n'est pas vérifié objectivement (mesure, pas impression).
+**Objectif du projet** : une station audio utilisable et performante. Chaque phase a un critère de sortie mesurable — ne pas passer à la phase suivante tant que le critère n'est pas vérifié objectivement (mesure, pas impression).
+
+Conséquences sur la façon de trancher : prendre la dépendance mûre plutôt que réécrire, garder la solution la plus rapide à latence égale, et ne faire un détour que s'il achète de la performance ou de la fiabilité mesurable.
 
 **Principe architectural non négociable** : le thread audio (callback `cpal`) ne fait jamais d'allocation, de lock, d'I/O disque/réseau, ni d'attente bloquante. Toute communication avec ce thread passe par des structures lock-free. C'est la règle centrale de tout le projet.
 
@@ -176,9 +178,9 @@ Sauvegarde/rechargement d'un projet complexe (16 pistes, automation, effets) san
 **À ne démarrer que si les phases 1-3 sont stables sous charge réelle, pas juste sur ton exemple de test.**
 
 ### Pourquoi c'est à part
-Le rapport apprentissage/effort est mauvais comparé aux phases précédentes : tu vas surtout apprendre de la plomberie FFI (binding C++ pour VST3, gestion de fenêtre GUI native d'un process tiers, isolation de crash) plutôt que de l'audio. Les phases 1-3 concentrent 80% de la valeur pédagogique du projet.
+Pour une station réellement utilisable, l'hébergement de plugins n'est pas accessoire : c'est ce qui décide si l'application sert à travailler ou reste une démo. Mais c'est aussi le poste le plus coûteux et le plus risqué du projet — plomberie FFI vers un SDK C++, fenêtre GUI d'un process tiers, isolation de crash — et il ne rend rien tant que le moteur n'est pas solide. D'où l'ordre : phases 1-3 d'abord, sous charge réelle, puis celle-ci.
 
-### Tâches (si tu choisis de la faire quand même)
+### Tâches
 - [ ] Étudier `vst3-sys` (binding FFI vers le SDK C++ Steinberg) — comprendre le modèle de composants VST3 (edit controller, processor, IPlugView).
 - [ ] Alternative plus propre : `clap-sys` (ABI en C, plus simple à binder) — écosystème de plugins existants plus restreint.
 - [ ] Isolation de crash : un plugin tiers qui segfault ne doit pas planter l'hôte (sandbox par process séparé, communication IPC — sujet à lui seul).
