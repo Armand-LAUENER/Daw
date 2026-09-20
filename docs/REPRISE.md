@@ -27,8 +27,11 @@ seek, boucle), avec poignée de main de flush et rampes anti-clic.
 **Incrément 5 fait** : tout est branché sur le périphérique, avec l'exemple
 `phase1` et le mappage des canaux vers un périphérique 7.1.
 
-**Phase 1 terminée côté code.** Reste à valider le critère de sortie sur la vraie
-sortie audio : `scripts/windows.sh phase1 FICHIER --minutes 10 --seek-every 5`.
+**Phase 1 terminée côté code, validation entamée.** Un run de 40 s sur WASAPI
+(MP3 stéréo, casque PRO X 2 en 7.1, 9 seeks) passe : 0 xrun, 0 underrun,
+charge p50 0,1 % / max 0,4 %. Reste le critère complet : 10 minutes, et une
+écoute pour confirmer l'absence de clic aux seeks —
+`scripts/windows.sh phase1 FICHIER --minutes 10 --seek-every 5`.
 
 Le dépôt est sur GitHub (`Armand-LAUENER/Daw`, privé) et la CI y tourne sur
 Linux et Windows.
@@ -75,6 +78,7 @@ Règles non négociables, déjà outillées :
 | `scripts/windows.sh test\|check` | Même chose **sous Windows**, lancé depuis WSL, sur un instantané de l'arbre de travail (y compris le non commité). |
 | `scripts/windows.sh phase0 --minutes 30 --gain 0.05` | Run temps réel sur la vraie sortie audio Windows. Log dans `target/windows-logs/`. |
 | `scripts/windows.sh bench` | Débit du DSP sur la cible réelle. |
+| `scripts/windows.sh phase1 FICHIER --minutes 10 --seek-every 5` | Lecture de fichier temps réel, seeks répétés. Le chemin est un chemin **Windows**. Sort en code non nul au moindre xrun ou underrun. |
 | Hooks git (`.githooks/`) | `pre-commit` → `check.sh --fast` ; `pre-push` → `check.sh`. Activés par `git config core.hooksPath .githooks` (à refaire après un nouveau clone). |
 | CI (`.github/workflows/ci.yml`) | `check.sh` sur Linux + Windows, sur le dépôt privé `Armand-LAUENER/Daw`. |
 

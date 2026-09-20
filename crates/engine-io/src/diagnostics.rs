@@ -30,13 +30,38 @@ pub enum RtEvent {
 /// Fraction of the buffer duration (in ‰) above which a callback is reported as overloaded.
 pub const OVERLOAD_THRESHOLD_PERMILLE: u32 = 700;
 
-/// Width of one [`Stats::load_histogram`] bucket, in ‰ of the buffer duration.
-pub const LOAD_BUCKET_PERMILLE: u64 = 25;
-/// Number of load buckets. The last one collects everything at or above
-/// `(LOAD_BUCKETS - 1) * LOAD_BUCKET_PERMILLE`, which sits just above
-/// [`OVERLOAD_THRESHOLD_PERMILLE`]: past that point the exact figure no longer
-/// matters, only that the deadline is in danger.
+/// Number of [`Stats::load_histogram`] buckets.
 pub const LOAD_BUCKETS: usize = 32;
+/// Buckets per doubling of load.
+///
+/// The buckets are spaced logarithmically, not evenly. An engine doing its job
+/// sits near one percent of its deadline, so buckets wide enough to reach 100%
+/// put every callback in the first one and report nothing: the first version of
+/// this used 2.5% buckets and printed "p50 2.5%, max 0.2%" — a median above the
+/// maximum. Three per doubling keeps about 26% relative resolution everywhere,
+/// from a tenth of a percent to past the deadline.
+const BUCKETS_PER_DOUBLING: f64 = 3.0;
+
+/// Highest load, in ‰, that `bucket` holds.
+///
+/// Bucket 0 covers everything at or below 1‰; the last collects whatever is
+/// above its edge, where the exact figure stops mattering — only that the
+/// deadline is in danger.
+pub fn load_bucket_edge(bucket: usize) -> u64 {
+    if bucket == 0 {
+        return 1;
+    }
+    2.0f64.powf(bucket as f64 / BUCKETS_PER_DOUBLING).ceil() as u64
+}
+
+/// Which bucket a load belongs in, the inverse of [`load_bucket_edge`].
+fn load_bucket(permille: u64) -> usize {
+    if permille <= 1 {
+        return 0;
+    }
+    let bucket = (BUCKETS_PER_DOUBLING * (permille as f64).log2()).ceil() as usize;
+    bucket.min(LOAD_BUCKETS - 1)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XrunSource {
@@ -127,8 +152,7 @@ impl Stats {
     /// Files one callback's load into [`Stats::load_histogram`].
     #[inline]
     pub fn record_load_bucket(&self, permille: u64) {
-        let bucket = (permille / LOAD_BUCKET_PERMILLE).min(LOAD_BUCKETS as u64 - 1) as usize;
-        self.load_histogram[bucket].fetch_add(1, Ordering::Relaxed);
+        self.load_histogram[load_bucket(permille)].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> StatsSnapshot {
@@ -174,10 +198,10 @@ impl StatsSnapshot {
 
     /// Load in ‰ of the buffer duration that `fraction` of callbacks stayed under.
     ///
-    /// Reported at bucket resolution, so it rounds up to the bucket's upper edge
-    /// — `load_percentile(0.5)` of 50 means half the callbacks finished within
-    /// 5% of their deadline, not that the median is exactly 5%. Returns 0 when
-    /// nothing has been measured yet.
+    /// Reported at bucket resolution, so it rounds up to the bucket's upper
+    /// edge: `load_percentile(0.5)` of 20 means half the callbacks finished
+    /// within 2% of their deadline, not that the median is exactly 2%. Returns
+    /// 0 when nothing has been measured yet.
     pub fn load_percentile(&self, fraction: f64) -> u64 {
         let total = self.measured_callbacks();
         if total == 0 {
@@ -188,10 +212,10 @@ impl StatsSnapshot {
         for (i, count) in self.load_histogram.iter().enumerate() {
             seen += count;
             if seen >= wanted {
-                return (i as u64 + 1) * LOAD_BUCKET_PERMILLE;
+                return load_bucket_edge(i);
             }
         }
-        LOAD_BUCKETS as u64 * LOAD_BUCKET_PERMILLE
+        load_bucket_edge(LOAD_BUCKETS - 1)
     }
 }
 
@@ -366,9 +390,18 @@ mod tests {
 
         #[test]
         fn percentiles_round_up_to_the_bucket_edge() {
-            // 30‰ lands in the second bucket, whose upper edge is 50‰.
             let s = with_loads(&[30]);
-            assert_eq!(s.load_percentile(0.5), 2 * LOAD_BUCKET_PERMILLE);
+            let reported = s.load_percentile(0.5);
+            assert!((30..=38).contains(&reported), "30‰ reported as {reported}‰");
+        }
+
+        #[test]
+        fn resolution_stays_fine_where_the_engine_actually_sits() {
+            // The failure that prompted log spacing: a 2‰ load must not come
+            // back as 25‰, and the median must never exceed the maximum.
+            let s = with_loads(&[2; 100]);
+            let median = s.load_percentile(0.5);
+            assert!(median <= 3, "2‰ reported as {median}‰");
         }
 
         #[test]
@@ -379,8 +412,8 @@ mod tests {
             let mut loads = vec![10; 99];
             loads.push(980);
             let s = with_loads(&loads);
-            assert_eq!(s.load_percentile(0.5), LOAD_BUCKET_PERMILLE);
-            assert_eq!(s.load_percentile(1.0), LOAD_BUCKETS as u64 * LOAD_BUCKET_PERMILLE);
+            assert!(s.load_percentile(0.5) <= 12, "median {} pulled up by one outlier", s.load_percentile(0.5));
+            assert!(s.load_percentile(1.0) >= 980, "the outlier vanished: {}", s.load_percentile(1.0));
         }
 
         #[test]
@@ -389,8 +422,8 @@ mod tests {
             let mut loads = vec![10; 98];
             loads.extend([600, 600]);
             let s = with_loads(&loads);
-            assert_eq!(s.load_percentile(0.5), LOAD_BUCKET_PERMILLE);
-            assert!(s.load_percentile(0.99) > 600, "p99 = {}", s.load_percentile(0.99));
+            assert!(s.load_percentile(0.5) <= 12, "median {}", s.load_percentile(0.5));
+            assert!(s.load_percentile(0.99) >= 600, "p99 = {}", s.load_percentile(0.99));
         }
 
         #[test]
@@ -399,8 +432,8 @@ mod tests {
             let s = with_loads(&[5_000]);
             assert_eq!(s.load_histogram[LOAD_BUCKETS - 1], 1);
             assert!(
-                (LOAD_BUCKETS as u64 - 1) * LOAD_BUCKET_PERMILLE > u64::from(OVERLOAD_THRESHOLD_PERMILLE),
-                "the top bucket must start above the overload threshold"
+                load_bucket_edge(LOAD_BUCKETS - 1) > u64::from(OVERLOAD_THRESHOLD_PERMILLE),
+                "the top bucket must reach past the overload threshold"
             );
         }
     }

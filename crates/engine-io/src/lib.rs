@@ -16,8 +16,8 @@ mod stream;
 pub use channels::map_frames;
 pub use control::Command;
 pub use diagnostics::{
-    CallbackTiming, DRIFT_LEAK, DriftMonitor, LOAD_BUCKET_PERMILLE, LOAD_BUCKETS, OVERLOAD_THRESHOLD_PERMILLE, RtEvent,
-    STREAM_ERROR_KINDS, Stats, StatsSnapshot, TimingAnomaly, XrunDetector, XrunSource,
+    CallbackTiming, DRIFT_LEAK, DriftMonitor, LOAD_BUCKETS, OVERLOAD_THRESHOLD_PERMILLE, RtEvent, STREAM_ERROR_KINDS,
+    Stats, StatsSnapshot, TimingAnomaly, XrunDetector, XrunSource, load_bucket_edge,
 };
 pub use processor::{RenderFn, StreamProcessor};
 pub use stream::{
