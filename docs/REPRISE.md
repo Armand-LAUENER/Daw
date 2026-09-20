@@ -27,11 +27,30 @@ seek, boucle), avec poignée de main de flush et rampes anti-clic.
 **Incrément 5 fait** : tout est branché sur le périphérique, avec l'exemple
 `phase1` et le mappage des canaux vers un périphérique 7.1.
 
-**Phase 1 terminée côté code, validation entamée.** Un run de 40 s sur WASAPI
-(MP3 stéréo, casque PRO X 2 en 7.1, 9 seeks) passe : 0 xrun, 0 underrun,
-charge p50 0,1 % / max 0,4 %. Reste le critère complet : 10 minutes, et une
-écoute pour confirmer l'absence de clic aux seeks —
-`scripts/windows.sh phase1 FICHIER --minutes 10 --seek-every 5`.
+**Phase 1 validée le 2026-09-21**, critère de sortie atteint en automatique via
+`scripts/windows.sh phase1 --self-test --minutes 10 --seek-every 5` :
+
+```
+[600.02s] callbacks 60001 | xruns 0 | overloads 0 | load p50 0,1 % p99 0,1 % max 1,5 %
+seeks 119 | underruns 0
+discontinuities 0 | worst step 0,013091 | limit 0,018257
+PASS: no xrun, no underrun, no discontinuity
+```
+
+Le pire pas vaut exactement la pente propre du sinus de 100 Hz (0,013090 en
+théorie) : aucun des 119 seeks n'a ajouté quoi que ce soit au signal. Un run de
+40 s sur un vrai MP3 passe aussi, mais sans détection de clic — sur de la
+musique un coup de caisse claire est une marche légitime, et aucun seuil ne
+l'écarte d'un clic.
+
+**Ce que ça ne prouve pas** : la chaîne est propre sur un signal maîtrisé, pas
+que ta musique l'est ; et rien après notre buffer — mixeur Windows,
+spatialisation du casque — n'est couvert.
+
+**Phase 2 en cours** : `engine-core` a le tampon planaire, les nœuds de base et
+le graphe avec ordre topologique. Restent l'échange atomique de graphe,
+l'automation sample-accurate, le limiteur master et le test de charge 8/16
+pistes.
 
 Le dépôt est sur GitHub (`Armand-LAUENER/Daw`, privé) et la CI y tourne sur
 Linux et Windows.
