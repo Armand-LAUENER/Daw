@@ -8,6 +8,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+engine-core = { path = "crates/engine-core" }
 engine-dsp = { path = "crates/engine-dsp" }
 engine-io-file = { path = "crates/engine-io-file" }
 cpal = "0.18.2"

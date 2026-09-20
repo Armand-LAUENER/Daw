@@ -203,6 +203,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-core"
+version = "0.1.0"
+dependencies = [
+ "engine-dsp",
+ "proptest",
+]
+
+[[package]]
 name = "engine-dsp"
 version = "0.1.0"
 dependencies = [
