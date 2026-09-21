@@ -75,9 +75,20 @@ case "$cmd" in
         ;;
     app)
         # Windows locks the executable of a running process, so cargo cannot
-        # replace it and the build fails with "Accès refusé". Ending the
-        # previous window first costs nothing and saves a round trip.
-        win taskkill.exe /IM daw.exe /F >/dev/null 2>&1 || true
+        # replace it and the build fails with "Accès refusé". The previous
+        # window is asked to close rather than killed: a forced end skips the
+        # app's own exit, and with it the report of how the run went. Forced
+        # only if asking does not work.
+        running() { win tasklist.exe /FI "IMAGENAME eq daw.exe" 2>/dev/null | grep -qi daw.exe; }
+        if running; then
+            echo "==> closing the previous window"
+            win taskkill.exe /IM daw.exe >/dev/null 2>&1 || true
+            for _ in 1 2 3 4 5; do
+                running || break
+                sleep 1
+            done
+            running && win taskkill.exe /IM daw.exe /F >/dev/null 2>&1 || true
+        fi
         mkdir -p target/windows-logs
         log="target/windows-logs/app-$(date +%Y%m%d-%H%M%S).log"
         echo "==> logging to $log"
