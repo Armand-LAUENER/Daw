@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 engine-core = { path = "crates/engine-core" }
 engine-dsp = { path = "crates/engine-dsp" }
+engine-io = { path = "crates/engine-io" }
 engine-io-file = { path = "crates/engine-io-file" }
 engine-midi = { path = "crates/engine-midi" }
 project-model = { path = "crates/project-model" }

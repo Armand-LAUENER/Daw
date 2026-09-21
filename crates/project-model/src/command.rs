@@ -42,6 +42,31 @@ pub enum Command {
     },
 }
 
+/// What a change is aimed at, for telling one gesture from the next.
+///
+/// Only continuous controls have one. A mute is a decision and deserves its own
+/// place in the history; a fader dragged across the screen is one decision that
+/// happens to arrive sixty times a second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Target(u8, TrackId);
+
+impl Command {
+    /// The control this change moves, when it is one that can be dragged.
+    pub(crate) fn target(&self) -> Option<Target> {
+        match self {
+            Self::SetGain { id, .. } => Some(Target(0, *id)),
+            Self::SetPan { id, .. } => Some(Target(1, *id)),
+            // The master has no track of its own to be named by.
+            Self::SetMasterGain { .. } => Some(Target(2, TrackId(u32::MAX))),
+            Self::AddTrack { .. }
+            | Self::RemoveTrack { .. }
+            | Self::RenameTrack { .. }
+            | Self::SetMuted { .. }
+            | Self::SetSoloed { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandError {
     /// The track was removed, or never existed. Refused rather than ignored: a

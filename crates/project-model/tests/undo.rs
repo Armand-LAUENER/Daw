@@ -77,7 +77,12 @@ proptest! {
         for action in &actions {
             let Some(command) = to_command(session.project(), action) else { continue };
             let snapshot = session.project().clone();
-            if session.apply(command).is_ok() {
+            let depth = session.depth();
+            // A change that continues the gesture already in progress folds
+            // into it, so it is not a state undo will ever land on. Only a
+            // change that made a new step gets a snapshot — which makes this
+            // a check on the folding too.
+            if session.apply(command).is_ok() && session.depth() > depth {
                 before.push(snapshot);
             }
         }

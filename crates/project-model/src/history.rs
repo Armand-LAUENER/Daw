@@ -1,11 +1,13 @@
 use crate::Project;
-use crate::command::{Command, CommandError, Edit, apply, resolve};
+use crate::command::{Command, CommandError, Edit, Target, apply, resolve};
 
 /// One entry in the history: what was done, and what puts it back.
 #[derive(Debug, Clone)]
 struct Step {
     forward: Edit,
     backward: Edit,
+    /// The control it moved, when a following change could continue it.
+    target: Option<Target>,
 }
 
 /// A project together with everything done to it.
@@ -19,6 +21,13 @@ pub struct Session {
     steps: Vec<Step>,
     /// How many steps are currently in effect. The rest are redoable.
     applied: usize,
+    /// Whether the last step can still absorb a change that continues it.
+    ///
+    /// A fader dragged across the screen arrives as a change every frame. Left
+    /// alone that is sixty entries for one gesture, and an undo that walks back
+    /// through the drag frame by frame. They fold into one step until something
+    /// [`seals`](Session::seal) it — which is what letting go of the mouse does.
+    open: bool,
 }
 
 impl Session {
@@ -28,7 +37,7 @@ impl Session {
 
     /// Starts from a project that already exists, with nothing to undo.
     pub fn from_project(project: Project) -> Self {
-        Self { project, steps: Vec::new(), applied: 0 }
+        Self { project, steps: Vec::new(), applied: 0, open: false }
     }
 
     pub fn project(&self) -> &Project {
@@ -40,13 +49,38 @@ impl Session {
     /// A command that cannot be carried out changes nothing and records
     /// nothing, so it never leaves an undo that undoes nothing.
     pub fn apply(&mut self, command: Command) -> Result<(), CommandError> {
+        let target = command.target();
         let (forward, backward) = resolve(&self.project, command)?;
+
+        // A change continuing the gesture already in progress replaces its
+        // forward edit and keeps its backward one — which is where the gesture
+        // began, and so where undo has to land.
+        if self.open
+            && target.is_some()
+            && self.applied == self.steps.len()
+            && let Some(last) = self.steps.last_mut()
+            && last.target == target
+        {
+            apply(&mut self.project, &forward);
+            last.forward = forward;
+            return Ok(());
+        }
+
         // Anything that was redoable is now a branch nobody can reach.
         self.steps.truncate(self.applied);
         apply(&mut self.project, &forward);
-        self.steps.push(Step { forward, backward });
+        self.steps.push(Step { forward, backward, target });
         self.applied += 1;
+        self.open = target.is_some();
         Ok(())
+    }
+
+    /// Ends the gesture in progress, so the next change starts a new step.
+    ///
+    /// The interface calls this when a control is let go. Anything that does
+    /// not drag never needs it.
+    pub fn seal(&mut self) {
+        self.open = false;
     }
 
     /// Takes back the last change. False when there is nothing to take back.
@@ -56,6 +90,8 @@ impl Session {
         };
         apply(&mut self.project, &self.steps[index].backward);
         self.applied = index;
+        // Whatever gesture was in progress is over; a change now is a new one.
+        self.open = false;
         true
     }
 
@@ -66,6 +102,7 @@ impl Session {
         };
         apply(&mut self.project, &step.forward);
         self.applied += 1;
+        self.open = false;
         true
     }
 
@@ -212,5 +249,76 @@ mod tests {
 
         session.apply(Command::SetMuted { id: a, muted: true }).unwrap();
         assert!(!session.project().is_audible(a), "a muted track stays silent when soloed");
+    }
+
+    #[test]
+    fn a_drag_folds_into_one_step() {
+        // Sixty changes a second, one gesture. Without this an undo walks back
+        // through the drag frame by frame.
+        let mut session = with_tracks(1);
+        let id = first(&session);
+        let before = session.project().clone();
+
+        for step in 1..=60 {
+            session.apply(Command::SetGain { id, gain: step as f32 / 60.0 }).unwrap();
+        }
+        assert_eq!(session.depth(), 1, "the drag left {} steps", session.depth());
+        assert_eq!(session.project().track(id).unwrap().gain, 1.0);
+
+        assert!(session.undo());
+        assert_eq!(session.project(), &before, "undo landed inside the drag instead of before it");
+    }
+
+    #[test]
+    fn letting_go_ends_the_gesture() {
+        let mut session = with_tracks(1);
+        let id = first(&session);
+        session.apply(Command::SetGain { id, gain: 0.5 }).unwrap();
+        session.seal();
+        session.apply(Command::SetGain { id, gain: 0.25 }).unwrap();
+        assert_eq!(session.depth(), 2, "the second gesture folded into the first");
+
+        session.undo();
+        assert_eq!(session.project().track(id).unwrap().gain, 0.5, "undo skipped a gesture");
+    }
+
+    #[test]
+    fn two_faders_never_fold_together() {
+        let mut session = with_tracks(2);
+        let (a, b) = (session.project().tracks[0].id, session.project().tracks[1].id);
+        session.apply(Command::SetGain { id: a, gain: 0.5 }).unwrap();
+        session.apply(Command::SetGain { id: b, gain: 0.5 }).unwrap();
+        assert_eq!(session.depth(), 2);
+    }
+
+    #[test]
+    fn gain_and_pan_on_one_track_are_separate_gestures() {
+        let mut session = with_tracks(1);
+        let id = first(&session);
+        session.apply(Command::SetGain { id, gain: 0.5 }).unwrap();
+        session.apply(Command::SetPan { id, pan: 0.5 }).unwrap();
+        assert_eq!(session.depth(), 2);
+    }
+
+    #[test]
+    fn a_switch_is_never_folded_away() {
+        // Muting twice is two decisions, and both belong in the history.
+        let mut session = with_tracks(1);
+        let id = first(&session);
+        session.apply(Command::SetMuted { id, muted: true }).unwrap();
+        session.apply(Command::SetMuted { id, muted: false }).unwrap();
+        assert_eq!(session.depth(), 2);
+    }
+
+    #[test]
+    fn undoing_ends_the_gesture_so_a_later_change_is_its_own_step() {
+        let mut session = with_tracks(1);
+        let id = first(&session);
+        session.apply(Command::SetGain { id, gain: 0.5 }).unwrap();
+        session.undo();
+        session.apply(Command::SetGain { id, gain: 0.25 }).unwrap();
+        assert_eq!(session.depth(), 1);
+        assert!(session.undo());
+        assert_eq!(session.project().track(id).unwrap().gain, 1.0);
     }
 }

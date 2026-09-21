@@ -1,0 +1,17 @@
+[package]
+name = "daw"
+description = "The application: a window over the project, and the engine that plays it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+engine-core.workspace = true
+engine-dsp.workspace = true
+engine-io.workspace = true
+project-engine.workspace = true
+project-model.workspace = true
+eframe = "0.36.2"
+
+[lints]
+workspace = true
