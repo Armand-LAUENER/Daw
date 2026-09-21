@@ -232,6 +232,33 @@ Le test de charge vérifie maintenant qu'un solo a bien été engagé pendant le
 run, au même titre que « le mix n'était pas silencieux » : sans ça il passerait
 sans jamais avoir exercé le contrôle que le critère nomme.
 
+**Critère de sortie revalidé avec le solo, le 2026-09-21** — 30 minutes, 16
+pistes, tranche complète gain/pan/mute/solo :
+
+```
+[ 1800.01s] callbacks 180000 | xruns 0 | overloads 0 | load p50 1,3 % p99 2,6 % max 17,3 %
+fader moves 355276 | refused 0 | graph swaps 78
+discontinuities 0 | worst step 0,034680 | limit 0,089604
+PASS: no xrun, no discontinuity
+```
+
+355 276 mouvements contre 266 475 au run précédent, soit exactement le rapport
+4/3 attendu en passant de trois paramètres à quatre. Pire pas identique
+(0,034680) pour une limite montée à 0,089604, la rampe de solo ayant ajouté son
+terme : marge à 39 %.
+
+**Le `max 17,3 %` n'est pas une mesure du moteur.** Le run précédent plafonnait
+à 4,6 %. p50 et p99 sont inchangés (1,3 % et 2,6 %), donc ni le coût typique ni
+la queue proche n'ont bougé — c'est un `fetch_max` sur 180 000 callbacks, donc
+le pire tirage d'une distribution à queue lourde. Et pendant ce run, la même
+machine compilait le workspace et passait clippy et la suite de tests, parce que
+c'est là que j'ai fait le travail sur le plan. Le chiffre mesure cette
+contention, pas le graphe. Les valeurs à retenir sont p50 et p99 ; le seuil
+d'overload est à 70 % et rien ne l'a approché.
+
+À refaire sur une machine au repos si on veut un `max` qui veuille dire quelque
+chose.
+
 ### Deux dettes réglées au passage
 
 **`GraphPlayer::process_automated`** existe maintenant, donc l'automation marche
