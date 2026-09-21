@@ -21,9 +21,11 @@ pub trait Engine {
     fn swap(&mut self, graph: Box<Graph>) -> bool;
 }
 
-/// Makes the audio for a track. The model has no clips yet, so this is where
-/// the question is answered until it does.
-pub type SourceFor = Box<dyn FnMut(&Track) -> Box<dyn Node> + Send>;
+/// Makes the audio for a track.
+///
+/// Called on the control side when a graph is built, so it may read files and
+/// take its time; what crosses to the audio thread is the node it returns.
+pub type SourceFor = Box<dyn FnMut(&Track) -> Box<dyn Node>>;
 
 /// The project, the history, and the engine playing it, kept in step.
 pub struct Studio<E: Engine> {
@@ -202,7 +204,9 @@ mod tests {
     }
 
     fn add_track(studio: &mut Studio<Recorder>) -> TrackId {
-        studio.apply(Command::AddTrack { name: "track".into() }).expect("adding always works");
+        studio
+            .apply(Command::AddTrack { name: "track".into(), source: Default::default() })
+            .expect("adding always works");
         studio.project().tracks.last().expect("it was just added").id
     }
 

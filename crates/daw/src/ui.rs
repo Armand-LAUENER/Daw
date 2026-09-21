@@ -27,10 +27,14 @@ pub struct Actions {
 }
 
 /// How the engine is getting on, for the strip along the bottom.
-pub struct Health {
+pub struct Health<'a> {
     pub xruns: u64,
     pub load_percent: f64,
     pub refusals: u64,
+    pub files: usize,
+    /// The last thing that went wrong, if anything did. Shown rather than
+    /// logged: a file that failed to open is the person's business.
+    pub trouble: Option<&'a str>,
 }
 
 pub fn top_bar(ui: &mut Ui, theme: &Theme, themes: &[Theme], can_undo: bool, can_redo: bool, actions: &mut Actions) {
@@ -47,7 +51,7 @@ pub fn top_bar(ui: &mut Ui, theme: &Theme, themes: &[Theme], can_undo: bool, can
 
         ui.separator();
         if ui.button("Add track").clicked() {
-            actions.commands.push(Command::AddTrack { name: "Track".into() });
+            actions.commands.push(Command::AddTrack { name: "Track".into(), source: Default::default() });
         }
 
         ui.separator();
@@ -161,23 +165,36 @@ fn strip(
                 if ui.button(RichText::new("remove").color(theme.warning).small()).clicked() {
                     actions.commands.push(Command::RemoveTrack { id });
                 }
+                let playing = matches!(track.source, project_model::Source::File { .. });
+                if playing && ui.button(RichText::new("eject").color(theme.dim).small()).clicked() {
+                    actions.commands.push(Command::SetSource { id, source: project_model::Source::Tone });
+                }
+                let colour = if playing { theme.accent } else { theme.dim };
+                ui.label(RichText::new(track.source.label()).color(colour).small());
             });
         });
     });
 }
 
-pub fn status(ui: &mut Ui, theme: &Theme, health: &Health) {
+pub fn status(ui: &mut Ui, theme: &Theme, health: &Health<'_>) {
     ui.horizontal(|ui| {
-        let trouble = health.xruns > 0 || health.refusals > 0;
-        let colour = if trouble { theme.warning } else { theme.dim };
+        let unwell = health.xruns > 0 || health.refusals > 0;
+        let colour = if unwell { theme.warning } else { theme.dim };
         ui.label(
             RichText::new(format!(
-                "load {:.1}%   xruns {}   refused {}",
-                health.load_percent, health.xruns, health.refusals
+                "load {:.1}%   xruns {}   refused {}   files {}",
+                health.load_percent, health.xruns, health.refusals, health.files
             ))
             .color(colour)
             .monospace()
             .small(),
         );
+        if let Some(trouble) = health.trouble {
+            ui.separator();
+            ui.label(RichText::new(trouble).color(theme.warning).small());
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new("drop audio files here to add a track").color(theme.dim).small());
+        });
     });
 }

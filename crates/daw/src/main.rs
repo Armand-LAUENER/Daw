@@ -6,11 +6,15 @@
 //! window can be rewritten without touching the other two, which is the point
 //! of the split: the engine is the part that has to stay still.
 
+mod clip;
 mod layout;
 mod studio;
 mod theme;
 mod ui;
 
+use std::cell::RefCell;
+use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,8 +22,9 @@ use eframe::egui;
 use engine_core::{AutomationSender, Graph, GraphSwapper, Node, ParamId, automation_channel, graph_channel};
 use engine_dsp::SineOsc;
 use engine_io::{AudioEngine, EngineOptions, Stats, default_output_config, map_frames};
-use project_model::Track;
+use project_model::{Command, Source, Track};
 
+use clip::{Clip, Library};
 use layout::Layout;
 use studio::{Engine, Studio};
 use theme::Theme;
@@ -50,6 +55,21 @@ impl Node for Tone {
                 buffer.channel_mut(channel)[frame] = sample;
             }
         }
+    }
+}
+
+/// What a track plays: a file when it has one, the standby tone otherwise.
+///
+/// A file named by the project but missing from the library falls back to the
+/// tone rather than to silence — a track that vanished without a word would be
+/// harder to notice than one that is obviously not what was asked for.
+fn source_for(track: &Track, library: &Library, sample_rate: f32) -> Box<dyn Node> {
+    match &track.source {
+        Source::File { path } => match library.get(path) {
+            Some(audio) => Box::new(Clip::new(audio)),
+            None => tone_for(track, sample_rate),
+        },
+        Source::Tone => tone_for(track, sample_rate),
     }
 }
 
@@ -89,6 +109,12 @@ struct App {
     /// here rather than in the project, and never enters the history.
     layout: Layout,
     show_layout: bool,
+    /// Files already read. Shared with the callback that builds the graph, so
+    /// a rebuild reuses what was decoded rather than reading it again.
+    library: Rc<RefCell<Library>>,
+    sample_rate: u32,
+    /// The last thing that went wrong, for the strip along the bottom.
+    trouble: Option<String>,
     /// Pushed into egui only when it changes, rather than every frame.
     theme_applied: Option<usize>,
     stats: Arc<Stats>,
@@ -131,9 +157,11 @@ impl App {
         })?;
 
         let stats = Arc::clone(&engine.stats);
+        let library = Rc::new(RefCell::new(Library::new()));
+        let for_graph = Rc::clone(&library);
         let studio = Studio::new(
             LiveEngine { params, swapper },
-            Box::new(move |track| tone_for(track, sample_rate)),
+            Box::new(move |track| source_for(track, &for_graph.borrow(), sample_rate)),
             GRAPH_CHANNELS,
             MAX_GRAPH_FRAMES,
             sample_rate,
@@ -159,9 +187,34 @@ impl App {
             theme_applied: Some(0),
             layout: Layout::default(),
             show_layout: false,
+            library,
+            sample_rate: rate,
+            trouble: None,
             stats,
             _engine: engine,
         })
+    }
+
+    /// Reads a file and gives it a track of its own.
+    ///
+    /// One command, so one entry in the history: a file dropped by mistake is
+    /// taken back with a single undo.
+    fn load(&mut self, path: PathBuf) {
+        let rate = self.sample_rate;
+        match self.library.borrow_mut().load(&path, rate) {
+            Ok(audio) => {
+                let name = path.file_stem().map_or_else(|| "Track".into(), |n| n.to_string_lossy().into_owned());
+                let seconds = audio.duration().as_secs_f64();
+                self.trouble = None;
+                println!("loaded {} ({:.1}s, {} ch)", path.display(), seconds, audio.channels);
+                let _ = self.studio.apply(Command::AddTrack { name, source: Source::File { path } });
+            }
+            Err(e) => {
+                let message = format!("{}: {e}", path.display());
+                println!("{message}");
+                self.trouble = Some(message);
+            }
+        }
     }
 
     fn carry_out(&mut self, actions: Actions) {
@@ -217,6 +270,15 @@ impl eframe::App for App {
         }
         let theme = self.themes[self.theme];
 
+        // Dropping a file on the window is how audio gets in. A picker would
+        // need a dependency for a dialog; this needs none, and for a mixer it
+        // is the better gesture anyway.
+        let dropped: Vec<PathBuf> =
+            ctx.input(|input| input.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+        for path in dropped {
+            self.load(path);
+        }
+
         let mut actions = Actions::default();
         ctx.input_mut(|input| {
             if input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z) {
@@ -242,6 +304,8 @@ impl eframe::App for App {
                 xruns: snapshot.total_xruns(),
                 load_percent: snapshot.load_percentile(0.99) as f64 / 10.0,
                 refusals: self.studio.refusals(),
+                files: self.library.borrow().len(),
+                trouble: self.trouble.as_deref(),
             };
             ui::status(ui, &theme, &health);
         });

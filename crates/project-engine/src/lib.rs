@@ -145,7 +145,9 @@ pub fn route(bindings: &Bindings, command: &Command) -> Change {
     let flag = |on: bool| if on { 1.0 } else { 0.0 };
 
     match command {
-        Command::AddTrack { .. } | Command::RemoveTrack { .. } => Change::Rebuild,
+        // A different source is a different node in the graph, not a value on
+        // one that is already there.
+        Command::AddTrack { .. } | Command::RemoveTrack { .. } | Command::SetSource { .. } => Change::Rebuild,
         Command::RenameTrack { .. } => Change::Nothing,
         Command::SetGain { id, gain } => aimed(*id, |b| b.gain, *gain),
         Command::SetPan { id, pan } => aimed(*id, |b| b.pan, pan.clamp(-1.0, 1.0)),

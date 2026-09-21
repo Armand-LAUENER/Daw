@@ -16,6 +16,8 @@
 mod command;
 mod history;
 
+use std::path::PathBuf;
+
 pub use command::{Command, CommandError};
 pub use history::Session;
 
@@ -34,6 +36,32 @@ pub const FORMAT_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TrackId(pub u32);
 
+/// Where a track's audio comes from.
+///
+/// The model names the source but does not hold it: decoding belongs to
+/// whoever has a sample rate to decode for, and a project should survive being
+/// opened on a machine where the file has moved.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Source {
+    /// A tone, so a new track is audible before anything is loaded onto it.
+    #[default]
+    Tone,
+    /// Audio read from a file.
+    File { path: PathBuf },
+}
+
+impl Source {
+    /// A short name for the mixer, taken from the file rather than the path.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Tone => "tone".into(),
+            Self::File { path } => {
+                path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
+            }
+        }
+    }
+}
+
 /// One track's settings. What the mixer shows, and what a graph is built from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Track {
@@ -45,11 +73,12 @@ pub struct Track {
     pub pan: f32,
     pub muted: bool,
     pub soloed: bool,
+    pub source: Source,
 }
 
 impl Track {
-    pub fn new(id: TrackId, name: impl Into<String>) -> Self {
-        Self { id, name: name.into(), gain: 1.0, pan: 0.0, muted: false, soloed: false }
+    pub fn new(id: TrackId, name: impl Into<String>, source: Source) -> Self {
+        Self { id, name: name.into(), gain: 1.0, pan: 0.0, muted: false, soloed: false, source }
     }
 }
 

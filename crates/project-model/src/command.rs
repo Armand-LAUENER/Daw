@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::{Project, Track, TrackId};
+use crate::{Project, Source, Track, TrackId};
 
 /// A change someone asked for.
 ///
@@ -8,8 +8,11 @@ use crate::{Project, Track, TrackId};
 /// arm that resolves it — which is also what makes it undoable, for free.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
+    /// The source is given up front rather than set afterwards, so a file
+    /// dropped onto the window is one entry in the history and one undo.
     AddTrack {
         name: String,
+        source: Source,
     },
     RemoveTrack {
         id: TrackId,
@@ -40,6 +43,12 @@ pub enum Command {
     SetMasterGain {
         gain: f32,
     },
+    /// What the track plays. A change of material, not of setting, so it never
+    /// folds into a neighbouring gesture.
+    SetSource {
+        id: TrackId,
+        source: Source,
+    },
 }
 
 /// What a change is aimed at, for telling one gesture from the next.
@@ -62,7 +71,8 @@ impl Command {
             | Self::RemoveTrack { .. }
             | Self::RenameTrack { .. }
             | Self::SetMuted { .. }
-            | Self::SetSoloed { .. } => None,
+            | Self::SetSoloed { .. }
+            | Self::SetSource { .. } => None,
         }
     }
 }
@@ -105,6 +115,7 @@ pub(crate) enum Edit {
     SetMuted { id: TrackId, muted: bool },
     SetSoloed { id: TrackId, soloed: bool },
     SetMasterGain { gain: f32 },
+    SetSource { id: TrackId, source: Source },
 }
 
 /// Works out what a command does, and what would undo it.
@@ -115,9 +126,10 @@ pub(crate) fn resolve(project: &Project, command: Command) -> Result<(Edit, Edit
     let found = |id: TrackId| project.track(id).ok_or(CommandError::NoSuchTrack(id));
 
     Ok(match command {
-        Command::AddTrack { name } => {
+        Command::AddTrack { name, source } => {
             let index = project.tracks.len();
-            (Edit::InsertTrack { index, track: Track::new(project.next_id(), name) }, Edit::RemoveTrack { index })
+            let track = Track::new(project.next_id(), name, source);
+            (Edit::InsertTrack { index, track }, Edit::RemoveTrack { index })
         }
         Command::RemoveTrack { id } => {
             let index = project.index_of(id).ok_or(CommandError::NoSuchTrack(id))?;
@@ -151,6 +163,10 @@ pub(crate) fn resolve(project: &Project, command: Command) -> Result<(Edit, Edit
             finite(gain, "the master gain")?;
             (Edit::SetMasterGain { gain }, Edit::SetMasterGain { gain: project.master_gain })
         }
+        Command::SetSource { id, source } => {
+            let was = found(id)?.source.clone();
+            (Edit::SetSource { id, source }, Edit::SetSource { id, source: was })
+        }
     })
 }
 
@@ -173,6 +189,7 @@ pub(crate) fn apply(project: &mut Project, edit: &Edit) {
         Edit::SetMuted { id, muted } => on(*id, &mut |t| t.muted = *muted),
         Edit::SetSoloed { id, soloed } => on(*id, &mut |t| t.soloed = *soloed),
         Edit::SetMasterGain { gain } => project.master_gain = *gain,
+        Edit::SetSource { id, source } => on(*id, &mut |t| t.source = source.clone()),
     }
 }
 

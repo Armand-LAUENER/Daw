@@ -9,6 +9,7 @@ license.workspace = true
 engine-core.workspace = true
 engine-dsp.workspace = true
 engine-io.workspace = true
+engine-io-file.workspace = true
 project-engine.workspace = true
 project-model.workspace = true
 eframe = "0.36.2"

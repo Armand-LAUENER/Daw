@@ -901,6 +901,7 @@ dependencies = [
  "engine-core",
  "engine-dsp",
  "engine-io",
+ "engine-io-file",
  "project-engine",
  "project-model",
 ]

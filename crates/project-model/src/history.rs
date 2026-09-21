@@ -123,14 +123,16 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Command, CommandError, TrackId};
+    use crate::{Command, CommandError, Source, TrackId};
 
     /// A session with `n` tracks and its history already cleared, so a test
     /// starts from a known project rather than from an empty one.
     fn with_tracks(n: usize) -> Session {
         let mut session = Session::new();
         for i in 0..n {
-            session.apply(Command::AddTrack { name: format!("track {i}") }).expect("adding always works");
+            session
+                .apply(Command::AddTrack { name: format!("track {i}"), source: Source::default() })
+                .expect("adding always works");
         }
         Session::from_project(session.project().clone())
     }
@@ -181,7 +183,7 @@ mod tests {
         // Replaying the command instead of the resolved edit would mint a new
         // id, and every later step naming the old one would miss.
         let mut session = Session::new();
-        session.apply(Command::AddTrack { name: "one".into() }).unwrap();
+        session.apply(Command::AddTrack { name: "one".into(), source: Default::default() }).unwrap();
         let id = first(&session);
 
         assert!(session.undo());

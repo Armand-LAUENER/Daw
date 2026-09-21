@@ -52,7 +52,7 @@ fn to_command(project: &Project, action: &Action) -> Option<Command> {
         (!tracks.is_empty()).then(|| tracks[usize::from(i) % tracks.len()].id)
     };
     Some(match action {
-        Action::Add => Command::AddTrack { name: "track".into() },
+        Action::Add => Command::AddTrack { name: "track".into(), source: Default::default() },
         Action::Remove(i) => Command::RemoveTrack { id: pick(*i)? },
         Action::Rename(i, name) => Command::RenameTrack { id: pick(*i)?, name: name.clone() },
         Action::Gain(i, gain) => Command::SetGain { id: pick(*i)?, gain: *gain },
