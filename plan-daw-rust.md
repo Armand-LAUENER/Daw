@@ -84,12 +84,12 @@ Lecture d'un fichier de 10+ minutes avec seeks répétés sans clic audible ; fi
 **But** : passer d'un flux linéaire à un vrai graphe de traitement, avec plusieurs pistes qui se mixent.
 
 ### Tâches
-- [ ] Définir le trait `Node` : `fn process(&mut self, input: &mut AudioBuffer)`.
-- [ ] Implémenter le tri topologique du graphe (pistes → bus → master) — recalculé à chaque modification de routing, jamais dans le callback.
-- [ ] Nodes de base : gain, pan (loi de panoramique constante en puissance, pas linéaire), mute, solo (le solo doit couper les autres pistes sans qu'elles cessent de tourner en arrière-plan si tu veux un solo "safe" sans glitch au relâchement).
-- [ ] Automation : rampes de paramètres interpolées sample-accurate, écrites depuis un thread externe via message lock-free consommé au début de chaque callback.
-- [ ] Bus master avec limiteur simple en sortie (protection contre le clipping numérique pendant les tests).
-- [ ] Test de charge : 8, puis 16 pistes simultanées, mesure du CPU par piste, identification du goulot d'étranglement (allocation cachée, copie de buffer superflue).
+- [x] Définir le trait `Node` : `fn process(&mut self, input: &mut AudioBuffer)`.
+- [x] Implémenter le tri topologique du graphe (pistes → bus → master) — recalculé à chaque modification de routing, jamais dans le callback.
+- [x] Nodes de base : gain, pan (loi de panoramique constante en puissance, pas linéaire), mute, solo (le solo doit couper les autres pistes sans qu'elles cessent de tourner en arrière-plan si tu veux un solo "safe" sans glitch au relâchement).
+- [x] Automation : rampes de paramètres interpolées sample-accurate, écrites depuis un thread externe via message lock-free consommé au début de chaque callback.
+- [x] Bus master avec limiteur simple en sortie (protection contre le clipping numérique pendant les tests).
+- [x] Test de charge : 8, puis 16 pistes simultanées, mesure du CPU par piste, identification du goulot d'étranglement (allocation cachée, copie de buffer superflue).
 
 ### Points d'attention
 - Le tri topologique doit être recalculé hors du thread audio et livré au thread audio via un swap atomique de graphe (double-buffering), jamais modifié en place pendant qu'il tourne.
@@ -97,6 +97,14 @@ Lecture d'un fichier de 10+ minutes avec seeks répétés sans clic audible ; fi
 
 ### Critère de sortie
 8 pistes mixées simultanément, paramètres (gain/pan/mute/solo) modifiables en live sans glitch, usage CPU mesuré et stable sur 30 minutes de lecture continue.
+
+### État
+Les six tâches sont faites. Mesures, marges et runs de validation dans [`docs/REPRISE.md`](docs/REPRISE.md) ; le détail ne vit pas ici.
+
+Deux écarts au plan valent d'être notés :
+
+- **L'automation fait mieux que demandé.** Le plan disait « consommé au début de chaque callback » ; les événements portent une frame absolue et le bloc est découpé à chacune, donc un changement tombe au sample près. À 256 frames et 48 kHz, la frontière du callback est à 5,3 ms — audible sur un élément joué en rythme.
+- **La latence est rapportée, pas compensée.** `Graph::latency_frames()` donne le plus long chemin vers la sortie (96 frames avec le limiteur). Rien n'aligne un chemin qui contourne un nœud à latence contre un qui le traverse. Il n'y a pas de route parallèle aujourd'hui, mais un départ d'effet en créerait une : la vraie compensation de délai (PDC) reste à faire, à ranger dans la phase qui en aura besoin.
 
 ---
 
