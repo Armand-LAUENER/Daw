@@ -12,9 +12,7 @@ mod studio;
 mod theme;
 mod ui;
 
-use std::cell::RefCell;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,7 +24,7 @@ use project_model::{Command, Source, Track};
 
 use clip::{Clip, Library};
 use layout::Layout;
-use studio::{Engine, Studio};
+use studio::{Engine, Sources, Studio};
 use theme::Theme;
 use ui::{Actions, Health};
 
@@ -58,18 +56,33 @@ impl Node for Tone {
     }
 }
 
-/// What a track plays: a file when it has one, the standby tone otherwise.
+/// The files that have been read, and what to make of a track that names one.
 ///
-/// A file named by the project but missing from the library falls back to the
-/// tone rather than to silence — a track that vanished without a word would be
-/// harder to notice than one that is obviously not what was asked for.
-fn source_for(track: &Track, library: &Library, sample_rate: f32) -> Box<dyn Node> {
-    match &track.source {
-        Source::File { path } => match library.get(path) {
-            Some(audio) => Box::new(Clip::new(audio)),
-            None => tone_for(track, sample_rate),
-        },
-        Source::Tone => tone_for(track, sample_rate),
+/// Owned outright rather than shared. The studio asks for a node when it needs
+/// one and gives this back afterwards, so nothing here is ever borrowed twice
+/// at once — and the compiler says so rather than a panic at the worst moment.
+struct FileSources {
+    library: Library,
+    /// The device's rate, which is what files are decoded to: resampling inside
+    /// the callback is work nobody has budgeted for.
+    rate: u32,
+    sample_rate: f32,
+}
+
+impl Sources for FileSources {
+    /// A file when the track names one, the standby tone otherwise.
+    ///
+    /// A file the project names but the library has not read falls back to the
+    /// tone rather than to silence: a track that vanished without a word would
+    /// be harder to notice than one that is obviously not what was asked for.
+    fn node_for(&mut self, track: &Track) -> Box<dyn Node> {
+        match &track.source {
+            Source::File { path } => match self.library.get(path) {
+                Some(audio) => Box::new(Clip::new(audio)),
+                None => tone_for(track, self.sample_rate),
+            },
+            Source::Tone => tone_for(track, self.sample_rate),
+        }
     }
 }
 
@@ -109,10 +122,9 @@ struct App {
     /// here rather than in the project, and never enters the history.
     layout: Layout,
     show_layout: bool,
-    /// Files already read. Shared with the callback that builds the graph, so
-    /// a rebuild reuses what was decoded rather than reading it again.
-    library: Rc<RefCell<Library>>,
-    sample_rate: u32,
+    /// Files already read, so a rebuild reuses what was decoded rather than
+    /// reading it again.
+    sources: FileSources,
     /// The last thing that went wrong, for the strip along the bottom.
     trouble: Option<String>,
     /// Pushed into egui only when it changes, rather than every frame.
@@ -157,15 +169,9 @@ impl App {
         })?;
 
         let stats = Arc::clone(&engine.stats);
-        let library = Rc::new(RefCell::new(Library::new()));
-        let for_graph = Rc::clone(&library);
-        let studio = Studio::new(
-            LiveEngine { params, swapper },
-            Box::new(move |track| source_for(track, &for_graph.borrow(), sample_rate)),
-            GRAPH_CHANNELS,
-            MAX_GRAPH_FRAMES,
-            sample_rate,
-        );
+        let mut sources = FileSources { library: Library::new(), rate, sample_rate };
+        let studio =
+            Studio::new(LiveEngine { params, swapper }, &mut sources, GRAPH_CHANNELS, MAX_GRAPH_FRAMES, sample_rate);
 
         println!(
             "host {} | device {}\n{} Hz, {} ch, {} | buffer: {}",
@@ -187,8 +193,7 @@ impl App {
             theme_applied: Some(0),
             layout: Layout::default(),
             show_layout: false,
-            library,
-            sample_rate: rate,
+            sources,
             trouble: None,
             stats,
             _engine: engine,
@@ -200,14 +205,18 @@ impl App {
     /// One command, so one entry in the history: a file dropped by mistake is
     /// taken back with a single undo.
     fn load(&mut self, path: PathBuf) {
-        let rate = self.sample_rate;
-        match self.library.borrow_mut().load(&path, rate) {
+        // Bound before the match rather than inside it, so reading the file is
+        // finished with before the graph is rebuilt from it. Holding the two at
+        // once is what the borrow checker is here to refuse.
+        let rate = self.sources.rate;
+        let loaded = self.sources.library.load(&path, rate);
+        match loaded {
             Ok(audio) => {
                 let name = path.file_stem().map_or_else(|| "Track".into(), |n| n.to_string_lossy().into_owned());
                 let seconds = audio.duration().as_secs_f64();
                 self.trouble = None;
                 println!("loaded {} ({:.1}s, {} ch)", path.display(), seconds, audio.channels);
-                let _ = self.studio.apply(Command::AddTrack { name, source: Source::File { path } });
+                let _ = self.studio.apply(Command::AddTrack { name, source: Source::File { path } }, &mut self.sources);
             }
             Err(e) => {
                 let message = format!("{}: {e}", path.display());
@@ -222,17 +231,17 @@ impl App {
             // A command the project refuses is the person asking for something
             // that is no longer there — a track someone else removed, say. It
             // is not an error worth stopping the frame for.
-            let _ = self.studio.apply(command);
+            let _ = self.studio.apply(command, &mut self.sources);
         }
         if actions.seal {
             // Nothing after this folds into the gesture that just ended.
             self.studio.seal();
         }
         if actions.undo {
-            self.studio.undo();
+            self.studio.undo(&mut self.sources);
         }
         if actions.redo {
-            self.studio.redo();
+            self.studio.redo(&mut self.sources);
         }
         if let Some(index) = actions.theme {
             self.theme = index;
@@ -304,7 +313,7 @@ impl eframe::App for App {
                 xruns: snapshot.total_xruns(),
                 load_percent: snapshot.load_percentile(0.99) as f64 / 10.0,
                 refusals: self.studio.refusals(),
-                files: self.library.borrow().len(),
+                files: self.sources.library.len(),
                 trouble: self.trouble.as_deref(),
             };
             ui::status(ui, &theme, &health);
@@ -319,7 +328,7 @@ impl eframe::App for App {
         self.carry_out(actions);
         // Anything the engine had no room for is tried again here rather than
         // dropped, so the graph cannot stay out of step with the mixer.
-        self.studio.poll();
+        self.studio.poll(&mut self.sources);
 
         // The status strip reads counters the audio thread keeps moving, so the
         // window has to come back even when nobody touches it.

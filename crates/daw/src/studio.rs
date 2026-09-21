@@ -23,16 +23,23 @@ pub trait Engine {
 
 /// Makes the audio for a track.
 ///
+/// Passed in at each call rather than held by the studio. Holding it would mean
+/// the studio owning whatever it captures — a library of decoded files, say —
+/// while the caller also needs it, which in safe Rust means interior mutability
+/// and a borrow rule nobody checks until it panics. Handed over instead, the
+/// compiler proves the two never overlap.
+///
 /// Called on the control side when a graph is built, so it may read files and
 /// take its time; what crosses to the audio thread is the node it returns.
-pub type SourceFor = Box<dyn FnMut(&Track) -> Box<dyn Node>>;
+pub trait Sources {
+    fn node_for(&mut self, track: &Track) -> Box<dyn Node>;
+}
 
 /// The project, the history, and the engine playing it, kept in step.
 pub struct Studio<E: Engine> {
     session: Session,
     bindings: Bindings,
     engine: E,
-    source_for: SourceFor,
     channels: usize,
     max_frames: usize,
     sample_rate: f32,
@@ -43,19 +50,18 @@ pub struct Studio<E: Engine> {
 }
 
 impl<E: Engine> Studio<E> {
-    pub fn new(engine: E, source_for: SourceFor, channels: usize, max_frames: usize, sample_rate: f32) -> Self {
+    pub fn new(engine: E, sources: &mut impl Sources, channels: usize, max_frames: usize, sample_rate: f32) -> Self {
         let mut studio = Self {
             session: Session::new(),
             bindings: Bindings::default(),
             engine,
-            source_for,
             channels,
             max_frames,
             sample_rate,
             owed_rebuild: false,
             refusals: 0,
         };
-        studio.rebuild();
+        studio.rebuild(sources);
         studio
     }
 
@@ -79,13 +85,13 @@ impl<E: Engine> Studio<E> {
     ///
     /// The project moves first. A command it refuses must never reach the
     /// engine, or the two would disagree about a change that never happened.
-    pub fn apply(&mut self, command: Command) -> Result<(), CommandError> {
+    pub fn apply(&mut self, command: Command, sources: &mut impl Sources) -> Result<(), CommandError> {
         let change = route(&self.bindings, &command);
         self.session.apply(command)?;
 
         match change {
             Change::Nothing => {}
-            Change::Rebuild => self.rebuild(),
+            Change::Rebuild => self.rebuild(sources),
             Change::Param { param, value } => {
                 if !self.engine.send(param, value) {
                     // The queue was full, so the graph no longer matches the
@@ -111,18 +117,18 @@ impl<E: Engine> Studio<E> {
     /// Always rebuilds, even for a fader. The history knows which edit it
     /// reversed, but not in a form this side can aim, so the coarse repair is
     /// the correct one until it does — a crossfade on undo, never a mismatch.
-    pub fn undo(&mut self) -> bool {
+    pub fn undo(&mut self, sources: &mut impl Sources) -> bool {
         if self.session.undo() {
-            self.rebuild();
+            self.rebuild(sources);
             true
         } else {
             false
         }
     }
 
-    pub fn redo(&mut self) -> bool {
+    pub fn redo(&mut self, sources: &mut impl Sources) -> bool {
         if self.session.redo() {
-            self.rebuild();
+            self.rebuild(sources);
             true
         } else {
             false
@@ -133,15 +139,16 @@ impl<E: Engine> Studio<E> {
     ///
     /// Called every frame. Until it succeeds the graph is out of date, which is
     /// why the attempt is repeated rather than dropped.
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self, sources: &mut impl Sources) {
         if self.owed_rebuild {
-            self.rebuild();
+            self.rebuild(sources);
         }
     }
 
-    fn rebuild(&mut self) {
-        let Self { session, source_for, channels, max_frames, sample_rate, .. } = self;
-        let compiled = compile(session.project(), |track| source_for(track), *channels, *max_frames, *sample_rate);
+    fn rebuild(&mut self, sources: &mut impl Sources) {
+        let Self { session, channels, max_frames, sample_rate, .. } = self;
+        let compiled =
+            compile(session.project(), |track| sources.node_for(track), *channels, *max_frames, *sample_rate);
         let Ok(compiled) = compiled else {
             // A graph the builder refuses means the project describes routing
             // that cannot run. Keeping the old graph is better than silence.
@@ -199,114 +206,159 @@ mod tests {
         fn process(&mut self, _buffer: &mut AudioBuffer<'_>) {}
     }
 
-    fn studio() -> Studio<Recorder> {
-        Studio::new(Recorder::default(), Box::new(|_| Box::new(Silence)), 2, 512, 48_000.0)
+    /// Answers every track with silence, and counts how often it was asked —
+    /// which is how often the graph was built.
+    #[derive(Default)]
+    struct Quiet {
+        asked: usize,
     }
 
-    fn add_track(studio: &mut Studio<Recorder>) -> TrackId {
-        studio
-            .apply(Command::AddTrack { name: "track".into(), source: Default::default() })
-            .expect("adding always works");
-        studio.project().tracks.last().expect("it was just added").id
+    impl Sources for Quiet {
+        fn node_for(&mut self, _track: &Track) -> Box<dyn Node> {
+            self.asked += 1;
+            Box::new(Silence)
+        }
+    }
+
+    struct Fixture {
+        studio: Studio<Recorder>,
+        sources: Quiet,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let mut sources = Quiet::default();
+            let studio = Studio::new(Recorder::default(), &mut sources, 2, 512, 48_000.0);
+            Self { studio, sources }
+        }
+
+        fn apply(&mut self, command: Command) -> Result<(), CommandError> {
+            self.studio.apply(command, &mut self.sources)
+        }
+
+        fn add_track(&mut self) -> TrackId {
+            self.apply(Command::AddTrack { name: "track".into(), source: Default::default() })
+                .expect("adding always works");
+            self.studio.project().tracks.last().expect("it was just added").id
+        }
+
+        fn swaps(&self) -> usize {
+            self.studio.engine.swaps
+        }
+
+        fn params(&self) -> usize {
+            self.studio.engine.params.len()
+        }
     }
 
     #[test]
     fn a_fader_reaches_the_graph_without_rebuilding_it() {
-        let mut studio = studio();
-        let id = add_track(&mut studio);
-        let swaps_after_add = studio.engine.swaps;
+        let mut f = Fixture::new();
+        let id = f.add_track();
+        let before = f.swaps();
 
-        studio.apply(Command::SetGain { id, gain: 0.5 }).unwrap();
-        assert_eq!(studio.engine.swaps, swaps_after_add, "a fader movement rebuilt the graph");
-        assert_eq!(studio.engine.params.last().map(|(_, v)| *v), Some(0.5));
+        f.apply(Command::SetGain { id, gain: 0.5 }).unwrap();
+        assert_eq!(f.swaps(), before, "a fader movement rebuilt the graph");
+        assert_eq!(f.studio.engine.params.last().map(|(_, v)| *v), Some(0.5));
     }
 
     #[test]
     fn adding_a_track_rebuilds() {
-        let mut studio = studio();
-        let before = studio.engine.swaps;
-        add_track(&mut studio);
-        assert_eq!(studio.engine.swaps, before + 1);
+        let mut f = Fixture::new();
+        let before = f.swaps();
+        f.add_track();
+        assert_eq!(f.swaps(), before + 1);
     }
 
     #[test]
     fn renaming_asks_nothing_of_the_engine() {
-        let mut studio = studio();
-        let id = add_track(&mut studio);
-        let (swaps, params) = (studio.engine.swaps, studio.engine.params.len());
+        let mut f = Fixture::new();
+        let id = f.add_track();
+        let (swaps, params) = (f.swaps(), f.params());
 
-        studio.apply(Command::RenameTrack { id, name: "drums".into() }).unwrap();
-        assert_eq!(studio.project().track(id).unwrap().name, "drums");
-        assert_eq!((studio.engine.swaps, studio.engine.params.len()), (swaps, params));
+        f.apply(Command::RenameTrack { id, name: "drums".into() }).unwrap();
+        assert_eq!(f.studio.project().track(id).unwrap().name, "drums");
+        assert_eq!((f.swaps(), f.params()), (swaps, params));
+    }
+
+    #[test]
+    fn changing_what_a_track_plays_asks_for_its_audio_again() {
+        // A different source is a different node, so the graph has to be built
+        // again and the new material fetched.
+        let mut f = Fixture::new();
+        let id = f.add_track();
+        let (swaps, asked) = (f.swaps(), f.sources.asked);
+
+        f.apply(Command::SetSource { id, source: project_model::Source::File { path: "kick.wav".into() } }).unwrap();
+        assert_eq!(f.swaps(), swaps + 1);
+        assert!(f.sources.asked > asked, "the graph was rebuilt without asking what to play");
     }
 
     #[test]
     fn a_command_the_project_refuses_never_reaches_the_engine() {
         // Otherwise the graph would be carrying a change the project says did
         // not happen, and no undo would ever take it back.
-        let mut studio = studio();
-        add_track(&mut studio);
-        let (swaps, params) = (studio.engine.swaps, studio.engine.params.len());
+        let mut f = Fixture::new();
+        f.add_track();
+        let (swaps, params) = (f.swaps(), f.params());
 
-        assert!(studio.apply(Command::SetGain { id: TrackId(999), gain: 0.5 }).is_err());
-        assert_eq!((studio.engine.swaps, studio.engine.params.len()), (swaps, params));
+        assert!(f.apply(Command::SetGain { id: TrackId(999), gain: 0.5 }).is_err());
+        assert_eq!((f.swaps(), f.params()), (swaps, params));
     }
 
     #[test]
     fn a_refused_swap_leaves_the_old_bindings_in_place() {
         // The old graph is still playing. Adopting the new bindings would aim
         // every later fader at nodes that are not there.
-        let mut studio = studio();
-        add_track(&mut studio);
-        studio.engine.refuse_swap = true;
+        let mut f = Fixture::new();
+        f.add_track();
+        f.studio.engine.refuse_swap = true;
 
-        let id = add_track(&mut studio);
-        assert!(studio.owed_rebuild, "the refusal was forgotten");
-        assert_eq!(studio.refusals(), 1);
-        // The new track is in the project but not in the graph, so aiming at it
-        // has to ask for a rebuild rather than move something else.
-        assert!(studio.project().track(id).is_some());
+        let id = f.add_track();
+        assert!(f.studio.owed_rebuild, "the refusal was forgotten");
+        assert_eq!(f.studio.refusals(), 1);
+        assert!(f.studio.project().track(id).is_some());
 
-        studio.engine.refuse_swap = false;
-        studio.poll();
-        assert!(!studio.owed_rebuild, "the retry never happened");
+        f.studio.engine.refuse_swap = false;
+        f.studio.poll(&mut f.sources);
+        assert!(!f.studio.owed_rebuild, "the retry never happened");
     }
 
     #[test]
     fn a_fader_the_queue_had_no_room_for_is_repaired_by_a_rebuild() {
         // A dropped parameter would leave the graph quietly out of step with
         // the mixer the person is looking at.
-        let mut studio = studio();
-        let id = add_track(&mut studio);
-        studio.engine.refuse_send = true;
+        let mut f = Fixture::new();
+        let id = f.add_track();
+        f.studio.engine.refuse_send = true;
 
-        studio.apply(Command::SetGain { id, gain: 0.25 }).unwrap();
-        assert!(studio.owed_rebuild, "the dropped change was not noticed");
+        f.apply(Command::SetGain { id, gain: 0.25 }).unwrap();
+        assert!(f.studio.owed_rebuild, "the dropped change was not noticed");
 
-        let before = studio.engine.swaps;
-        studio.poll();
-        assert_eq!(studio.engine.swaps, before + 1, "the repair never ran");
+        let before = f.swaps();
+        f.studio.poll(&mut f.sources);
+        assert_eq!(f.swaps(), before + 1, "the repair never ran");
     }
 
     #[test]
     fn undo_puts_the_graph_back_as_well_as_the_project() {
-        let mut studio = studio();
-        let id = add_track(&mut studio);
-        studio.apply(Command::SetGain { id, gain: 0.1 }).unwrap();
-        let before = studio.engine.swaps;
+        let mut f = Fixture::new();
+        let id = f.add_track();
+        f.apply(Command::SetGain { id, gain: 0.1 }).unwrap();
+        let before = f.swaps();
 
-        assert!(studio.undo());
-        assert_eq!(studio.project().track(id).unwrap().gain, 1.0);
-        assert_eq!(studio.engine.swaps, before + 1, "the project moved but the graph did not");
+        assert!(f.studio.undo(&mut f.sources));
+        assert_eq!(f.studio.project().track(id).unwrap().gain, 1.0);
+        assert_eq!(f.swaps(), before + 1, "the project moved but the graph did not");
 
-        assert!(studio.redo());
-        assert_eq!(studio.project().track(id).unwrap().gain, 0.1);
+        assert!(f.studio.redo(&mut f.sources));
+        assert_eq!(f.studio.project().track(id).unwrap().gain, 0.1);
     }
 
     #[test]
     fn there_is_nothing_to_undo_at_the_start() {
-        let mut studio = studio();
-        assert!(!studio.can_undo() && !studio.can_redo());
-        assert!(!studio.undo());
+        let mut f = Fixture::new();
+        assert!(!f.studio.can_undo() && !f.studio.can_redo());
+        assert!(!f.studio.undo(&mut f.sources));
     }
 }
