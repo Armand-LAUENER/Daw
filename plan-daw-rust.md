@@ -63,12 +63,12 @@ Stream stable 10+ minutes sans underrun, changement de paramètre en direct sans
 **But** : lire un vrai fichier audio avec transport complet, et faire vivre ton premier nœud DSP dans le flux temps réel.
 
 ### Tâches
-- [ ] Intégrer `symphonia` pour décoder mp3/flac/wav en PCM.
-- [ ] Thread de préchargement disque : lit des chunks à l'avance dans un ring buffer plus grand (quelques secondes de marge), jamais dans le callback audio.
-- [ ] Transport : play / pause / seek / loop. Le seek doit vider proprement le ring buffer de préchargement et redémarrer la lecture au bon offset sans glitch.
-- [ ] Implémenter un filtre biquad résonant (RBJ cookbook — low-pass, high-pass) comme struct qui expose `process_sample(&mut self, x: f32) -> f32`.
-- [ ] Interpolation des coefficients du filtre entre deux mises à jour de paramètre (éviter le zipper noise) — recalcul progressif sur N samples, pas un switch brutal.
-- [ ] Test spectral : sweep sinusoïdal en entrée, FFT en sortie, vérifier la pente de coupure attendue (ex. -12dB/octave pour un biquad simple).
+- [x] Intégrer `symphonia` pour décoder mp3/flac/wav en PCM.
+- [x] Thread de préchargement disque : lit des chunks à l'avance dans un ring buffer plus grand (quelques secondes de marge), jamais dans le callback audio.
+- [x] Transport : play / pause / seek / loop. Le seek doit vider proprement le ring buffer de préchargement et redémarrer la lecture au bon offset sans glitch.
+- [x] Implémenter un filtre biquad résonant (RBJ cookbook — low-pass, high-pass) comme struct qui expose `process_sample(&mut self, x: f32) -> f32`.
+- [x] Interpolation des coefficients du filtre entre deux mises à jour de paramètre (éviter le zipper noise) — recalcul progressif sur N samples, pas un switch brutal.
+- [x] Test spectral : sweep sinusoïdal en entrée, FFT en sortie, vérifier la pente de coupure attendue (ex. -12dB/octave pour un biquad simple).
 
 ### Points d'attention
 - Le seek pendant lecture est un point classique de bug : si tu ne resynchronises pas le thread de préchargement avec la nouvelle position, tu lis de l'audio obsolète pendant quelques centaines de ms.
@@ -76,6 +76,11 @@ Stream stable 10+ minutes sans underrun, changement de paramètre en direct sans
 
 ### Critère de sortie
 Lecture d'un fichier de 10+ minutes avec seeks répétés sans clic audible ; filtre modulable en direct sans zipper noise, validé par mesure FFT et pas seulement à l'oreille.
+
+### État
+Les six tâches sont faites, et le critère de sortie a été validé sur le périphérique le 2026-09-21 (10 min, 119 seeks, aucun xrun ni discontinuité). Le log et les marges sont dans [`docs/REPRISE.md`](docs/REPRISE.md).
+
+Un écart au plan : **la réponse en fréquence est mesurée par sonde à sinus, pas par FFT.** Le filtre est attaqué par un sinus, on laisse le transitoire s'éteindre, puis on compare les RMS d'entrée et de sortie sur la même fenêtre — mesurer l'entrée plutôt que la supposer annule l'essentiel de l'erreur d'un nombre de cycles non entier. Ça mesure exactement ce qu'une FFT mesurerait, aux fréquences qui comptent, sans ajouter de dépendance. Les assertions sont les mêmes qu'au plan : -3,01 dB à la coupure, -12 dB/octave, pic de résonance ≈ Q, blocage du continu, plus un test de propriété qui balaie les coupures de 200 Hz à 8 kHz.
 
 ---
 
