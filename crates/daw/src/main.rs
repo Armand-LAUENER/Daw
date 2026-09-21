@@ -6,6 +6,7 @@
 //! window can be rewritten without touching the other two, which is the point
 //! of the split: the engine is the part that has to stay still.
 
+mod layout;
 mod studio;
 mod theme;
 mod ui;
@@ -19,6 +20,7 @@ use engine_dsp::SineOsc;
 use engine_io::{AudioEngine, EngineOptions, Stats, default_output_config, map_frames};
 use project_model::Track;
 
+use layout::Layout;
 use studio::{Engine, Studio};
 use theme::Theme;
 use ui::{Actions, Health};
@@ -83,6 +85,10 @@ struct App {
     studio: Studio<LiveEngine>,
     themes: [Theme; 2],
     theme: usize,
+    /// How big things are. A preference of whoever is looking, so it is kept
+    /// here rather than in the project, and never enters the history.
+    layout: Layout,
+    show_layout: bool,
     /// Pushed into egui only when it changes, rather than every frame.
     theme_applied: Option<usize>,
     stats: Arc<Stats>,
@@ -146,7 +152,16 @@ impl App {
         let themes = Theme::all();
         println!("themes: {}", themes.iter().map(|t| t.name).collect::<Vec<_>>().join(", "));
         themes[0].apply(&cc.egui_ctx);
-        Ok(Self { studio, themes, theme: 0, theme_applied: Some(0), stats, _engine: engine })
+        Ok(Self {
+            studio,
+            themes,
+            theme: 0,
+            theme_applied: Some(0),
+            layout: Layout::default(),
+            show_layout: false,
+            stats,
+            _engine: engine,
+        })
     }
 
     fn carry_out(&mut self, actions: Actions) {
@@ -168,6 +183,9 @@ impl App {
         }
         if let Some(index) = actions.theme {
             self.theme = index;
+        }
+        if actions.toggle_layout {
+            self.show_layout = !self.show_layout;
         }
     }
 }
@@ -212,6 +230,11 @@ impl eframe::App for App {
         egui::Panel::top("bar").show(root, |ui| {
             ui::top_bar(ui, &theme, &self.themes, self.studio.can_undo(), self.studio.can_redo(), &mut actions);
         });
+        if self.show_layout {
+            egui::Panel::top("layout").show(root, |ui| {
+                layout::controls(ui, &theme, &mut self.layout);
+            });
+        }
 
         let snapshot = self.stats.snapshot();
         egui::Panel::bottom("status").show(root, |ui| {
@@ -225,7 +248,7 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme.background)).show(root, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui::mixer(ui, self.studio.project(), &theme, &mut actions);
+                ui::mixer(ui, self.studio.project(), &theme, &self.layout, &mut actions);
             });
         });
 

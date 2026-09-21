@@ -8,21 +8,8 @@
 use eframe::egui::{self, RichText, Ui};
 use project_model::{Command, Project, TrackId};
 
+use crate::layout::Layout;
 use crate::theme::Theme;
-
-/// How wide a gain fader is.
-///
-/// egui's default is a hundred pixels, which is a setting rather than a fader:
-/// the whole range in a hundred steps makes small adjustments impossible, and
-/// gain is the control a person reaches for most.
-const GAIN_WIDTH: f32 = 240.0;
-/// Panning needs less travel than gain — it has a centre to find, not a curve
-/// to ride — but still more than a hundred pixels.
-const PAN_WIDTH: f32 = 150.0;
-/// Enough for a name without crowding out the faders behind it.
-const NAME_WIDTH: f32 = 110.0;
-/// Square-ish, so M and S read as switches rather than as words.
-const SWITCH_WIDTH: f32 = 26.0;
 
 /// What happened during one frame.
 #[derive(Default)]
@@ -35,6 +22,8 @@ pub struct Actions {
     pub redo: bool,
     /// A different theme was chosen.
     pub theme: Option<usize>,
+    /// The layout controls were asked for, or dismissed.
+    pub toggle_layout: bool,
 }
 
 /// How the engine is getting on, for the strip along the bottom.
@@ -61,6 +50,11 @@ pub fn top_bar(ui: &mut Ui, theme: &Theme, themes: &[Theme], can_undo: bool, can
             actions.commands.push(Command::AddTrack { name: "Track".into() });
         }
 
+        ui.separator();
+        if ui.button("Layout").clicked() {
+            actions.toggle_layout = true;
+        }
+
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             for (index, candidate) in themes.iter().enumerate().rev() {
                 let current = candidate.name == theme.name;
@@ -72,7 +66,7 @@ pub fn top_bar(ui: &mut Ui, theme: &Theme, themes: &[Theme], can_undo: bool, can
     });
 }
 
-pub fn mixer(ui: &mut Ui, project: &Project, theme: &Theme, actions: &mut Actions) {
+pub fn mixer(ui: &mut Ui, project: &Project, theme: &Theme, layout: &Layout, actions: &mut Actions) {
     if project.tracks.is_empty() {
         ui.add_space(24.0);
         ui.vertical_centered(|ui| {
@@ -84,15 +78,15 @@ pub fn mixer(ui: &mut Ui, project: &Project, theme: &Theme, actions: &mut Action
 
     for track in &project.tracks {
         let audible = project.is_audible(track.id);
-        strip(ui, track, audible, theme, actions);
-        ui.add_space(4.0);
+        strip(ui, track, audible, theme, layout, actions);
+        ui.add_space(layout.strip_spacing);
     }
 
     ui.separator();
     ui.horizontal(|ui| {
         ui.label(RichText::new("Master").color(theme.dim).strong());
         let mut gain = project.master_gain;
-        ui.spacing_mut().slider_width = GAIN_WIDTH;
+        ui.spacing_mut().slider_width = layout.gain_width;
         let slider = ui.add(egui::Slider::new(&mut gain, 0.0..=2.0).show_value(false));
         if slider.changed() {
             actions.commands.push(Command::SetMasterGain { gain });
@@ -104,12 +98,19 @@ pub fn mixer(ui: &mut Ui, project: &Project, theme: &Theme, actions: &mut Action
     });
 }
 
-fn strip(ui: &mut Ui, track: &project_model::Track, audible: bool, theme: &Theme, actions: &mut Actions) {
+fn strip(
+    ui: &mut Ui,
+    track: &project_model::Track,
+    audible: bool,
+    theme: &Theme,
+    layout: &Layout,
+    actions: &mut Actions,
+) {
     let id: TrackId = track.id;
     egui::Frame::group(ui.style()).fill(theme.panel).show(ui, |ui| {
         ui.horizontal(|ui| {
             let mut name = track.name.clone();
-            if ui.add(egui::TextEdit::singleline(&mut name).desired_width(NAME_WIDTH)).changed() {
+            if ui.add(egui::TextEdit::singleline(&mut name).desired_width(layout.name_width)).changed() {
                 actions.commands.push(Command::RenameTrack { id, name });
             }
 
@@ -117,20 +118,20 @@ fn strip(ui: &mut Ui, track: &project_model::Track, audible: bool, theme: &Theme
             // tall mixer is enough.
             let mute_colour = if track.muted { theme.muted } else { theme.dim };
             let mute = egui::Button::new(RichText::new("M").color(mute_colour).strong())
-                .min_size(egui::vec2(SWITCH_WIDTH, 0.0));
+                .min_size(egui::vec2(layout.switch_width, 0.0));
             if ui.add(mute).clicked() {
                 actions.commands.push(Command::SetMuted { id, muted: !track.muted });
             }
             let solo_colour = if track.soloed { theme.soloed } else { theme.dim };
             let solo = egui::Button::new(RichText::new("S").color(solo_colour).strong())
-                .min_size(egui::vec2(SWITCH_WIDTH, 0.0));
+                .min_size(egui::vec2(layout.switch_width, 0.0));
             if ui.add(solo).clicked() {
                 actions.commands.push(Command::SetSoloed { id, soloed: !track.soloed });
             }
 
             ui.label(RichText::new("gain").color(theme.dim).small());
             let mut gain = track.gain;
-            ui.spacing_mut().slider_width = GAIN_WIDTH;
+            ui.spacing_mut().slider_width = layout.gain_width;
             let fader = ui.add(egui::Slider::new(&mut gain, 0.0..=2.0).show_value(false));
             if fader.changed() {
                 actions.commands.push(Command::SetGain { id, gain });
@@ -141,7 +142,7 @@ fn strip(ui: &mut Ui, track: &project_model::Track, audible: bool, theme: &Theme
 
             ui.label(RichText::new("pan").color(theme.dim).small());
             let mut pan = track.pan;
-            ui.spacing_mut().slider_width = PAN_WIDTH;
+            ui.spacing_mut().slider_width = layout.pan_width;
             let panner = ui.add(egui::Slider::new(&mut pan, -1.0..=1.0).show_value(false));
             if panner.changed() {
                 actions.commands.push(Command::SetPan { id, pan });
