@@ -93,8 +93,12 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let options = EngineOptions::default();
-        let (rate, _channels) = default_output_config(options.host.as_deref(), options.device.as_deref())?;
+        let (rate, channels) = default_output_config(options.host.as_deref(), options.device.as_deref())?;
         let sample_rate = rate as f32;
+        // Printed rather than only shown in the window: a run checked from a
+        // terminal, or from another machine, otherwise has no evidence that
+        // the audio path opened at all.
+        println!("device: {rate} Hz, {channels} channels");
 
         let (swapper, mut player) = graph_channel(None, GRAPH_CHANNELS, MAX_GRAPH_FRAMES, sample_rate);
         let (params, mut queue) = automation_channel(256);
@@ -129,7 +133,18 @@ impl App {
             sample_rate,
         );
 
+        println!(
+            "host {} | device {}\n{} Hz, {} ch, {} | buffer: {}",
+            engine.info.host,
+            engine.info.device,
+            engine.info.sample_rate,
+            engine.info.channels,
+            engine.info.sample_format,
+            engine.info.buffer_size
+        );
+
         let themes = Theme::all();
+        println!("themes: {}", themes.iter().map(|t| t.name).collect::<Vec<_>>().join(", "));
         themes[0].apply(&cc.egui_ctx);
         Ok(Self { studio, themes, theme: 0, theme_applied: Some(0), stats, _engine: engine })
     }
@@ -154,6 +169,24 @@ impl App {
         if let Some(index) = actions.theme {
             self.theme = index;
         }
+    }
+}
+
+impl Drop for App {
+    /// What the engine made of the session. A window closed without a word
+    /// would leave a run unfalsifiable.
+    fn drop(&mut self) {
+        let stats = self.stats.snapshot();
+        println!(
+            "\ncallbacks {} | xruns {} | overloads {} | load p50 {:.1}% p99 {:.1}% max {:.1}% | rebuilds refused {}",
+            stats.callbacks,
+            stats.total_xruns(),
+            stats.overloads,
+            stats.load_percentile(0.5) as f64 / 10.0,
+            stats.load_percentile(0.99) as f64 / 10.0,
+            stats.max_load_permille as f64 / 10.0,
+            self.studio.refusals(),
+        );
     }
 }
 
