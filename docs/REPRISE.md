@@ -134,15 +134,68 @@ C'est ce dernier chiffre qui rend les deux premiers utiles — une borne que rie
 ne peut dépasser ne prouverait rien. Le pic sort à 0,90000004 dans les deux cas,
 donc le limiteur tient bien le plafond pendant tout le run.
 
-**Ce que ça ne prouve pas** : tout ça est hors périphérique. Ça établit le coût
-et la justesse du graphe, pas que le callback tient sous un vrai ordonnanceur
-avec sa gigue. La phase 1 avait été validée sur matériel (WASAPI natif) ; le
-même run pour la phase 2 attend que le graphe soit branché dans `engine-io`.
+Tout ça reste hors périphérique : ça établit le coût et la justesse du graphe,
+pas que le callback tient sous un vrai ordonnanceur. C'est ce que fait
+l'exemple `phase2`.
 
-**Ce qui n'est pas encore branché** : `process_automated` est au niveau de
-`Graph`, pas de `GraphPlayer`. Pendant le fondu croisé d'un échange de graphe,
-les identifiants de nœuds des deux graphes ne correspondent pas, donc
-l'automation n'y est pas encore définie — à trancher en câblant le moteur.
+### Câblage dans `engine-io` (incrément 9)
+
+`scripts/windows.sh phase2 --tracks 8 --seconds 60 --swap-every 7` fait tourner
+le graphe sur le périphérique Windows : le callback pilote un `GraphPlayer`, le
+thread de contrôle bouge les faders par automation et remplace le routage
+pendant que ça joue.
+
+`engine-core` est une **dev-dependency** de `engine-io`, comme `engine-io-file` :
+la bibliothèque reste device-only, le câblage vit dans l'exemple.
+
+Le graphe est stéréo quel que soit le périphérique — le panoramique a besoin
+d'une paire — et `map_frames` l'amène ensuite vers la disposition réelle (7.1
+ici), exactement comme phase1 le fait pour un fichier. Il est construit pour
+2048 frames au plus ; un callback plus gros est rendu en plusieurs passes plutôt
+que de dimensionner chaque tampon de nœud pour le pire cas.
+
+Le thread de contrôle ne connaît pas l'horloge du thread audio, donc le callback
+publie sa position dans un `AtomicU64` et le contrôle programme 30 ms devant. Un
+événement en retard n'est pas perdu : il tombe au début du bloc suivant.
+
+Premier run validé le 2026-09-21 (8 pistes, 60 s, 8 échanges de graphe, 8886
+mouvements de fader) :
+
+```
+graph: 8 tracks, stereo, limiter at 0.9 | latency 96 frames (2.00 ms)
+[   60.02s] callbacks 6002 | xruns 0 | overloads 0 | load p50 0,6 % p99 1,3 % max 2,9 %
+fader moves 8886 | refused 0 | graph swaps 8
+discontinuities 0 | worst step 0,024764 | limit 0,063652
+PASS: no xrun, no discontinuity
+```
+
+Le pire pas à 39 % de la limite : le détecteur regardait bien de l'audio.
+
+### Deux dettes réglées au passage
+
+**`GraphPlayer::process_automated`** existe maintenant, donc l'automation marche
+à travers un échange de graphe. Les changements vont au graphe qui prend la
+main ; le graphe sortant garde ses réglages, parce que les deux ont été
+construits séparément et qu'un identifiant de nœud ne désigne pas la même chose
+dans chacun. Il lui reste `SWAP_FADE_MS` à vivre, donc ce qu'il rate est
+inaudible.
+
+Un test a trouvé un vrai bug de commande au passage : `process_automated`
+appliquait les événements à `self.current` **avant** que `process` ne récupère
+le graphe entrant, donc un changement programmé dans le même bloc qu'un échange
+atterrissait sur le graphe sortant — puis était fondu au noir avec lui.
+`process_automated` récupère maintenant le graphe entrant en premier.
+
+**La latence est rapportée** : `Node::latency_frames()`, `Graph::latency_frames()`
+(plus long chemin vers la sortie, pas la somme des chemins parallèles) et
+`GraphPlayer::latency_frames()`. L'exemple l'affiche : 96 frames, 2,00 ms.
+
+**Ce qui n'est toujours pas fait** : rapporter n'est pas compenser. Rien n'aligne
+un chemin qui contourne un nœud à latence contre un qui le traverse, donc un
+graphe avec des routes parallèles de profondeurs différentes les verra dériver.
+Il n'y en a pas aujourd'hui — le limiteur est sur la sortie — mais un départ
+d'effet en parallèle en créerait une. C'est de la compensation de délai (PDC),
+un vrai morceau, à faire quand un routage en aura besoin.
 
 Le dépôt est sur GitHub (`Armand-LAUENER/Daw`, privé) et la CI y tourne sur
 Linux et Windows.

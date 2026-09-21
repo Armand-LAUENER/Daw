@@ -111,6 +111,21 @@ impl AutomationQueue {
         while self.rx.pop().is_ok() {}
     }
 
+    /// Hands every change due at `start + done` to `apply`, then says how far
+    /// the next span may render before the following one falls due.
+    ///
+    /// Both things that split a block go through here, so they cannot disagree
+    /// about where a change lands.
+    pub(crate) fn span(&mut self, start: u64, done: usize, frames: usize, mut apply: impl FnMut(ParamEvent)) -> usize {
+        let now = start + done as u64;
+        while let Some(event) = self.take_due(now) {
+            apply(event);
+        }
+        // Everything due at `now` has been applied, so whatever is left is
+        // strictly later and the span is never empty.
+        self.next_frame().map_or(frames, |frame| (frame - start) as usize).clamp(done + 1, frames)
+    }
+
     fn fill(&mut self) {
         if self.head.is_none() {
             self.head = self.rx.pop().ok();

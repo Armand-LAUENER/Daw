@@ -10,7 +10,8 @@
 
 use assert_no_alloc::{AllocDisabler, assert_no_alloc};
 use engine_core::{
-    AudioBuffer, Gain, GraphBuilder, Limiter, Mute, Node, Pan, ParamEvent, ParamId, automation_channel, graph_channel,
+    AudioBuffer, Gain, GraphBuilder, Limiter, Mute, Node, NodeId, Pan, ParamEvent, ParamId, automation_channel,
+    graph_channel,
 };
 
 #[global_allocator]
@@ -154,5 +155,36 @@ fn automating_a_graph_does_not_allocate() {
     }
 
     assert!(out.iter().any(|s| *s != 0.0), "the graph produced silence, so it proved nothing");
+    assert!(out.iter().all(|s| s.is_finite()), "the mix went non-finite");
+}
+
+#[test]
+fn automating_through_a_swap_does_not_allocate() {
+    // The two halves of the audio thread's job at once: a fade running while
+    // changes are landing, each on its own frame. Splitting the block here
+    // means the fade is stepped through in pieces, which is where a scratch
+    // buffer sized on the fly would hide.
+    let (mut swapper, mut player) = graph_channel(Some(constant_graph(0.1)), CHANNELS, MAX_FRAMES, SR);
+    let (mut sender, mut queue) = automation_channel(64);
+    let mut out = vec![0.0f32; MAX_FRAMES * CHANNELS];
+    let mut frame = 0u64;
+
+    for i in 0..300usize {
+        if i.is_multiple_of(40) {
+            let _ = swapper.swap(constant_graph(0.1 + i as f32 / 1_000.0));
+        }
+        let frames = 64 + (i * 53) % 900;
+        for step in 0..4u64 {
+            // Aimed at the one node a constant graph has.
+            let param = ParamId::new(NodeId::from_index(0), 0);
+            let _ = sender.send(ParamEvent::new(param, 0.2, frame + step * (frames as u64 / 4)));
+        }
+
+        let block = &mut out[..frames * CHANNELS];
+        assert_no_alloc(|| player.process_automated(block, &mut queue, frame));
+        while swapper.collect().is_some() {}
+        frame += frames as u64;
+    }
+
     assert!(out.iter().all(|s| s.is_finite()), "the mix went non-finite");
 }

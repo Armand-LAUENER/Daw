@@ -7,9 +7,10 @@
 #   scripts/windows.sh bench              # DSP throughput, on the real target CPU
 #   scripts/windows.sh phase0 [ARGS...]   # real-time sine run on the Windows audio device
 #   scripts/windows.sh phase1 FILE [ARGS...]  # real-time file playback (FILE is a Windows path)
+#   scripts/windows.sh phase2 [ARGS...]   # real-time mixer graph with faders moving
 #
 # The Windows side is a clone of this repository (DAW_WIN_DIR, default
-# C:\dev\Daw) used as a mirror: do not edit files there. phase0 logs are
+# C:\dev\Daw) used as a mirror: do not edit files there. Run logs are
 # saved under target/windows-logs/. Needs cargo.exe and git.exe on the PATH
 # (WSL appends the Windows PATH by default).
 set -euo pipefail
@@ -72,21 +73,16 @@ case "$cmd" in
     bench)
         cargo_win run --release -q -p engine-dsp --example bench
         ;;
-    phase1)
-        # FILE is a Windows path: the mirror cannot reach WSL paths.
+    phase0 | phase1 | phase2)
+        # The example is named by the command. phase1's FILE is a Windows path:
+        # the mirror cannot reach WSL paths.
         mkdir -p target/windows-logs
-        log="target/windows-logs/phase1-$(date +%Y%m%d-%H%M%S).log"
+        log="target/windows-logs/$cmd-$(date +%Y%m%d-%H%M%S).log"
         echo "==> logging to $log"
-        cargo_win run --release -q -p engine-io --example phase1 -- "$@" | tee "$log"
-        ;;
-    phase0)
-        mkdir -p target/windows-logs
-        log="target/windows-logs/phase0-$(date +%Y%m%d-%H%M%S).log"
-        echo "==> logging to $log"
-        cargo_win run --release -q -p engine-io --example phase0 -- "$@" | tee "$log"
+        cargo_win run --release -q -p engine-io --example "$cmd" -- "$@" | tee "$log"
         ;;
     *)
-        echo "unknown command $cmd (test | check | bench | phase0 [ARGS...] | phase1 FILE [ARGS...])" >&2
+        echo "unknown command $cmd (test | check | bench | phase0 | phase1 FILE | phase2 [ARGS...])" >&2
         exit 2
         ;;
 esac

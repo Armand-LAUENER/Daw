@@ -20,9 +20,17 @@ proptest.workspace = true
 # Only the phase1 example and the pipeline test play files; the library stays
 # device-only, so the file layer never becomes a runtime dependency.
 engine-io-file.workspace = true
+# Same rule for the graph: the phase2 example wires it to the device, the
+# library does not depend on it.
+engine-core.workspace = true
 
 [lints]
 workspace = true
+
+[[example]]
+name = "phase2"
+# Run the argument-parsing tests with `cargo test`.
+test = true
 
 [[example]]
 name = "phase1"

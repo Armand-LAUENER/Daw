@@ -1,6 +1,6 @@
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::Graph;
+use crate::{AutomationQueue, Graph};
 
 /// How long the crossfade between two graphs lasts.
 ///
@@ -101,6 +101,43 @@ impl GraphPlayer {
         }
     }
 
+    /// Fills `out`, breaking the block at each scheduled change so it lands on
+    /// its own frame.
+    ///
+    /// Changes go to the graph that is playing. During a crossfade the outgoing
+    /// graph keeps whatever settings it had: the two graphs were built
+    /// separately, so a node id means different things in each, and applying an
+    /// event to both would move something unrelated. The outgoing graph has
+    /// `SWAP_FADE_MS` left to live, so what it misses is inaudible.
+    pub fn process_automated(&mut self, out: &mut [f32], events: &mut AutomationQueue, start_frame: u64) {
+        // Pick up a waiting graph before any event is applied, not after. A
+        // change scheduled for the same block as a swap is meant for the graph
+        // taking over; leaving this to `process` would land it on the one on
+        // its way out, which is then faded away with the change on it.
+        self.return_retired();
+        self.take_incoming();
+
+        let frames = out.len() / self.channels;
+        let mut done = 0;
+
+        while done < frames {
+            let current = &mut self.current;
+            let end = events.span(start_frame, done, frames, |event| {
+                if let Some(graph) = current {
+                    graph.set_param(event.param, event.value);
+                }
+            });
+            self.process(&mut out[done * self.channels..end * self.channels]);
+            done = end;
+        }
+    }
+
+    /// How many frames the playing graph delays its output by, or zero before
+    /// one has arrived. Changes when a graph of a different shape is swapped in.
+    pub fn latency_frames(&self) -> usize {
+        self.current.as_ref().map_or(0, |graph| graph.latency_frames())
+    }
+
     /// Whether a crossfade is under way, so two graphs are running at once.
     pub fn is_swapping(&self) -> bool {
         self.previous.is_some()
@@ -162,7 +199,7 @@ pub fn graph_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AudioBuffer, GraphBuilder, Node};
+    use crate::{AudioBuffer, GraphBuilder, Limiter, Node, NodeId, ParamEvent, ParamId, automation_channel};
 
     const SR: f32 = 48_000.0;
     const CHANNELS: usize = 2;
@@ -185,6 +222,26 @@ mod tests {
         let node = builder.add(Box::new(Constant(level)));
         builder.output(node);
         Box::new(builder.build(CHANNELS, MAX_FRAMES).unwrap())
+    }
+
+    /// A one-node graph whose level answers automation without a ramp, so a
+    /// test can read the exact sample a change landed on.
+    fn levelled_graph(level: f32) -> (Box<Graph>, ParamId) {
+        struct Level(f32);
+        impl Node for Level {
+            fn process(&mut self, buffer: &mut AudioBuffer<'_>) {
+                for channel in buffer.channels_mut() {
+                    channel.fill(self.0);
+                }
+            }
+            fn set_param(&mut self, _param: u32, value: f32) {
+                self.0 = value;
+            }
+        }
+        let mut builder = GraphBuilder::new();
+        let node = builder.add(Box::new(Level(level)));
+        builder.output(node);
+        (Box::new(builder.build(CHANNELS, MAX_FRAMES).unwrap()), ParamId::new(node, 0))
     }
 
     fn play(player: &mut GraphPlayer, blocks: usize, frames: usize) -> Vec<f32> {
@@ -264,5 +321,73 @@ mod tests {
             swapper.swap(graph(0.1)).unwrap();
         }
         assert!(swapper.swap(graph(0.1)).is_err(), "an overfull queue should refuse rather than block");
+    }
+
+    #[test]
+    fn the_player_places_a_change_on_its_own_frame() {
+        let (graph, level) = levelled_graph(1.0);
+        let (_swapper, mut player) = graph_channel(Some(graph), CHANNELS, MAX_FRAMES, SR);
+        let (mut sender, mut queue) = automation_channel(8);
+        sender.send(ParamEvent::new(level, 0.25, 100)).unwrap();
+
+        let mut out = vec![0.0; 256 * CHANNELS];
+        player.process_automated(&mut out, &mut queue, 0);
+
+        assert!(out[..100 * CHANNELS].iter().all(|s| *s == 1.0), "the change arrived early");
+        assert!(out[100 * CHANNELS..].iter().all(|s| *s == 0.25), "the change arrived late");
+    }
+
+    #[test]
+    fn a_change_during_a_fade_goes_to_the_graph_taking_over() {
+        // The two graphs were built separately, so a node id means something
+        // different in each. Applying an event to both would move whatever
+        // happened to sit at that index in the outgoing one.
+        let (first, _) = levelled_graph(1.0);
+        let (mut swapper, mut player) = graph_channel(Some(first), CHANNELS, MAX_FRAMES, SR);
+        let (mut sender, mut queue) = automation_channel(8);
+
+        let mut out = vec![0.0; 64 * CHANNELS];
+        player.process_automated(&mut out, &mut queue, 0);
+
+        let (second, level) = levelled_graph(0.0);
+        swapper.swap(second).map_err(|_| "the queue was empty").unwrap();
+        sender.send(ParamEvent::new(level, 0.5, 64)).unwrap();
+        player.process_automated(&mut out, &mut queue, 64);
+
+        assert!(player.is_swapping(), "the fade should still be running");
+        // The incoming graph moved to 0.5 and the outgoing one is still at 1.0,
+        // so the mix sits between them rather than at either.
+        let last = out[out.len() - 1];
+        assert!(last > 0.5 && last < 1.0, "expected a blend of 0.5 and 1.0, got {last}");
+    }
+
+    #[test]
+    fn silence_takes_automation_without_complaint() {
+        // Events can be in flight when no graph has arrived yet. Dropping them
+        // is right; panicking on them is not.
+        let (_swapper, mut player) = graph_channel(None, CHANNELS, MAX_FRAMES, SR);
+        let (mut sender, mut queue) = automation_channel(8);
+        sender.send(ParamEvent::new(ParamId::new(NodeId::from_index(0), 0), 0.5, 10)).unwrap();
+
+        let mut out = vec![1.0; 64 * CHANNELS];
+        player.process_automated(&mut out, &mut queue, 0);
+        assert!(out.iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn the_player_reports_the_latency_of_what_is_playing() {
+        let mut builder = GraphBuilder::new();
+        let node = builder.add(Box::new(Constant(0.5)));
+        let ceiling = builder.add(Box::new(Limiter::new(0.9, CHANNELS, SR)));
+        builder.connect(node, ceiling).output(ceiling);
+        let latent = Box::new(builder.build(CHANNELS, MAX_FRAMES).unwrap());
+        let expected = latent.latency_frames();
+        assert!(expected > 0, "the limiter reported no lookahead");
+
+        let (_swapper, silent) = graph_channel(None, CHANNELS, MAX_FRAMES, SR);
+        assert_eq!(silent.latency_frames(), 0, "silence has no latency to report");
+
+        let (_swapper, player) = graph_channel(Some(latent), CHANNELS, MAX_FRAMES, SR);
+        assert_eq!(player.latency_frames(), expected);
     }
 }

@@ -225,6 +225,7 @@ version = "0.1.0"
 dependencies = [
  "assert_no_alloc",
  "cpal",
+ "engine-core",
  "engine-dsp",
  "engine-io-file",
  "proptest",

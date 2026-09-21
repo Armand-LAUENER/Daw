@@ -100,12 +100,14 @@ impl GraphBuilder {
 
         let order = topological_order(&self.entries)?;
         let count = self.entries.len();
+        let latency = path_latency(&self.entries, &order, output);
         let (nodes, inputs): (Vec<_>, Vec<_>) = self.entries.into_iter().map(|e| (e.node, e.inputs)).unzip();
 
         Ok(Graph {
             nodes,
             inputs,
             order,
+            latency,
             buffers: vec![vec![0.0; channels * max_frames]; count],
             channels,
             max_frames,
@@ -138,6 +140,19 @@ fn topological_order(entries: &[Entry]) -> Result<Vec<usize>, GraphError> {
     if order.len() == entries.len() { Ok(order) } else { Err(GraphError::Cycle) }
 }
 
+/// Delay on the longest path from a source to `output`.
+///
+/// Walking in topological order means a node's inputs are always settled by the
+/// time it is reached, so one pass is enough.
+fn path_latency(entries: &[Entry], order: &[usize], output: usize) -> usize {
+    let mut latency = vec![0usize; entries.len()];
+    for &index in order {
+        let upstream = entries[index].inputs.iter().map(|&input| latency[input]).max().unwrap_or(0);
+        latency[index] = upstream + entries[index].node.latency_frames();
+    }
+    latency[output]
+}
+
 /// A routed set of nodes, ready to run.
 ///
 /// Built on the control side and handed over whole. The audio thread never
@@ -152,6 +167,8 @@ pub struct Graph {
     channels: usize,
     max_frames: usize,
     output: usize,
+    /// Frames of delay on the longest path to the output.
+    latency: usize,
 }
 
 impl fmt::Debug for Graph {
@@ -164,6 +181,7 @@ impl fmt::Debug for Graph {
             .field("output", &self.output)
             .field("channels", &self.channels)
             .field("max_frames", &self.max_frames)
+            .field("latency", &self.latency)
             .finish()
     }
 }
@@ -224,18 +242,29 @@ impl Graph {
         let mut done = 0;
 
         while done < frames {
-            let now = start_frame + done as u64;
-            while let Some(event) = events.take_due(now) {
-                self.set_param(event.param, event.value);
-            }
-
-            // Everything due at `now` is applied, so whatever is left is
-            // strictly later and the next span is never empty.
-            let next = events.next_frame().map_or(frames, |frame| (frame - start_frame) as usize);
-            let end = next.clamp(done + 1, frames);
+            let nodes = &mut self.nodes;
+            let end = events.span(start_frame, done, frames, |event| {
+                if let Some(node) = nodes.get_mut(event.param.node.index()) {
+                    node.set_param(event.param.param, event.value);
+                }
+            });
             self.process(&mut out[done * self.channels..end * self.channels]);
             done = end;
         }
+    }
+
+    /// How many frames the graph delays its output by.
+    ///
+    /// The longest path to the output, since a node cannot produce its first
+    /// sample before everything feeding it has. Worked out when the graph is
+    /// built, where walking it is free.
+    ///
+    /// This reports the delay; it does not correct it. Nothing here aligns a
+    /// path that bypasses a latent node against one that goes through it, so a
+    /// graph with parallel routes of different depth will have them drift apart
+    /// by the difference.
+    pub fn latency_frames(&self) -> usize {
+        self.latency
     }
 
     /// Applies one change now. Events for a node that is not in this graph are
@@ -497,5 +526,42 @@ mod tests {
             assert!((w[1] - w[0]).abs() <= max_step, "step at {i}: {} -> {}", w[0], w[1]);
         }
         assert_eq!(out[959], 0.0, "the ramp never arrived");
+    }
+
+    #[test]
+    fn a_graph_of_plain_nodes_has_no_latency() {
+        let (graph, _) = tone_graph();
+        assert_eq!(graph.latency_frames(), 0);
+    }
+
+    #[test]
+    fn latency_adds_up_along_a_chain() {
+        use crate::Limiter;
+        let mut builder = GraphBuilder::new();
+        let tone = builder.add(Box::new(Tone(1.0)));
+        let first = builder.add(Box::new(Limiter::new(0.9, 1, SR)));
+        let second = builder.add(Box::new(Limiter::new(0.9, 1, SR)));
+        builder.connect(tone, first).connect(first, second).output(second);
+        let graph = builder.build(1, 512).unwrap();
+
+        let one = Limiter::new(0.9, 1, SR).latency_frames();
+        assert_eq!(graph.latency_frames(), one * 2, "two in series delay by both");
+    }
+
+    #[test]
+    fn parallel_paths_report_the_longest_not_the_sum() {
+        // Two routes into one bus: the bus cannot produce a sample before the
+        // slowest of them has, and no sooner than that either.
+        use crate::Limiter;
+        let mut builder = GraphBuilder::new();
+        let tone = builder.add(Box::new(Tone(1.0)));
+        let direct = builder.add(Box::new(Gain::new(1.0, SR)));
+        let latent = builder.add(Box::new(Limiter::new(0.9, 1, SR)));
+        let bus = builder.add(Box::new(Gain::new(0.5, SR)));
+        builder.connect(tone, direct).connect(tone, latent);
+        builder.connect(direct, bus).connect(latent, bus).output(bus);
+        let graph = builder.build(1, 512).unwrap();
+
+        assert_eq!(graph.latency_frames(), Limiter::new(0.9, 1, SR).latency_frames());
     }
 }

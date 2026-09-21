@@ -64,14 +64,6 @@ impl Limiter {
         }
     }
 
-    /// How many frames the limiter delays the signal by.
-    ///
-    /// Anything that has to line up with this output — a metronome, a recorded
-    /// take, another path through the graph — has to account for it.
-    pub fn latency_frames(&self) -> usize {
-        self.lookahead
-    }
-
     pub fn set_threshold(&mut self, threshold: f32) {
         self.threshold = threshold.max(f32::MIN_POSITIVE);
     }
@@ -103,6 +95,13 @@ impl Limiter {
 }
 
 impl Node for Limiter {
+    /// The lookahead, which is the whole point of the design and the price of
+    /// it. Anything that has to line up with this output — a metronome, a
+    /// recorded take, another path through the graph — has to account for it.
+    fn latency_frames(&self) -> usize {
+        self.lookahead
+    }
+
     fn process(&mut self, buffer: &mut AudioBuffer<'_>) {
         // The graph gives every node the channel count it was built with, so
         // this only bites if a limiter is moved between graphs of different

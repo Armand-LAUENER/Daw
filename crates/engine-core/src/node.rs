@@ -20,6 +20,15 @@ pub trait Node: Send {
     /// Drops any internal state, as when playback jumps somewhere else.
     fn reset(&mut self) {}
 
+    /// How many frames this node delays its output by.
+    ///
+    /// Zero for anything that works sample by sample. A node that has to see
+    /// ahead — a limiter, a linear-phase filter — reports what it holds back,
+    /// so the graph can say how far behind its output runs.
+    fn latency_frames(&self) -> usize {
+        0
+    }
+
     /// Applies an automation event aimed at this node.
     ///
     /// `param` is one of the node's own `PARAM_*` constants. A node ignores
