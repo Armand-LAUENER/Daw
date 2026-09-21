@@ -76,11 +76,12 @@ impl Sources for FileSources {
     /// tone rather than to silence: a track that vanished without a word would
     /// be harder to notice than one that is obviously not what was asked for.
     fn node_for(&mut self, track: &Track) -> Box<dyn Node> {
-        match &track.source {
-            Source::File { path } => match self.library.get(path) {
+        match track.source {
+            // Asked for a file but holding none, or holding one the library
+            // has not read: the tone says so audibly, where silence would look
+            // like a track that had quietly gone missing.
+            Source::File => match track.file.as_ref().and_then(|path| self.library.get(path)) {
                 Some(audio) => Box::new(Clip::new(audio)),
-                // Named but not read: the tone says so audibly, where silence
-                // would look like a track that had quietly gone missing.
                 None => tone_for(track, self.sample_rate),
             },
             Source::Tone => tone_for(track, self.sample_rate),
@@ -219,7 +220,8 @@ impl App {
                 let seconds = audio.duration().as_secs_f64();
                 self.trouble = None;
                 println!("loaded {} ({:.1}s, {} ch)", path.display(), seconds, audio.channels);
-                let _ = self.studio.apply(Command::AddTrack { name, source: Source::File { path } }, &mut self.sources);
+                let command = Command::AddTrack { name, source: Source::File, file: Some(path) };
+                let _ = self.studio.apply(command, &mut self.sources);
             }
             Err(e) => {
                 let message = format!("{}: {e}", path.display());

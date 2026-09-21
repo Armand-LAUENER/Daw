@@ -237,7 +237,7 @@ mod tests {
         }
 
         fn add_track(&mut self) -> TrackId {
-            self.apply(Command::AddTrack { name: "track".into(), source: Default::default() })
+            self.apply(Command::AddTrack { name: "track".into(), source: Default::default(), file: None })
                 .expect("adding always works");
             self.studio.project().tracks.last().expect("it was just added").id
         }
@@ -289,7 +289,7 @@ mod tests {
         let id = f.add_track();
         let (swaps, asked) = (f.swaps(), f.sources.asked);
 
-        f.apply(Command::SetSource { id, source: project_model::Source::File { path: "kick.wav".into() } }).unwrap();
+        f.apply(Command::SetSource { id, source: project_model::Source::File }).unwrap();
         assert_eq!(f.swaps(), swaps + 1);
         assert!(f.sources.asked > asked, "the graph was rebuilt without asking what to play");
     }

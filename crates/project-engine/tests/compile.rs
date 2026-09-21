@@ -32,7 +32,7 @@ fn with_tracks(n: usize) -> Session {
     let mut session = Session::new();
     for i in 0..n {
         session
-            .apply(Command::AddTrack { name: format!("track {i}"), source: Source::default() })
+            .apply(Command::AddTrack { name: format!("track {i}"), source: Source::default(), file: None })
             .expect("adding always works");
     }
     Session::from_project(session.project().clone())
@@ -129,7 +129,10 @@ fn changing_the_shape_asks_for_a_rebuild_and_moving_a_fader_does_not() {
     let compiled = build(&session);
     let b = &compiled.bindings;
 
-    assert_eq!(route(b, &Command::AddTrack { name: "two".into(), source: Default::default() }), Change::Rebuild);
+    assert_eq!(
+        route(b, &Command::AddTrack { name: "two".into(), source: Default::default(), file: None }),
+        Change::Rebuild
+    );
     assert_eq!(route(b, &Command::RemoveTrack { id }), Change::Rebuild);
     assert_eq!(route(b, &Command::RenameTrack { id, name: "x".into() }), Change::Nothing);
 
@@ -192,7 +195,7 @@ fn the_master_holds_a_stack_of_tracks_under_the_ceiling() {
     // clipping is the one failure that cannot be undone afterwards.
     let mut session = Session::new();
     for i in 0..20 {
-        session.apply(Command::AddTrack { name: format!("{i}"), source: Source::default() }).unwrap();
+        session.apply(Command::AddTrack { name: format!("{i}"), source: Source::default(), file: None }).unwrap();
     }
     let mut compiled = compile(session.project(), |_| Box::new(Constant(1.0)), CHANNELS, MAX_FRAMES, SR).unwrap();
 
@@ -213,7 +216,7 @@ fn changing_what_a_track_plays_asks_for_a_rebuild() {
     let session = with_tracks(1);
     let id = ids(&session)[0];
     let compiled = build(&session);
-    let source = Source::File { path: "kick.wav".into() };
+    let source = Source::File;
     assert_eq!(route(&compiled.bindings, &Command::SetSource { id, source }), Change::Rebuild);
 }
 
@@ -221,8 +224,8 @@ fn changing_what_a_track_plays_asks_for_a_rebuild() {
 fn the_source_survives_being_undone_and_redone() {
     let mut session = with_tracks(1);
     let id = ids(&session)[0];
-    let source = Source::File { path: "kick.wav".into() };
-    session.apply(Command::SetSource { id, source: source.clone() }).unwrap();
+    let source = Source::File;
+    session.apply(Command::SetSource { id, source }).unwrap();
     assert_eq!(session.project().track(id).unwrap().source, source);
 
     session.undo();

@@ -51,7 +51,7 @@ pub fn top_bar(ui: &mut Ui, theme: &Theme, themes: &[Theme], can_undo: bool, can
 
         ui.separator();
         if ui.button("Add track").clicked() {
-            actions.commands.push(Command::AddTrack { name: "Track".into(), source: Default::default() });
+            actions.commands.push(Command::AddTrack { name: "Track".into(), source: Default::default(), file: None });
         }
 
         ui.separator();
@@ -165,22 +165,30 @@ fn strip(
                 if ui.button(RichText::new("remove").color(theme.warning).small()).clicked() {
                     actions.commands.push(Command::RemoveTrack { id });
                 }
-                let source = &track.source;
-                let loaded = matches!(source, Source::File { .. });
-                // Eject empties the track rather than putting the test tone
-                // back: taking a file off should leave silence, not a buzz.
-                if !matches!(source, Source::Silent)
-                    && ui.button(RichText::new("eject").color(theme.dim).small()).clicked()
+                // Three states, chosen rather than cycled, and none of them
+                // throws the file away: switching to the tone and back is how
+                // a person hears what a setting is doing.
+                let has_file = track.file.is_some();
+                for (label, source, enabled) in
+                    [("silent", Source::Silent, true), ("tone", Source::Tone, true), ("file", Source::File, has_file)]
                 {
+                    let chosen = track.source == source;
+                    let colour = if chosen { theme.accent } else { theme.dim };
+                    // Selection is carried by colour rather than by a frame:
+                    // the chosen one is also the one that cannot be clicked.
+                    let button = egui::Button::new(RichText::new(label).color(colour).small());
+                    if ui.add_enabled(enabled && !chosen, button).clicked() {
+                        actions.commands.push(Command::SetSource { id, source });
+                    }
+                }
+                if has_file && ui.button(RichText::new("eject").color(theme.warning).small()).clicked() {
+                    // Takes the file off the track for good; the tone button is
+                    // how you stop listening to it without losing it.
+                    actions.commands.push(Command::SetFile { id, file: None });
                     actions.commands.push(Command::SetSource { id, source: Source::Silent });
                 }
-                if !matches!(source, Source::Tone)
-                    && ui.button(RichText::new("tone").color(theme.dim).small()).clicked()
-                {
-                    actions.commands.push(Command::SetSource { id, source: Source::Tone });
-                }
-                let colour = if loaded { theme.accent } else { theme.dim };
-                ui.label(RichText::new(source.label()).color(colour).small());
+                let colour = if track.source == Source::File { theme.accent } else { theme.dim };
+                ui.label(RichText::new(track.playing()).color(colour).small());
             });
         });
     });

@@ -1,5 +1,7 @@
 use std::fmt;
 
+use std::path::PathBuf;
+
 use crate::{Project, Source, Track, TrackId};
 
 /// A change someone asked for.
@@ -8,11 +10,12 @@ use crate::{Project, Source, Track, TrackId};
 /// arm that resolves it — which is also what makes it undoable, for free.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
-    /// The source is given up front rather than set afterwards, so a file
-    /// dropped onto the window is one entry in the history and one undo.
+    /// The source and the file are given up front rather than set afterwards,
+    /// so a file dropped onto the window is one entry in the history.
     AddTrack {
         name: String,
         source: Source,
+        file: Option<PathBuf>,
     },
     RemoveTrack {
         id: TrackId,
@@ -49,6 +52,13 @@ pub enum Command {
         id: TrackId,
         source: Source,
     },
+    /// The file the track holds. Setting it does not start it playing, and
+    /// clearing it does not silence the track — they are separate questions,
+    /// which is what lets someone listen to the tone and come back.
+    SetFile {
+        id: TrackId,
+        file: Option<PathBuf>,
+    },
 }
 
 /// What a change is aimed at, for telling one gesture from the next.
@@ -72,7 +82,8 @@ impl Command {
             | Self::RenameTrack { .. }
             | Self::SetMuted { .. }
             | Self::SetSoloed { .. }
-            | Self::SetSource { .. } => None,
+            | Self::SetSource { .. }
+            | Self::SetFile { .. } => None,
         }
     }
 }
@@ -116,6 +127,7 @@ pub(crate) enum Edit {
     SetSoloed { id: TrackId, soloed: bool },
     SetMasterGain { gain: f32 },
     SetSource { id: TrackId, source: Source },
+    SetFile { id: TrackId, file: Option<PathBuf> },
 }
 
 /// Works out what a command does, and what would undo it.
@@ -126,9 +138,9 @@ pub(crate) fn resolve(project: &Project, command: Command) -> Result<(Edit, Edit
     let found = |id: TrackId| project.track(id).ok_or(CommandError::NoSuchTrack(id));
 
     Ok(match command {
-        Command::AddTrack { name, source } => {
+        Command::AddTrack { name, source, file } => {
             let index = project.tracks.len();
-            let track = Track::new(project.next_id(), name, source);
+            let track = Track::new(project.next_id(), name, source, file);
             (Edit::InsertTrack { index, track }, Edit::RemoveTrack { index })
         }
         Command::RemoveTrack { id } => {
@@ -164,8 +176,12 @@ pub(crate) fn resolve(project: &Project, command: Command) -> Result<(Edit, Edit
             (Edit::SetMasterGain { gain }, Edit::SetMasterGain { gain: project.master_gain })
         }
         Command::SetSource { id, source } => {
-            let was = found(id)?.source.clone();
+            let was = found(id)?.source;
             (Edit::SetSource { id, source }, Edit::SetSource { id, source: was })
+        }
+        Command::SetFile { id, file } => {
+            let was = found(id)?.file.clone();
+            (Edit::SetFile { id, file }, Edit::SetFile { id, file: was })
         }
     })
 }
@@ -189,7 +205,8 @@ pub(crate) fn apply(project: &mut Project, edit: &Edit) {
         Edit::SetMuted { id, muted } => on(*id, &mut |t| t.muted = *muted),
         Edit::SetSoloed { id, soloed } => on(*id, &mut |t| t.soloed = *soloed),
         Edit::SetMasterGain { gain } => project.master_gain = *gain,
-        Edit::SetSource { id, source } => on(*id, &mut |t| t.source = source.clone()),
+        Edit::SetSource { id, source } => on(*id, &mut |t| t.source = *source),
+        Edit::SetFile { id, file } => on(*id, &mut |t| t.file.clone_from(file)),
     }
 }
 

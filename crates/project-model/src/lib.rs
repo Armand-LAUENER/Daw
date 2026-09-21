@@ -41,34 +41,16 @@ pub struct TrackId(pub u32);
 /// The model names the source but does not hold it: decoding belongs to
 /// whoever has a sample rate to decode for, and a project should survive being
 /// opened on a machine where the file has moved.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Source {
-    /// Nothing. What an empty track plays, and what a track plays once its
-    /// file has been taken off it.
+    /// Nothing. What an empty track plays.
     #[default]
     Silent,
-    /// A test tone, asked for on purpose.
-    ///
-    /// Useful for hearing that a fader or a pan is doing what it says without
-    /// loading anything, which is what it was for before files worked. Not a
-    /// default any more: a track that buzzes until told otherwise is a track
-    /// nobody wants.
+    /// A test tone, asked for on purpose. Useful for hearing what a fader or a
+    /// pan does without loading anything.
     Tone,
-    /// Audio read from a file.
-    File { path: PathBuf },
-}
-
-impl Source {
-    /// A short name for the mixer, taken from the file rather than the path.
-    pub fn label(&self) -> String {
-        match self {
-            Self::Silent => "silent".into(),
-            Self::Tone => "tone".into(),
-            Self::File { path } => {
-                path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
-            }
-        }
-    }
+    /// The track's file, which it keeps whether or not it is playing it.
+    File,
 }
 
 /// One track's settings. What the mixer shows, and what a graph is built from.
@@ -82,12 +64,32 @@ pub struct Track {
     pub pan: f32,
     pub muted: bool,
     pub soloed: bool,
+    /// What the track plays.
     pub source: Source,
+    /// The file the track holds, kept whether or not it is the thing being
+    /// played. Separating the two is what lets a person listen to the test tone
+    /// and come back to their audio instead of having lost it.
+    pub file: Option<PathBuf>,
 }
 
 impl Track {
-    pub fn new(id: TrackId, name: impl Into<String>, source: Source) -> Self {
-        Self { id, name: name.into(), gain: 1.0, pan: 0.0, muted: false, soloed: false, source }
+    pub fn new(id: TrackId, name: impl Into<String>, source: Source, file: Option<PathBuf>) -> Self {
+        Self { id, name: name.into(), gain: 1.0, pan: 0.0, muted: false, soloed: false, source, file }
+    }
+
+    /// A short description of what this track is playing, for the mixer.
+    pub fn playing(&self) -> String {
+        match self.source {
+            Source::Silent => "silent".into(),
+            Source::Tone => "tone".into(),
+            Source::File => self.file_name().unwrap_or_else(|| "no file".into()),
+        }
+    }
+
+    /// The name of the file it holds, without the path leading to it.
+    pub fn file_name(&self) -> Option<String> {
+        let path = self.file.as_ref()?;
+        Some(path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()))
     }
 }
 

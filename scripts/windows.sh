@@ -74,6 +74,10 @@ case "$cmd" in
         cargo_win run --release -q -p engine-dsp --example bench
         ;;
     app)
+        # Windows locks the executable of a running process, so cargo cannot
+        # replace it and the build fails with "Accès refusé". Ending the
+        # previous window first costs nothing and saves a round trip.
+        win taskkill.exe /IM daw.exe /F >/dev/null 2>&1 || true
         mkdir -p target/windows-logs
         log="target/windows-logs/app-$(date +%Y%m%d-%H%M%S).log"
         echo "==> logging to $log"

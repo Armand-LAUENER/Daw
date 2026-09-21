@@ -131,7 +131,7 @@ mod tests {
         let mut session = Session::new();
         for i in 0..n {
             session
-                .apply(Command::AddTrack { name: format!("track {i}"), source: Source::default() })
+                .apply(Command::AddTrack { name: format!("track {i}"), source: Source::default(), file: None })
                 .expect("adding always works");
         }
         Session::from_project(session.project().clone())
@@ -183,7 +183,7 @@ mod tests {
         // Replaying the command instead of the resolved edit would mint a new
         // id, and every later step naming the old one would miss.
         let mut session = Session::new();
-        session.apply(Command::AddTrack { name: "one".into(), source: Default::default() }).unwrap();
+        session.apply(Command::AddTrack { name: "one".into(), source: Default::default(), file: None }).unwrap();
         let id = first(&session);
 
         assert!(session.undo());
