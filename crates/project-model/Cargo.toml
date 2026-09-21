@@ -1,0 +1,12 @@
+[package]
+name = "project-model"
+description = "The project as saved and edited: tracks, commands, undo. Not the engine's state."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
