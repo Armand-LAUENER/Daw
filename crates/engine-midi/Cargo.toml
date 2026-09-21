@@ -1,0 +1,13 @@
+[package]
+name = "engine-midi"
+description = "Standard MIDI file decoding into scheduled notes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+engine-core.workspace = true
+midly.workspace = true
+
+[lints]
+workspace = true

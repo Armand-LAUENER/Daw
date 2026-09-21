@@ -11,11 +11,16 @@ license = "MIT OR Apache-2.0"
 engine-core = { path = "crates/engine-core" }
 engine-dsp = { path = "crates/engine-dsp" }
 engine-io-file = { path = "crates/engine-io-file" }
+engine-midi = { path = "crates/engine-midi" }
 cpal = "0.18.2"
 # default-features off: the default set pulls every decoder in, so each crate
 # names the formats it actually wants.
 symphonia = { version = "0.6.1", default-features = false }
 rubato = "5.0.0"
+# default-features off: the default set pulls rayon in to parse tracks in
+# parallel, which is six crates for work measured in milliseconds, off the
+# audio thread.
+midly = { version = "0.5.3", default-features = false, features = ["std"] }
 rtrb = "0.4.0"
 assert_no_alloc = "1.1.2"
 proptest = "1.11.0"
