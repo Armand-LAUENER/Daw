@@ -171,6 +171,27 @@ PASS: no xrun, no discontinuity
 
 Le pire pas à 39 % de la limite : le détecteur regardait bien de l'audio.
 
+**Critère de sortie de la phase 2, validé le 2026-09-21** — 30 minutes, 16
+pistes (alternant 16 et 8 à chaque échange), via
+`scripts/windows.sh phase2 --tracks 16 --minutes 30 --swap-every 23` :
+
+```
+[ 1800.00s] callbacks 179999 | xruns 0 | overloads 0 | load p50 1,1 % p99 2,6 % max 4,6 %
+fader moves 266475 | refused 0 | graph swaps 78
+discontinuities 0 | worst step 0,034680 | limit 0,086271
+PASS: no xrun, no discontinuity
+```
+
+266 475 mouvements de fader, aucun refusé — la file d'automation n'a jamais
+débordé. 78 échanges de graphe pendant la lecture, aucune discontinuité. La
+charge est la même à la 30ᵉ minute qu'à la première, ce que le run offline de
+30 minutes disait déjà mais sans l'ordonnanceur réel.
+
+**Il manque le solo.** Le critère du plan dit « paramètres (gain/pan/mute/solo)
+modifiables en live » et `Solo` n'existe nulle part dans le code. Le reste du
+critère est atteint et dépassé (16 pistes au lieu de 8), mais tant que le solo
+n'est pas là, la phase 2 n'est pas close au sens du plan.
+
 ### Deux dettes réglées au passage
 
 **`GraphPlayer::process_automated`** existe maintenant, donc l'automation marche
