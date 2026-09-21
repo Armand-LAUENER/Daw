@@ -118,17 +118,33 @@ Deux écarts au plan valent d'être notés :
 **But** : ajouter un synthé interne piloté par MIDI, avec scheduling sample-accurate.
 
 ### Tâches
-- [ ] I/O MIDI externe via `midir` (réception de notes depuis un contrôleur/clavier).
-- [ ] Parsing de fichiers `.mid` via `midly` pour rejouer une séquence enregistrée.
-- [ ] Synthé simple : oscillateur (sine/saw/square) + enveloppe ADSR par voix, polyphonie basique (pool de voix réutilisables, pas d'allocation à chaque note).
-- [ ] Scheduling intra-buffer : une note qui démarre au milieu d'un buffer de 512 samples doit démarrer exactement au bon sample, pas au début du buffer suivant (sinon dérive audible sur un tempo rapide).
-- [ ] Piano roll minimal en mémoire (liste de notes avec timestamp/durée/pitch/vélocité) pour tester le scheduling sans dépendre du matériel MIDI.
+- [x] I/O MIDI externe via `midir` (réception de notes depuis un contrôleur/clavier).
+- [x] Parsing de fichiers `.mid` via `midly` pour rejouer une séquence enregistrée.
+- [x] Synthé simple : oscillateur (sine/saw/square) + enveloppe ADSR par voix, polyphonie basique (pool de voix réutilisables, pas d'allocation à chaque note).
+- [x] Scheduling intra-buffer : une note qui démarre au milieu d'un buffer de 512 samples doit démarrer exactement au bon sample, pas au début du buffer suivant (sinon dérive audible sur un tempo rapide).
+- [x] Piano roll minimal en mémoire (liste de notes avec timestamp/durée/pitch/vélocité) pour tester le scheduling sans dépendre du matériel MIDI.
 
 ### Points d'attention
 - Le piège classique : traiter tout le buffer d'un coup puis "appliquer" les events MIDI au début du buffer suivant. Ça introduit jusqu'à ~10ms de latence perçable au tempo élevé. Découpe le buffer aux points d'arrivée des events si tu veux du vrai sample-accurate.
 
 ### Critère de sortie
 Lecture d'un fichier MIDI sans décalage audible même à tempo élevé (160+ BPM), réaction en direct à un contrôleur externe avec latence perçue nulle.
+
+**Première moitié atteinte, seconde non validée.** Les cinq tâches sont faites ; le critère, lui, ne l'est qu'à moitié.
+
+| moitié | état |
+|---|---|
+| Fichier MIDI sans décalage à 160+ BPM | **atteint** — 30 min à 180 BPM sur le périphérique, 21 601 notes, pire écart **0 frame** |
+| Contrôleur externe, latence perçue nulle | **non validé** — aucun clavier MIDI disponible |
+
+### État
+Mesures et runs dans [`docs/REPRISE.md`](docs/REPRISE.md) ; le détail ne vit pas ici.
+
+Trois écarts au plan valent d'être notés :
+
+- **Le synthé ne découpe pas le buffer.** Le plan dit « découpe le buffer aux points d'arrivée des events », ce que fait l'automation de la phase 2 — mais un synthé génère échantillon par échantillon, donc il consulte sa file en arrivant sur chaque frame. Même précision, aucun coût pour le reste du graphe. Ça a demandé une horloge partagée (`Node::set_frame`), distribuée par le graphe et aux deux graphes pendant un fondu croisé.
+- **Saw et square sont band-limités (PolyBLEP).** Le plan ne le demandait pas. Pris au pied de la lettre, un saw à 5 kHz met de l'énergie à 3 kHz par repliement, où aucune de ses harmoniques n'a affaire, et rien en aval ne peut l'en séparer ensuite.
+- **`midir` est derrière une feature `live`.** Lire un `.mid` ne doit pas lier la pile MIDI système : sans la feature `engine-midi` coûte 5 crates, avec elle 13. Le code du clavier est écrit et sa traduction de messages testée, mais l'ouverture d'un port réel n'a jamais été exercée — et les ports virtuels ne sont pas une échappatoire (`midir` n'en a pas sur Windows, WSL n'expose pas `/dev/snd/seq`). `scripts/windows.sh phase3 --midi-in` est prêt pour le jour où un clavier sera branché.
 
 ---
 
