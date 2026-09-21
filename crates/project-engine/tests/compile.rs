@@ -226,7 +226,7 @@ fn the_source_survives_being_undone_and_redone() {
     assert_eq!(session.project().track(id).unwrap().source, source);
 
     session.undo();
-    assert_eq!(session.project().track(id).unwrap().source, Source::Tone);
+    assert_eq!(session.project().track(id).unwrap().source, Source::Silent, "an ejected track should be silent");
     session.redo();
     assert_eq!(session.project().track(id).unwrap().source, source);
 }

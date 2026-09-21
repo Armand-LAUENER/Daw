@@ -22,7 +22,7 @@ use engine_dsp::SineOsc;
 use engine_io::{AudioEngine, EngineOptions, Stats, default_output_config, map_frames};
 use project_model::{Command, Source, Track};
 
-use clip::{Clip, Library};
+use clip::{Clip, Library, Silence};
 use layout::Layout;
 use studio::{Engine, Sources, Studio};
 use theme::Theme;
@@ -79,9 +79,12 @@ impl Sources for FileSources {
         match &track.source {
             Source::File { path } => match self.library.get(path) {
                 Some(audio) => Box::new(Clip::new(audio)),
+                // Named but not read: the tone says so audibly, where silence
+                // would look like a track that had quietly gone missing.
                 None => tone_for(track, self.sample_rate),
             },
             Source::Tone => tone_for(track, self.sample_rate),
+            Source::Silent => Box::new(Silence),
         }
     }
 }

@@ -54,6 +54,16 @@ impl Library {
     }
 }
 
+/// A track with nothing on it.
+///
+/// It writes nothing at all rather than writing zeros: the graph hands every
+/// node a buffer it has already silenced, so there is nothing to do.
+pub struct Silence;
+
+impl Node for Silence {
+    fn process(&mut self, _buffer: &mut AudioBuffer<'_>) {}
+}
+
 /// Plays shared audio into the graph, round and round.
 pub struct Clip {
     audio: Shared,
@@ -164,5 +174,14 @@ mod tests {
         let library = Library::new();
         assert_eq!(library.len(), 0);
         assert!(library.get(Path::new("nothing.wav")).is_none());
+    }
+
+    #[test]
+    fn an_empty_track_leaves_the_buffer_as_it_found_it() {
+        // The graph silences a node's buffer before calling it, so a source
+        // with nothing to play has nothing to do.
+        let mut data = vec![0.0f32; 8];
+        Silence.process(&mut AudioBuffer::new(&mut data, 2));
+        assert!(data.iter().all(|s| *s == 0.0));
     }
 }

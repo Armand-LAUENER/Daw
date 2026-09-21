@@ -6,7 +6,7 @@
 //! touching anything that matters.
 
 use eframe::egui::{self, RichText, Ui};
-use project_model::{Command, Project, TrackId};
+use project_model::{Command, Project, Source, TrackId};
 
 use crate::layout::Layout;
 use crate::theme::Theme;
@@ -165,12 +165,22 @@ fn strip(
                 if ui.button(RichText::new("remove").color(theme.warning).small()).clicked() {
                     actions.commands.push(Command::RemoveTrack { id });
                 }
-                let playing = matches!(track.source, project_model::Source::File { .. });
-                if playing && ui.button(RichText::new("eject").color(theme.dim).small()).clicked() {
-                    actions.commands.push(Command::SetSource { id, source: project_model::Source::Tone });
+                let source = &track.source;
+                let loaded = matches!(source, Source::File { .. });
+                // Eject empties the track rather than putting the test tone
+                // back: taking a file off should leave silence, not a buzz.
+                if !matches!(source, Source::Silent)
+                    && ui.button(RichText::new("eject").color(theme.dim).small()).clicked()
+                {
+                    actions.commands.push(Command::SetSource { id, source: Source::Silent });
                 }
-                let colour = if playing { theme.accent } else { theme.dim };
-                ui.label(RichText::new(track.source.label()).color(colour).small());
+                if !matches!(source, Source::Tone)
+                    && ui.button(RichText::new("tone").color(theme.dim).small()).clicked()
+                {
+                    actions.commands.push(Command::SetSource { id, source: Source::Tone });
+                }
+                let colour = if loaded { theme.accent } else { theme.dim };
+                ui.label(RichText::new(source.label()).color(colour).small());
             });
         });
     });

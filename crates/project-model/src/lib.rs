@@ -43,8 +43,16 @@ pub struct TrackId(pub u32);
 /// opened on a machine where the file has moved.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum Source {
-    /// A tone, so a new track is audible before anything is loaded onto it.
+    /// Nothing. What an empty track plays, and what a track plays once its
+    /// file has been taken off it.
     #[default]
+    Silent,
+    /// A test tone, asked for on purpose.
+    ///
+    /// Useful for hearing that a fader or a pan is doing what it says without
+    /// loading anything, which is what it was for before files worked. Not a
+    /// default any more: a track that buzzes until told otherwise is a track
+    /// nobody wants.
     Tone,
     /// Audio read from a file.
     File { path: PathBuf },
@@ -54,6 +62,7 @@ impl Source {
     /// A short name for the mixer, taken from the file rather than the path.
     pub fn label(&self) -> String {
         match self {
+            Self::Silent => "silent".into(),
             Self::Tone => "tone".into(),
             Self::File { path } => {
                 path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
