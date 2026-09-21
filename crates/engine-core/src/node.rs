@@ -32,6 +32,14 @@ pub trait Node: Send {
         0
     }
 
+    /// Tells the node where the block about to be processed starts on the
+    /// engine's timeline.
+    ///
+    /// Only a node that schedules something against that timeline needs it — a
+    /// synth placing a note on its frame. Everything else works on whatever it
+    /// is handed and ignores this.
+    fn set_frame(&mut self, _frame: u64) {}
+
     /// Applies an automation event aimed at this node.
     ///
     /// `param` is one of the node's own `PARAM_*` constants. A node ignores

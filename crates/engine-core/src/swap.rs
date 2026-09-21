@@ -127,6 +127,10 @@ impl GraphPlayer {
                     graph.set_param(event.param, event.value);
                 }
             });
+            let at = start_frame + done as u64;
+            for graph in [self.current.as_mut(), self.previous.as_mut()].into_iter().flatten() {
+                graph.set_frame(at);
+            }
             self.process(&mut out[done * self.channels..end * self.channels]);
             done = end;
         }

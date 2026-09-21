@@ -109,6 +109,7 @@ impl GraphBuilder {
             order,
             latency,
             buffers: vec![vec![0.0; channels * max_frames]; count],
+            frame: 0,
             channels,
             max_frames,
             output,
@@ -169,6 +170,8 @@ pub struct Graph {
     output: usize,
     /// Frames of delay on the longest path to the output.
     latency: usize,
+    /// Where the next block sits on the engine's timeline.
+    frame: u64,
 }
 
 impl fmt::Debug for Graph {
@@ -207,6 +210,10 @@ impl Graph {
         assert!(frames <= self.max_frames, "callback of {frames} frames exceeds the graph's {}", self.max_frames);
         let used = frames * self.channels;
 
+        for node in &mut self.nodes {
+            node.set_frame(self.frame);
+        }
+
         for step in 0..self.order.len() {
             let index = self.order[step];
             // Lifting the buffer out lets this node's inputs be read while it
@@ -225,6 +232,20 @@ impl Graph {
         }
 
         AudioBuffer::new(&mut self.buffers[self.output][..used], self.channels).write_interleaved(out);
+        self.frame += u64::from(frames as u32);
+    }
+
+    /// Places the next block on the engine's timeline.
+    ///
+    /// Without it the graph keeps its own count from zero, which is right for
+    /// something rendered on its own and wrong for a graph swapped in halfway
+    /// through a session.
+    pub fn set_frame(&mut self, frame: u64) {
+        self.frame = frame;
+    }
+
+    pub fn frame(&self) -> u64 {
+        self.frame
     }
 
     /// Runs the block, stopping at each scheduled change so it lands on its
@@ -248,6 +269,7 @@ impl Graph {
                     node.set_param(event.param.param, event.value);
                 }
             });
+            self.frame = start_frame + done as u64;
             self.process(&mut out[done * self.channels..end * self.channels]);
             done = end;
         }

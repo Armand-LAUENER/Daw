@@ -1,6 +1,4 @@
-use rtrb::{Consumer, Producer, RingBuffer};
-
-use crate::NodeId;
+use crate::{NodeId, Scheduled, event_channel};
 
 /// Names one parameter of one node.
 ///
@@ -44,92 +42,29 @@ impl ParamEvent {
     }
 }
 
-/// Opens a one-way lane for parameter changes.
-///
-/// Single producer, single consumer: the control thread writes, the audio
-/// thread reads, and neither ever waits for the other.
-pub fn automation_channel(capacity: usize) -> (AutomationSender, AutomationQueue) {
-    let (tx, rx) = RingBuffer::new(capacity);
-    (AutomationSender { tx }, AutomationQueue { rx, head: None })
+impl Scheduled for ParamEvent {
+    fn frame(&self) -> u64 {
+        self.frame
+    }
 }
 
-/// The control side: schedules parameter changes.
-///
-/// Send events in non-decreasing `frame` order. One that arrives out of order
-/// is not dropped — it lands at the start of the next block instead of on its
-/// own frame, which is the same accuracy as having no automation at all.
-pub struct AutomationSender {
-    tx: Producer<ParamEvent>,
+/// The control side of automation: schedules parameter changes.
+pub type AutomationSender = crate::EventSender<ParamEvent>;
+/// The audio thread's side: hands over changes as their frame comes up.
+pub type AutomationQueue = crate::EventQueue<ParamEvent>;
+
+/// Opens a one-way lane for parameter changes.
+pub fn automation_channel(capacity: usize) -> (AutomationSender, AutomationQueue) {
+    event_channel(capacity)
 }
 
 impl AutomationSender {
-    /// Gives the event back when the queue is full, which means the audio
-    /// thread has not drained the previous ones yet.
-    pub fn send(&mut self, event: ParamEvent) -> Result<(), ParamEvent> {
-        self.tx.push(event).map_err(|rtrb::PushError::Full(event)| event)
-    }
-
     /// Schedules a change for the start of the next block.
+    ///
+    /// Frame zero is always in the past, and the queue applies anything overdue
+    /// straight away, so this needs no special case downstream.
     pub fn set(&mut self, param: ParamId, value: f32) -> Result<(), ParamEvent> {
         self.send(ParamEvent::now(param, value))
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.tx.is_full()
-    }
-}
-
-/// The audio thread's side: hands over events as their frame comes up.
-///
-/// Holds one event back in `head` rather than peeking into the ring, so asking
-/// when the next change is due costs nothing and never consumes it.
-pub struct AutomationQueue {
-    rx: Consumer<ParamEvent>,
-    head: Option<ParamEvent>,
-}
-
-impl AutomationQueue {
-    /// The frame the next pending event is due on, if there is one.
-    pub fn next_frame(&mut self) -> Option<u64> {
-        self.fill();
-        self.head.map(|event| event.frame)
-    }
-
-    /// Takes the next event if it is due at or before `frame`.
-    pub fn take_due(&mut self, frame: u64) -> Option<ParamEvent> {
-        self.fill();
-        match self.head {
-            Some(event) if event.frame <= frame => self.head.take(),
-            _ => None,
-        }
-    }
-
-    /// Drops everything pending, as when playback jumps somewhere else and the
-    /// changes queued for the old position no longer mean anything.
-    pub fn clear(&mut self) {
-        self.head = None;
-        while self.rx.pop().is_ok() {}
-    }
-
-    /// Hands every change due at `start + done` to `apply`, then says how far
-    /// the next span may render before the following one falls due.
-    ///
-    /// Both things that split a block go through here, so they cannot disagree
-    /// about where a change lands.
-    pub(crate) fn span(&mut self, start: u64, done: usize, frames: usize, mut apply: impl FnMut(ParamEvent)) -> usize {
-        let now = start + done as u64;
-        while let Some(event) = self.take_due(now) {
-            apply(event);
-        }
-        // Everything due at `now` has been applied, so whatever is left is
-        // strictly later and the span is never empty.
-        self.next_frame().map_or(frames, |frame| (frame - start) as usize).clamp(done + 1, frames)
-    }
-
-    fn fill(&mut self) {
-        if self.head.is_none() {
-            self.head = self.rx.pop().ok();
-        }
     }
 }
 

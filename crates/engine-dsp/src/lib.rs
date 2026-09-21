@@ -13,6 +13,6 @@ mod test_util;
 
 pub use adsr::{Adsr, Stage};
 pub use biquad::{Biquad, Coefficients, FilterKind};
-pub use oscillator::SineOsc;
+pub use oscillator::{Osc, SineOsc, Waveform};
 pub use smoothed_biquad::{DEFAULT_UPDATE_INTERVAL, SmoothedBiquad};
 pub use smoother::LinearSmoother;

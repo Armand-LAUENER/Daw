@@ -192,3 +192,55 @@ fn automating_through_a_swap_does_not_allocate() {
 
     assert!(out.iter().all(|s| s.is_finite()), "the mix went non-finite");
 }
+
+#[test]
+fn a_synth_does_not_allocate_while_it_plays() {
+    // Voice stealing is the part worth pinning down: it runs exactly when
+    // every voice is busy, which is when the callback is already at its
+    // heaviest and an allocation would be least survivable.
+    use engine_core::{Note, NoteEvent, PianoRoll, Synth, note_channel};
+    use engine_dsp::{Adsr, Waveform};
+
+    let (mut sender, queue) = note_channel(256);
+    let envelope = Adsr::new(0.002, 0.05, 0.6, 0.08, SR);
+    let mut synth = Synth::new(8, Waveform::Saw, &envelope, queue, SR);
+
+    // Twice the polyphony, overlapping, so voices are taken from notes still
+    // sounding rather than from idle ones.
+    let mut roll = PianoRoll::new();
+    for step in 0..64u64 {
+        roll.add(Note::new(48 + (step % 16) as u8, 0.8, step * 600, 2_400));
+    }
+    let events: Vec<NoteEvent> = roll.events();
+    let mut next = 0;
+    let mut frame = 0u64;
+    let mut out = vec![0.0f32; MAX_FRAMES * CHANNELS];
+    // Checked per block, not at the end: the run outlasts the notes, so the
+    // last buffer is legitimately silent and would prove nothing either way.
+    let (mut sounded, mut finite) = (false, true);
+
+    for i in 0..200usize {
+        let frames = 64 + (i * 37) % 960;
+        // Queued from the control side, as they would be in a real run.
+        while next < events.len() && events[next].frame < frame + frames as u64 * 2 {
+            if sender.send(events[next]).is_err() {
+                break;
+            }
+            next += 1;
+        }
+
+        let block = &mut out[..frames * CHANNELS];
+        block.fill(0.0);
+        let mut buffer = AudioBuffer::new(block, CHANNELS);
+        synth.set_frame(frame);
+        assert_no_alloc(|| synth.process(&mut buffer));
+        frame += frames as u64;
+
+        let rendered = &out[..frames * CHANNELS];
+        sounded |= rendered.iter().any(|s| *s != 0.0);
+        finite &= rendered.iter().all(|s| s.is_finite());
+    }
+
+    assert!(sounded, "the synth produced silence throughout, so it proved nothing");
+    assert!(finite, "the synth went non-finite");
+}
