@@ -9,7 +9,9 @@
 #![cfg(debug_assertions)]
 
 use assert_no_alloc::{AllocDisabler, assert_no_alloc};
-use engine_core::{AudioBuffer, Gain, GraphBuilder, Mute, Node, Pan, graph_channel};
+use engine_core::{
+    AudioBuffer, Gain, GraphBuilder, Mute, Node, Pan, ParamEvent, ParamId, automation_channel, graph_channel,
+};
 
 #[global_allocator]
 static ALLOC: AllocDisabler = AllocDisabler;
@@ -104,4 +106,51 @@ fn swapping_a_graph_does_not_allocate() {
     }
 
     assert!(out.iter().any(|s| *s != 0.0), "nothing played, so nothing was proved");
+}
+
+#[test]
+fn automating_a_graph_does_not_allocate() {
+    // Splitting a block at each scheduled change is the one place in the graph
+    // where the audio thread does work whose size it did not know in advance.
+    // If that path ever reaches for a Vec, it does so under a moving fader —
+    // exactly when an xrun is least forgivable.
+    let mut builder = GraphBuilder::new();
+    let master = builder.add(Box::new(Gain::new(0.5, SR)));
+    let mut faders = Vec::new();
+
+    for track in 0..8 {
+        let tone = builder.add(Box::new(Tone { phase: 0.0, step: (110.0 + track as f32 * 55.0) / SR }));
+        let gain = builder.add(Box::new(Gain::new(0.8, SR)));
+        let pan = builder.add(Box::new(Pan::new(-1.0 + track as f32 * 0.25, SR)));
+        let mute = builder.add(Box::new(Mute::new(false, SR)));
+        builder.connect(tone, gain).connect(gain, pan).connect(pan, mute).connect(mute, master);
+        faders.push((ParamId::new(gain, Gain::PARAM_GAIN), ParamId::new(pan, Pan::PARAM_POSITION)));
+    }
+    builder.output(master);
+    let mut graph = builder.build(CHANNELS, MAX_FRAMES).unwrap();
+
+    let (mut sender, mut queue) = automation_channel(64);
+    let mut out = vec![0.0f32; MAX_FRAMES * CHANNELS];
+    let mut frame = 0u64;
+
+    for i in 0..200usize {
+        let frames = 64 + (i * 37) % 960;
+
+        // Several changes inside the block, so it is split rather than run
+        // whole, and their frames rise the way a control thread would send them.
+        let (gain, pan) = faders[i % faders.len()];
+        for step in 0..4u64 {
+            let at = frame + step * (frames as u64 / 4);
+            let target = if step.is_multiple_of(2) { gain } else { pan };
+            let value = if step.is_multiple_of(2) { 0.2 + step as f32 * 0.1 } else { -0.5 + step as f32 * 0.2 };
+            let _ = sender.send(ParamEvent::new(target, value, at));
+        }
+
+        let block = &mut out[..frames * CHANNELS];
+        assert_no_alloc(|| graph.process_automated(block, &mut queue, frame));
+        frame += frames as u64;
+    }
+
+    assert!(out.iter().any(|s| *s != 0.0), "the graph produced silence, so it proved nothing");
+    assert!(out.iter().all(|s| s.is_finite()), "the mix went non-finite");
 }

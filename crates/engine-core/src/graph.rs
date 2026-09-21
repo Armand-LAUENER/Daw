@@ -1,10 +1,26 @@
 use std::fmt;
 
-use crate::{AudioBuffer, Node};
+use crate::{AudioBuffer, AutomationQueue, Node, ParamId};
 
 /// Where a node sits in a graph under construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(usize);
+
+impl NodeId {
+    /// Where the node sits in the graph. Automation travels as plain data, so
+    /// an event has to carry this rather than a borrow of the node.
+    pub fn index(self) -> usize {
+        self.0
+    }
+
+    /// Rebuilds an id from an index, for callers holding one on its own.
+    ///
+    /// An index that names no node addresses nothing: the graph ignores events
+    /// it cannot place rather than guessing at a neighbour.
+    pub fn from_index(index: usize) -> Self {
+        Self(index)
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum GraphError {
@@ -193,6 +209,43 @@ impl Graph {
         AudioBuffer::new(&mut self.buffers[self.output][..used], self.channels).write_interleaved(out);
     }
 
+    /// Runs the block, stopping at each scheduled change so it lands on its
+    /// own frame rather than at the edge of the callback.
+    ///
+    /// `start_frame` is where `out` begins on the engine's timeline. Events
+    /// already overdue apply before the first sample; events past the end of
+    /// the block stay queued for the next one.
+    ///
+    /// Splitting costs one extra pass over the graph per event. Automation is
+    /// sparse next to the sample rate, so that is cheaper than the alternative
+    /// of handing every node its own event list.
+    pub fn process_automated(&mut self, out: &mut [f32], events: &mut AutomationQueue, start_frame: u64) {
+        let frames = out.len() / self.channels;
+        let mut done = 0;
+
+        while done < frames {
+            let now = start_frame + done as u64;
+            while let Some(event) = events.take_due(now) {
+                self.set_param(event.param, event.value);
+            }
+
+            // Everything due at `now` is applied, so whatever is left is
+            // strictly later and the next span is never empty.
+            let next = events.next_frame().map_or(frames, |frame| (frame - start_frame) as usize);
+            let end = next.clamp(done + 1, frames);
+            self.process(&mut out[done * self.channels..end * self.channels]);
+            done = end;
+        }
+    }
+
+    /// Applies one change now. Events for a node that is not in this graph are
+    /// dropped: a graph swap can retire the node an event was aimed at.
+    pub fn set_param(&mut self, param: ParamId, value: f32) {
+        if let Some(node) = self.nodes.get_mut(param.node.index()) {
+            node.set_param(param.param, value);
+        }
+    }
+
     pub fn reset(&mut self) {
         for node in &mut self.nodes {
             node.reset();
@@ -206,12 +259,18 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Gain;
+    use crate::{Gain, PARAM_RAMP_MS, ParamEvent, automation_channel};
 
     const SR: f32 = 48_000.0;
 
     /// Writes a constant into every channel, standing in for a track.
+    ///
+    /// Its level answers automation without a ramp, so a test can read the
+    /// exact sample a change landed on instead of the middle of a slope.
     struct Tone(f32);
+
+    /// The only parameter `Tone` has.
+    const TONE_LEVEL: u32 = 0;
 
     impl Node for Tone {
         fn process(&mut self, buffer: &mut AudioBuffer<'_>) {
@@ -219,6 +278,20 @@ mod tests {
                 channel.fill(self.0);
             }
         }
+
+        fn set_param(&mut self, param: u32, value: f32) {
+            if param == TONE_LEVEL {
+                self.0 = value;
+            }
+        }
+    }
+
+    /// A one-node graph whose level is automatable, plus that level's address.
+    fn tone_graph() -> (Graph, ParamId) {
+        let mut builder = GraphBuilder::new();
+        let tone = builder.add(Box::new(Tone(1.0)));
+        builder.output(tone);
+        (builder.build(1, 512).unwrap(), ParamId::new(tone, TONE_LEVEL))
     }
 
     #[test]
@@ -318,5 +391,111 @@ mod tests {
         let mut graph = builder.build(2, 8).unwrap();
         let mut out = [0.0; 64];
         graph.process(&mut out);
+    }
+
+    #[test]
+    fn a_change_lands_on_its_own_frame_not_the_block_edge() {
+        // The whole point of splitting the block: at 48 kHz a callback is
+        // several milliseconds, and rounding every change to that boundary is
+        // audible as soon as anything is played in time.
+        let (mut graph, level) = tone_graph();
+        let (mut sender, mut queue) = automation_channel(8);
+        sender.send(ParamEvent::new(level, 0.25, 100)).unwrap();
+
+        let mut out = [0.0; 256];
+        graph.process_automated(&mut out, &mut queue, 0);
+
+        assert!(out[..100].iter().all(|s| *s == 1.0), "the change arrived early");
+        assert!(out[100..].iter().all(|s| *s == 0.25), "the change arrived late");
+    }
+
+    #[test]
+    fn a_change_is_placed_against_the_timeline_not_the_block() {
+        let (mut graph, level) = tone_graph();
+        let (mut sender, mut queue) = automation_channel(8);
+        sender.send(ParamEvent::new(level, 0.5, 1_000)).unwrap();
+
+        let mut out = [0.0; 256];
+        graph.process_automated(&mut out, &mut queue, 512);
+        assert!(out.iter().all(|s| *s == 1.0), "an event 1000 frames in fired during 512..768");
+
+        graph.process_automated(&mut out, &mut queue, 768);
+        assert!(out[..232].iter().all(|s| *s == 1.0));
+        assert!(out[232..].iter().all(|s| *s == 0.5), "frame 1000 is 232 into this block");
+    }
+
+    #[test]
+    fn several_changes_in_one_block_keep_their_order() {
+        let (mut graph, level) = tone_graph();
+        let (mut sender, mut queue) = automation_channel(8);
+        for (frame, value) in [(10u64, 0.8), (50, 0.6), (200, 0.4)] {
+            sender.send(ParamEvent::new(level, value, frame)).unwrap();
+        }
+
+        let mut out = [0.0; 256];
+        graph.process_automated(&mut out, &mut queue, 0);
+
+        assert_eq!((out[9], out[10]), (1.0, 0.8));
+        assert_eq!((out[49], out[50]), (0.8, 0.6));
+        assert_eq!((out[199], out[200]), (0.6, 0.4));
+    }
+
+    #[test]
+    fn an_overdue_change_applies_before_the_first_sample() {
+        // Anything the control thread sent without a schedule, and anything a
+        // slow block left behind, has to take effect rather than be skipped.
+        let (mut graph, level) = tone_graph();
+        let (mut sender, mut queue) = automation_channel(8);
+        sender.send(ParamEvent::new(level, 0.1, 5)).unwrap();
+
+        let mut out = [0.0; 64];
+        graph.process_automated(&mut out, &mut queue, 1_000);
+        assert!(out.iter().all(|s| *s == 0.1), "{:?}", &out[..4]);
+    }
+
+    #[test]
+    fn a_change_aimed_at_a_missing_node_is_dropped() {
+        // Ids come from the builder that made the graph, and a swap can retire
+        // the node one was aimed at. Applying it to whatever now holds that
+        // index would move the wrong fader.
+        let (mut graph, _) = tone_graph();
+        let (mut sender, mut queue) = automation_channel(8);
+        sender.send(ParamEvent::new(ParamId::new(NodeId::from_index(99), 0), 0.0, 0)).unwrap();
+
+        let mut out = [0.0; 64];
+        graph.process_automated(&mut out, &mut queue, 0);
+        assert!(out.iter().all(|s| *s == 1.0));
+    }
+
+    #[test]
+    fn an_empty_queue_renders_the_block_whole() {
+        let (mut graph, _) = tone_graph();
+        let (_sender, mut queue) = automation_channel(8);
+        let mut out = [0.0; 256];
+        graph.process_automated(&mut out, &mut queue, 0);
+        assert!(out.iter().all(|s| *s == 1.0));
+    }
+
+    #[test]
+    fn automating_a_gain_still_ramps() {
+        // Splitting the block must not restart or skip the node's own ramp: the
+        // two halves have to join without a step.
+        let mut builder = GraphBuilder::new();
+        let tone = builder.add(Box::new(Tone(1.0)));
+        let gain = builder.add(Box::new(Gain::new(1.0, SR)));
+        builder.connect(tone, gain).output(gain);
+        let mut graph = builder.build(1, 1_024).unwrap();
+
+        let (mut sender, mut queue) = automation_channel(8);
+        sender.send(ParamEvent::new(ParamId::new(gain, Gain::PARAM_GAIN), 0.0, 37)).unwrap();
+
+        let mut out = [0.0; 960];
+        graph.process_automated(&mut out, &mut queue, 0);
+
+        let max_step = 1.0 / (PARAM_RAMP_MS * 1e-3 * SR) * 1.001;
+        for (i, w) in out.windows(2).enumerate() {
+            assert!((w[1] - w[0]).abs() <= max_step, "step at {i}: {} -> {}", w[0], w[1]);
+        }
+        assert_eq!(out[959], 0.0, "the ramp never arrived");
     }
 }

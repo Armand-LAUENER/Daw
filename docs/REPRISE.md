@@ -1,4 +1,4 @@
-# Reprise — état du projet au 2026-09-20
+# Reprise — état du projet au 2026-09-21
 
 À lire en premier en reprenant le projet. Le plan complet et le journal de bord
 sont dans [`plan-daw-rust.md`](../plan-daw-rust.md).
@@ -47,10 +47,26 @@ l'écarte d'un clic.
 que ta musique l'est ; et rien après notre buffer — mixeur Windows,
 spatialisation du casque — n'est couvert.
 
-**Phase 2 en cours** : `engine-core` a le tampon planaire, les nœuds de base et
-le graphe avec ordre topologique. Restent l'échange atomique de graphe,
-l'automation sample-accurate, le limiteur master et le test de charge 8/16
-pistes.
+**Phase 2 en cours** : `engine-core` a le tampon planaire, les nœuds de base, le
+graphe avec ordre topologique, l'échange atomique de graphe (fondu croisé de
+10 ms, graphes retirés renvoyés au thread de contrôle pour y être libérés) et
+l'automation sample-accurate. Restent le limiteur master et le test de charge
+8/16 pistes.
+
+L'automation passe par un anneau SPSC `rtrb` de `ParamEvent { param, value,
+frame }`, où `frame` est absolu sur la timeline du moteur — le thread de
+contrôle ne sait pas où un callback commencera. `Graph::process_automated`
+découpe le bloc à chaque frame d'événement, donc un changement tombe au sample
+près au lieu d'être arrondi à la frontière du callback (5,3 ms à 256 frames et
+48 kHz, largement audible sur un élément joué en rythme). Le découpage ne
+réinitialise pas les rampes des nœuds : `automating_a_gain_still_ramps` vérifie
+que les deux moitiés se rejoignent sans marche, et
+`automating_a_graph_does_not_allocate` tient le chemin hors de l'allocateur.
+
+**Ce qui n'est pas encore branché** : `process_automated` est au niveau de
+`Graph`, pas de `GraphPlayer`. Pendant le fondu croisé d'un échange de graphe,
+les identifiants de nœuds des deux graphes ne correspondent pas, donc
+l'automation n'y est pas encore définie — à trancher en câblant le moteur.
 
 Le dépôt est sur GitHub (`Armand-LAUENER/Daw`, privé) et la CI y tourne sur
 Linux et Windows.

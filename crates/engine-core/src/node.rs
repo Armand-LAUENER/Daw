@@ -19,6 +19,13 @@ pub trait Node: Send {
 
     /// Drops any internal state, as when playback jumps somewhere else.
     fn reset(&mut self) {}
+
+    /// Applies an automation event aimed at this node.
+    ///
+    /// `param` is one of the node's own `PARAM_*` constants. A node ignores
+    /// anything it does not recognise: an event whose target was replaced by a
+    /// graph swap is better dropped than applied to whatever now sits there.
+    fn set_param(&mut self, _param: u32, _value: f32) {}
 }
 
 /// Scales every channel by a ramped gain.
@@ -28,6 +35,9 @@ pub struct Gain {
 }
 
 impl Gain {
+    /// The multiplier, linear rather than in decibels.
+    pub const PARAM_GAIN: u32 = 0;
+
     pub fn new(gain: f32, sample_rate: f32) -> Self {
         Self { gain: LinearSmoother::with_duration(gain, PARAM_RAMP_MS, sample_rate) }
     }
@@ -42,6 +52,12 @@ impl Gain {
 }
 
 impl Node for Gain {
+    fn set_param(&mut self, param: u32, value: f32) {
+        if param == Self::PARAM_GAIN {
+            self.set_gain(value);
+        }
+    }
+
     fn process(&mut self, buffer: &mut AudioBuffer<'_>) {
         // The ramp advances once per frame, not once per channel, or the two
         // sides of a stereo track would drift apart while the gain moves.
@@ -70,6 +86,9 @@ pub struct Pan {
 }
 
 impl Pan {
+    /// -1 hard left, 0 centre, 1 hard right.
+    pub const PARAM_POSITION: u32 = 0;
+
     /// `position` runs from -1 (hard left) through 0 (centre) to 1 (hard right).
     pub fn new(position: f32, sample_rate: f32) -> Self {
         Self { position: LinearSmoother::with_duration(position.clamp(-1.0, 1.0), PARAM_RAMP_MS, sample_rate) }
@@ -92,6 +111,12 @@ impl Pan {
 }
 
 impl Node for Pan {
+    fn set_param(&mut self, param: u32, value: f32) {
+        if param == Self::PARAM_POSITION {
+            self.set_position(value);
+        }
+    }
+
     fn process(&mut self, buffer: &mut AudioBuffer<'_>) {
         let Some((left, right)) = buffer.stereo_mut() else {
             return;
@@ -116,6 +141,12 @@ pub struct Mute {
 }
 
 impl Mute {
+    /// Muted above the halfway mark, open below it.
+    ///
+    /// Automation carries floats, and a toggle read as `value != 0.0` would
+    /// latch on the way through zero if anything ever ramped into it.
+    pub const PARAM_MUTED: u32 = 0;
+
     pub fn new(muted: bool, sample_rate: f32) -> Self {
         let level = if muted { 0.0 } else { 1.0 };
         Self { gain: LinearSmoother::with_duration(level, PARAM_RAMP_MS, sample_rate), muted }
@@ -132,6 +163,12 @@ impl Mute {
 }
 
 impl Node for Mute {
+    fn set_param(&mut self, param: u32, value: f32) {
+        if param == Self::PARAM_MUTED {
+            self.set_muted(value >= 0.5);
+        }
+    }
+
     fn process(&mut self, buffer: &mut AudioBuffer<'_>) {
         let (frames, channels) = (buffer.frames(), buffer.channels());
         for frame in 0..frames {

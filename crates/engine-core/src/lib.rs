@@ -9,11 +9,13 @@
 //! A graph moves whole channels around, so interleaving would make every access
 //! strided; the device's interleaved shape is converted once at each end.
 
+mod automation;
 mod buffer;
 mod graph;
 mod node;
 mod swap;
 
+pub use automation::{AutomationQueue, AutomationSender, ParamEvent, ParamId, automation_channel};
 pub use buffer::AudioBuffer;
 pub use graph::{Graph, GraphBuilder, GraphError, NodeId};
 pub use node::{Gain, Mute, Node, PARAM_RAMP_MS, Pan};
