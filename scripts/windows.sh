@@ -73,7 +73,7 @@ case "$cmd" in
     bench)
         cargo_win run --release -q -p engine-dsp --example bench
         ;;
-    phase0 | phase1 | phase2)
+    phase0 | phase1 | phase2 | phase3)
         # The example is named by the command. phase1's FILE is a Windows path:
         # the mirror cannot reach WSL paths.
         mkdir -p target/windows-logs
@@ -82,7 +82,7 @@ case "$cmd" in
         cargo_win run --release -q -p engine-io --example "$cmd" -- "$@" | tee "$log"
         ;;
     *)
-        echo "unknown command $cmd (test | check | bench | phase0 | phase1 FILE | phase2 [ARGS...])" >&2
+        echo "unknown command $cmd (test | check | bench | phase0 | phase1 FILE | phase2 | phase3 [ARGS...])" >&2
         exit 2
         ;;
 esac

@@ -20,12 +20,18 @@ proptest.workspace = true
 # Only the phase1 example and the pipeline test play files; the library stays
 # device-only, so the file layer never becomes a runtime dependency.
 engine-io-file.workspace = true
-# Same rule for the graph: the phase2 example wires it to the device, the
-# library does not depend on it.
+# Same rule for the graph and for MIDI: the phase2 and phase3 examples wire
+# them to the device, the library does not depend on either.
 engine-core.workspace = true
+engine-midi.workspace = true
 
 [lints]
 workspace = true
+
+[[example]]
+name = "phase3"
+# Run the argument-parsing tests with `cargo test`.
+test = true
 
 [[example]]
 name = "phase2"

@@ -228,6 +228,7 @@ dependencies = [
  "engine-core",
  "engine-dsp",
  "engine-io-file",
+ "engine-midi",
  "proptest",
  "rtrb",
 ]

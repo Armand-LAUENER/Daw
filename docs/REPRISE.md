@@ -288,6 +288,74 @@ un vrai morceau, à faire quand un routage en aura besoin.
 Le dépôt est sur GitHub (`Armand-LAUENER/Daw`, privé) et la CI y tourne sur
 Linux et Windows.
 
+## Phase 3 — Séquenceur & MIDI (en cours)
+
+Faits : enveloppe ADSR, événements de note et piano roll, synthé polyphonique
+avec scheduling sample-accurate, oscillateurs band-limités, décodage `.mid`, et
+l'exemple `phase3` sur le périphérique. Reste le MIDI externe (`midir`).
+
+**L'ADSR est en segments linéaires, pas exponentiels.** L'exponentielle est la
+forme analogique, mais un pôle n'atteint jamais zéro : il faut un seuil d'arrêt,
+et une voix laissée à 1e-30 est un dénormal, dont ce projet a déjà mesuré le
+coût. Le linéaire atterrit exactement, dans exactement le temps demandé, donc
+« cette voix est finie » est un fait que le pool peut exploiter. Toute
+transition part du niveau réel, donc une note relâchée pendant son attaque ne
+saute pas.
+
+**Le synthé ne découpe pas le bloc.** Le plan dit « découpe le buffer aux points
+d'arrivée des events », ce que fait l'automation — mais un synthé génère
+échantillon par échantillon, donc il consulte sa file en arrivant sur chaque
+frame. Pas de découpage, pas de coût pour le reste du graphe. Ça a demandé une
+horloge partagée : `Node::set_frame`, distribuée par le `Graph` et par le
+`GraphPlayer` aux **deux** graphes pendant un fondu croisé.
+
+**Vol de voix** : même hauteur (réutilise sa voix) → voix libre → voix relâchée
+→ la plus ancienne. Le thread audio ne peut pas demander une voix de plus, donc
+le choix est entre voler et faire taire, et une note qui disparaît est pire.
+
+**Saw et square sont band-limités (PolyBLEP).** Pris au pied de la lettre, un
+saw à 5 kHz met de l'énergie à 3 kHz par repliement, où aucune de ses harmoniques
+n'a affaire, et rien en aval ne peut l'en séparer ensuite. Mesuré par
+corrélation contre un saw naïf, au moins 6 dB d'écart exigés.
+
+**`midly` sans `rayon`** : les default-features tirent 6 crates transitifs pour
+paralléliser un parsing qui prend des millisecondes hors thread audio. Coupées,
+`midly` n'a aucune dépendance. Il vit dans `engine-midi`, comme `symphonia` vit
+dans `engine-io-file`.
+
+**Le piège du MIDI n'est pas le format, c'est l'horloge.** Un fichier mesure le
+temps en ticks dont la durée dépend d'un tempo qu'il peut changer quand il veut.
+Lire le premier et l'appliquer partout décale tout ce qui suit, de plus en plus
+loin. Les pistes sont donc fusionnées sur une timeline unique d'abord (un format
+1 met son tempo dans une piste dédiée), et chaque changement ne vaut que pour ce
+qui le suit.
+
+### Validation sur périphérique, 2026-09-21
+
+`scripts/windows.sh phase3 --self-test --bpm 180 --seconds 60` :
+
+```
+self test: sixteenths at 180 BPM, one every 4000 frames
+graph: 16 voices, Saw, limiter at 0.9 | latency 96 frames (2.00 ms)
+[   60.00s] callbacks 6001 | xruns 0 | overloads 0 | load p50 0,1 % p99 0,2 % max 0,8 %
+onsets 721 | off their frame 0 | worst 0 frames (0.000 ms)
+PASS: no xrun, every note on its frame
+```
+
+**Pire écart : 0 frame sur 721 notes.** Pas « inaudible » — exact.
+
+Comment c'est mesuré : le self-test joue des doubles-croches staccato avec
+`sustain = 0`, donc le synthé est réellement silencieux entre elles et il existe
+un front à mesurer. Un onset est une transition silence → son ; il devrait
+tomber à `frame_de_la_note + latence_du_graphe + 1` (la latence du limiteur,
+plus le sample que l'enveloppe passe à zéro avant de s'ouvrir). Les onsets étant
+périodiques, l'écart est un modulo, donc le callback ne porte aucune table.
+
+Un vrai fichier est joué mais **pas vérifié** : ses notes se chevauchent, il n'y
+a pas de silence entre elles pour mesurer un front. Le self-test provoque ce
+qu'il mesure, ce qui est la seule façon que le chiffre veuille dire quelque
+chose.
+
 ## Architecture actuelle
 
 ```
