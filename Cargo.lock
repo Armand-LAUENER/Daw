@@ -988,6 +988,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "project-engine"
+version = "0.1.0"
+dependencies = [
+ "engine-core",
+ "project-model",
+]
+
+[[package]]
 name = "project-model"
 version = "0.1.0"
 dependencies = [

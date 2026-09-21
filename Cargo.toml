@@ -13,6 +13,7 @@ engine-dsp = { path = "crates/engine-dsp" }
 engine-io-file = { path = "crates/engine-io-file" }
 engine-midi = { path = "crates/engine-midi" }
 project-model = { path = "crates/project-model" }
+project-engine = { path = "crates/project-engine" }
 cpal = "0.18.2"
 # default-features off: the default set pulls every decoder in, so each crate
 # names the formats it actually wants.
