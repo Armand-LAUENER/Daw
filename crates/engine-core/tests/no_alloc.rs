@@ -10,8 +10,8 @@
 
 use assert_no_alloc::{AllocDisabler, assert_no_alloc};
 use engine_core::{
-    AudioBuffer, Gain, GraphBuilder, Limiter, Mute, Node, NodeId, Pan, ParamEvent, ParamId, automation_channel,
-    graph_channel,
+    AudioBuffer, Gain, GraphBuilder, Limiter, Mute, Node, NodeId, Pan, ParamEvent, ParamId, Solo, SoloBus,
+    automation_channel, graph_channel,
 };
 
 #[global_allocator]
@@ -46,6 +46,7 @@ fn processing_a_graph_does_not_allocate() {
     // Eight tracks, each with gain, pan and mute, summed into a master — the
     // shape phase 2 exists to reach.
     let mut builder = GraphBuilder::new();
+    let bus = SoloBus::new();
     let master = builder.add(Box::new(Gain::new(0.5, SR)));
 
     for track in 0..8 {
@@ -53,7 +54,8 @@ fn processing_a_graph_does_not_allocate() {
         let gain = builder.add(Box::new(Gain::new(0.8, SR)));
         let pan = builder.add(Box::new(Pan::new(-1.0 + track as f32 * 0.25, SR)));
         let mute = builder.add(Box::new(Mute::new(false, SR)));
-        builder.connect(tone, gain).connect(gain, pan).connect(pan, mute).connect(mute, master);
+        let solo = builder.add(Box::new(Solo::new(&bus, false, SR)));
+        builder.connect(tone, gain).connect(gain, pan).connect(pan, mute).connect(mute, solo).connect(solo, master);
     }
     let ceiling = builder.add(Box::new(Limiter::new(0.9, CHANNELS, SR)));
     builder.connect(master, ceiling).output(ceiling);
@@ -117,6 +119,7 @@ fn automating_a_graph_does_not_allocate() {
     // If that path ever reaches for a Vec, it does so under a moving fader —
     // exactly when an xrun is least forgivable.
     let mut builder = GraphBuilder::new();
+    let bus = SoloBus::new();
     let master = builder.add(Box::new(Gain::new(0.5, SR)));
     let mut faders = Vec::new();
 
@@ -125,7 +128,8 @@ fn automating_a_graph_does_not_allocate() {
         let gain = builder.add(Box::new(Gain::new(0.8, SR)));
         let pan = builder.add(Box::new(Pan::new(-1.0 + track as f32 * 0.25, SR)));
         let mute = builder.add(Box::new(Mute::new(false, SR)));
-        builder.connect(tone, gain).connect(gain, pan).connect(pan, mute).connect(mute, master);
+        let solo = builder.add(Box::new(Solo::new(&bus, false, SR)));
+        builder.connect(tone, gain).connect(gain, pan).connect(pan, mute).connect(mute, solo).connect(solo, master);
         faders.push((ParamId::new(gain, Gain::PARAM_GAIN), ParamId::new(pan, Pan::PARAM_POSITION)));
     }
     let ceiling = builder.add(Box::new(Limiter::new(0.9, CHANNELS, SR)));

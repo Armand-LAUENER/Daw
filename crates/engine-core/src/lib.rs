@@ -20,5 +20,5 @@ pub use automation::{AutomationQueue, AutomationSender, ParamEvent, ParamId, aut
 pub use buffer::AudioBuffer;
 pub use graph::{Graph, GraphBuilder, GraphError, NodeId};
 pub use limiter::{LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_MS, Limiter};
-pub use node::{Gain, Mute, Node, PARAM_RAMP_MS, Pan};
+pub use node::{Gain, Mute, Node, PARAM_RAMP_MS, Pan, Solo, SoloBus};
 pub use swap::{GraphPlayer, GraphSwapper, SWAP_FADE_MS, graph_channel};

@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use engine_dsp::LinearSmoother;
 
 use crate::AudioBuffer;
@@ -189,6 +192,152 @@ impl Node for Mute {
     }
 }
 
+/// How many tracks are soloed, shared by every [`Solo`] on one graph.
+///
+/// Solo is the one control a track cannot answer on its own: a track is never
+/// "un-soloed", it is silenced *because another track is soloed*. Something has
+/// to hold that fact for all of them, and this is it.
+///
+/// One bus per graph. A graph built to replace another gets its own, since its
+/// nodes are new; the control side carries the solo state across by building
+/// the new graph with the same tracks soloed.
+///
+/// It is an atomic because a `Graph` crosses to the audio thread, so everything
+/// in it must be `Send`. Only one thread reads or writes it at a time, so the
+/// ordering can be the cheapest one.
+#[derive(Debug, Clone, Default)]
+pub struct SoloBus(Arc<AtomicU32>);
+
+impl SoloBus {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether anything is soloed, which is what decides the other tracks.
+    pub fn any(&self) -> bool {
+        self.count() > 0
+    }
+
+    pub fn count(&self) -> u32 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Silences a track unless it, or nothing at all, is soloed.
+///
+/// Like [`Mute`], this is a ramp rather than a branch around the processing:
+/// the nodes upstream keep running, so releasing a solo does not restart a
+/// filter or cut off a tail that was decaying behind it. That is what makes a
+/// solo safe to press and let go while something is playing.
+///
+/// Soloing is not exclusive — several tracks can be soloed and they all play.
+/// Nor does it override a mute: with both nodes in series their gains multiply,
+/// so a track the user muted stays silent when soloed, which is what a mixer
+/// does.
+#[derive(Debug)]
+pub struct Solo {
+    bus: SoloBus,
+    soloed: bool,
+    /// Whether this track is currently audible, to spot a real change: a
+    /// smoother restarts its ramp on every `set_target`, so retargeting each
+    /// block would crawl towards the value and never land on it.
+    open: bool,
+    /// False until the first block, where the bus is finally complete.
+    settled: bool,
+    gain: LinearSmoother,
+    ramp_len: u32,
+}
+
+impl Solo {
+    /// Soloed above the halfway mark, not below it.
+    pub const PARAM_SOLOED: u32 = 0;
+
+    pub fn new(bus: &SoloBus, soloed: bool, sample_rate: f32) -> Self {
+        let ramp_len = (PARAM_RAMP_MS * 1e-3 * sample_rate).round().max(0.0) as u32;
+        if soloed {
+            bus.0.fetch_add(1, Ordering::Relaxed);
+        }
+        Self {
+            bus: bus.clone(),
+            soloed,
+            open: true,
+            settled: false,
+            gain: LinearSmoother::new(1.0, ramp_len),
+            ramp_len,
+        }
+    }
+
+    pub fn set_soloed(&mut self, soloed: bool) {
+        // Guarded rather than unconditional: the bus counts tracks, so writing
+        // the same state twice would count this one twice and leave every other
+        // track silenced after it is released.
+        if soloed == self.soloed {
+            return;
+        }
+        self.soloed = soloed;
+        if soloed {
+            self.bus.0.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.bus.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn is_soloed(&self) -> bool {
+        self.soloed
+    }
+
+    pub fn bus(&self) -> &SoloBus {
+        &self.bus
+    }
+}
+
+impl Drop for Solo {
+    /// Hands the count back, so a graph retired while one of its tracks was
+    /// soloed cannot leave a bus it shares stuck above zero.
+    fn drop(&mut self) {
+        if self.soloed {
+            self.bus.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Node for Solo {
+    fn process(&mut self, buffer: &mut AudioBuffer<'_>) {
+        let open = self.soloed || !self.bus.any();
+        if !self.settled {
+            // The bus only finishes counting once every track has been built,
+            // which is after this node was. The first block is the earliest
+            // point the starting value can be known — and starting at the wrong
+            // one would let a soloed-out track through for the length of a ramp.
+            self.gain = LinearSmoother::new(if open { 1.0 } else { 0.0 }, self.ramp_len);
+            self.settled = true;
+        } else if open != self.open {
+            self.gain.set_target(if open { 1.0 } else { 0.0 });
+        }
+        self.open = open;
+
+        let (frames, channels) = (buffer.frames(), buffer.channels());
+        for frame in 0..frames {
+            let gain = self.gain.next_value();
+            for channel in 0..channels {
+                buffer.channel_mut(channel)[frame] *= gain;
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        // Re-resolve against the bus rather than ramping from wherever playback
+        // stopped, the same way a fresh graph does.
+        self.settled = false;
+    }
+
+    fn set_param(&mut self, param: u32, value: f32) {
+        if param == Self::PARAM_SOLOED {
+            self.set_soloed(value >= 0.5);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,5 +426,158 @@ mod tests {
         assert!(data.windows(2).all(|w| (w[1] - w[0]).abs() <= MAX_RAMP_STEP));
         assert_eq!(data[959], 0.0);
         assert!(mute.is_muted());
+    }
+
+    /// Runs one block of unit signal through a track's solo and reports the
+    /// level it settled at.
+    fn solo_level(solo: &mut Solo, blocks: usize) -> f32 {
+        let mut last = 0.0;
+        for _ in 0..blocks {
+            let mut data = [1.0; 960];
+            run(solo, &mut data, 1);
+            last = data[959];
+        }
+        last
+    }
+
+    #[test]
+    fn nothing_soloed_leaves_every_track_open() {
+        let bus = SoloBus::new();
+        let mut a = Solo::new(&bus, false, SR);
+        let mut b = Solo::new(&bus, false, SR);
+        assert!(!bus.any());
+        assert_eq!(solo_level(&mut a, 1), 1.0);
+        assert_eq!(solo_level(&mut b, 1), 1.0);
+    }
+
+    #[test]
+    fn soloing_one_track_silences_the_others() {
+        let bus = SoloBus::new();
+        let mut soloed = Solo::new(&bus, true, SR);
+        let mut other = Solo::new(&bus, false, SR);
+
+        assert_eq!(bus.count(), 1);
+        assert_eq!(solo_level(&mut soloed, 1), 1.0, "the soloed track should be the one you hear");
+        assert_eq!(solo_level(&mut other, 1), 0.0, "the other track should have been silenced");
+    }
+
+    #[test]
+    fn a_track_silenced_by_solo_starts_that_way() {
+        // The bus is not finished counting when a node is built, so the value
+        // it starts on can only be resolved on the first block. Getting this
+        // wrong lets a soloed-out track through for a whole ramp.
+        let bus = SoloBus::new();
+        let _soloed = Solo::new(&bus, true, SR);
+        let mut other = Solo::new(&bus, false, SR);
+
+        let mut data = [1.0; 64];
+        run(&mut other, &mut data, 1);
+        assert!(data.iter().all(|s| *s == 0.0), "leaked at the start: {:?}", &data[..4]);
+    }
+
+    #[test]
+    fn releasing_the_last_solo_reopens_everything() {
+        let bus = SoloBus::new();
+        let mut soloed = Solo::new(&bus, true, SR);
+        let mut other = Solo::new(&bus, false, SR);
+        assert_eq!(solo_level(&mut other, 1), 0.0);
+
+        soloed.set_soloed(false);
+        assert!(!bus.any());
+        assert_eq!(solo_level(&mut other, 2), 1.0, "the track never came back");
+    }
+
+    #[test]
+    fn several_tracks_can_be_soloed_at_once() {
+        // Solo is not exclusive: pressing a second one adds to the first
+        // rather than stealing it.
+        let bus = SoloBus::new();
+        let mut first = Solo::new(&bus, true, SR);
+        let mut second = Solo::new(&bus, false, SR);
+        let mut rest = Solo::new(&bus, false, SR);
+
+        second.set_soloed(true);
+        assert_eq!(bus.count(), 2);
+        assert_eq!(solo_level(&mut first, 2), 1.0);
+        assert_eq!(solo_level(&mut second, 2), 1.0);
+        assert_eq!(solo_level(&mut rest, 2), 0.0);
+    }
+
+    #[test]
+    fn soloing_twice_does_not_count_twice() {
+        // The bus counts tracks, not presses. A double count would leave every
+        // other track silenced after this one is released.
+        let bus = SoloBus::new();
+        let mut track = Solo::new(&bus, false, SR);
+        track.set_soloed(true);
+        track.set_soloed(true);
+        assert_eq!(bus.count(), 1);
+        track.set_soloed(false);
+        assert_eq!(bus.count(), 0, "the bus never came back to zero");
+    }
+
+    #[test]
+    fn a_retired_track_hands_its_solo_back() {
+        let bus = SoloBus::new();
+        let track = Solo::new(&bus, true, SR);
+        assert_eq!(bus.count(), 1);
+        drop(track);
+        assert_eq!(bus.count(), 0, "a dropped track left the bus stuck above zero");
+    }
+
+    #[test]
+    fn solo_fades_rather_than_cutting() {
+        let bus = SoloBus::new();
+        let mut other = Solo::new(&bus, false, SR);
+        let mut soloed = Solo::new(&bus, false, SR);
+        // Settle both while everything is open.
+        assert_eq!(solo_level(&mut other, 1), 1.0);
+
+        soloed.set_soloed(true);
+        let mut data = [1.0; 960];
+        run(&mut other, &mut data, 1);
+        for (i, w) in data.windows(2).enumerate() {
+            assert!((w[1] - w[0]).abs() <= MAX_RAMP_STEP, "step at {i}: {} -> {}", w[0], w[1]);
+        }
+        assert_eq!(data[959], 0.0, "the fade never arrived");
+    }
+
+    #[test]
+    fn a_muted_track_stays_silent_when_soloed() {
+        // The two nodes sit in series, so their gains multiply. A mixer works
+        // the same way: soloing something you muted does not unmute it.
+        let bus = SoloBus::new();
+        let mut mute = Mute::new(true, SR);
+        let mut solo = Solo::new(&bus, true, SR);
+
+        let mut data = [1.0; 960];
+        run(&mut mute, &mut data, 1);
+        run(&mut solo, &mut data, 1);
+        assert_eq!(data[959], 0.0);
+    }
+
+    #[test]
+    fn solo_is_automatable() {
+        let bus = SoloBus::new();
+        let mut track = Solo::new(&bus, false, SR);
+        track.set_param(Solo::PARAM_SOLOED, 1.0);
+        assert!(track.is_soloed());
+        track.set_param(999, 0.0);
+        assert!(track.is_soloed(), "an unknown parameter released the solo");
+        track.set_param(Solo::PARAM_SOLOED, 0.0);
+        assert!(!track.is_soloed());
+    }
+
+    #[test]
+    fn resetting_re_resolves_against_the_bus() {
+        let bus = SoloBus::new();
+        let mut track = Solo::new(&bus, false, SR);
+        assert_eq!(solo_level(&mut track, 1), 1.0);
+
+        let _soloed = Solo::new(&bus, true, SR);
+        track.reset();
+        let mut data = [1.0; 64];
+        run(&mut track, &mut data, 1);
+        assert!(data.iter().all(|s| *s == 0.0), "reset ramped instead of landing on the answer");
     }
 }

@@ -19,7 +19,7 @@ use std::{env, process, thread};
 
 use engine_core::{
     AudioBuffer, AutomationSender, Gain, Graph, GraphBuilder, LIMITER_LOOKAHEAD_MS, Limiter, Mute, Node, PARAM_RAMP_MS,
-    Pan, ParamEvent, ParamId, SWAP_FADE_MS, automation_channel, graph_channel,
+    Pan, ParamEvent, ParamId, SWAP_FADE_MS, Solo, SoloBus, automation_channel, graph_channel,
 };
 use engine_dsp::SineOsc;
 use engine_io::{AudioEngine, EngineOptions, StatsSnapshot, default_output_config, list_output_devices, map_frames};
@@ -74,11 +74,15 @@ struct Faders {
     gain: ParamId,
     pan: ParamId,
     mute: ParamId,
+    solo: ParamId,
 }
 
 /// Tracks, each through gain, pan and mute, into a master under a ceiling.
 fn mixer(tracks: usize, sample_rate: f32) -> (Box<Graph>, Vec<Faders>) {
     let mut builder = GraphBuilder::new();
+    // One bus per graph: a graph built to replace this one gets its own, and
+    // the control side carries the solo state over by rebuilding with it.
+    let bus = SoloBus::new();
     let master = builder.add(Box::new(Gain::new(MASTER_HEADROOM / tracks as f32, sample_rate)));
     let mut faders = Vec::with_capacity(tracks);
 
@@ -87,11 +91,13 @@ fn mixer(tracks: usize, sample_rate: f32) -> (Box<Graph>, Vec<Faders>) {
         let gain = builder.add(Box::new(Gain::new(TRACK_GAIN, sample_rate)));
         let pan = builder.add(Box::new(Pan::new(-1.0 + track as f32 * 2.0 / tracks as f32, sample_rate)));
         let mute = builder.add(Box::new(Mute::new(false, sample_rate)));
-        builder.connect(source, gain).connect(gain, pan).connect(pan, mute).connect(mute, master);
+        let solo = builder.add(Box::new(Solo::new(&bus, false, sample_rate)));
+        builder.connect(source, gain).connect(gain, pan).connect(pan, mute).connect(mute, solo).connect(solo, master);
         faders.push(Faders {
             gain: ParamId::new(gain, Gain::PARAM_GAIN),
             pan: ParamId::new(pan, Pan::PARAM_POSITION),
             mute: ParamId::new(mute, Mute::PARAM_MUTED),
+            solo: ParamId::new(solo, Solo::PARAM_SOLOED),
         });
     }
 
@@ -113,8 +119,8 @@ fn slope_bound(tracks: usize, sample_rate: f32) -> f32 {
     let signal: f32 = (0..tracks)
         .map(|t| TRACK_AMPLITUDE * TRACK_GAIN * share * std::f32::consts::TAU * frequency(t) / sample_rate)
         .sum();
-    // Gain, pan and mute can all be moving at once on every track.
-    let ramps = 3.0 * tracks as f32 * TRACK_AMPLITUDE * share / (PARAM_RAMP_MS * 1e-3 * sample_rate);
+    // Gain, pan, mute and solo can all be moving at once on every track.
+    let ramps = 4.0 * tracks as f32 * TRACK_AMPLITUDE * share / (PARAM_RAMP_MS * 1e-3 * sample_rate);
     let limiting = CEILING / (LIMITER_LOOKAHEAD_MS * 1e-3 * sample_rate);
     // Two graphs at the ceiling, blended the wrong way round for one sample.
     let swapping = 2.0 * CEILING / (SWAP_FADE_MS * 1e-3 * sample_rate);
@@ -324,8 +330,17 @@ fn automate(sender: &mut AutomationSender, faders: &[Faders], tick: usize, at: u
     }
     let track = &faders[tick % faders.len()];
     let sweep = (tick as f32 * 0.07).sin();
-    let moves =
-        [(track.gain, 0.5 + 0.45 * sweep), (track.pan, sweep), (track.mute, if tick % 211 < 105 { 0.0 } else { 1.0 })];
+    // Solo one track at a time, and only now and then — a solo held forever
+    // would leave the click check watching a single sine. The state is sent on
+    // every visit rather than on the change, so no track can be left soloed by
+    // a rotation that happened to skip it.
+    let soloing = tick % 400 < 80 && tick % faders.len() == (tick / 400) % faders.len();
+    let moves = [
+        (track.gain, 0.5 + 0.45 * sweep),
+        (track.pan, sweep),
+        (track.mute, if tick % 211 < 105 { 0.0 } else { 1.0 }),
+        (track.solo, if soloing { 1.0 } else { 0.0 }),
+    ];
 
     let mut sent = 0;
     for (step, (param, value)) in moves.into_iter().enumerate() {
@@ -459,6 +474,7 @@ mod tests {
     fn the_mixer_reports_the_limiters_latency() {
         let (graph, faders) = mixer(4, 48_000.0);
         assert_eq!(faders.len(), 4);
+        assert!(faders.iter().all(|f| f.solo != f.mute), "solo and mute must name different nodes");
         // Only the limiter looks ahead, so the master path is the only delay.
         assert_eq!(graph.latency_frames(), (LIMITER_LOOKAHEAD_MS * 1e-3 * 48_000.0) as usize);
     }

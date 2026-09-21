@@ -13,7 +13,7 @@
 
 use engine_core::{
     AudioBuffer, AutomationSender, Gain, Graph, GraphBuilder, LIMITER_LOOKAHEAD_MS, Limiter, Mute, Node, PARAM_RAMP_MS,
-    Pan, ParamEvent, ParamId, automation_channel,
+    Pan, ParamEvent, ParamId, Solo, SoloBus, automation_channel,
 };
 use engine_dsp::SineOsc;
 
@@ -56,11 +56,13 @@ struct Faders {
     gain: ParamId,
     pan: ParamId,
     mute: ParamId,
+    solo: ParamId,
 }
 
 /// Tracks, each through gain, pan and mute, into a master under a ceiling.
-fn mixer(tracks: usize) -> (Graph, Vec<Faders>) {
+fn mixer(tracks: usize) -> (Graph, Vec<Faders>, SoloBus) {
     let mut builder = GraphBuilder::new();
+    let bus = SoloBus::new();
     let master = builder.add(Box::new(Gain::new(MASTER_HEADROOM / tracks as f32, SR)));
     let mut faders = Vec::with_capacity(tracks);
 
@@ -69,11 +71,13 @@ fn mixer(tracks: usize) -> (Graph, Vec<Faders>) {
         let gain = builder.add(Box::new(Gain::new(TRACK_GAIN, SR)));
         let pan = builder.add(Box::new(Pan::new(-1.0 + track as f32 * 2.0 / tracks as f32, SR)));
         let mute = builder.add(Box::new(Mute::new(false, SR)));
-        builder.connect(source, gain).connect(gain, pan).connect(pan, mute).connect(mute, master);
+        let solo = builder.add(Box::new(Solo::new(&bus, false, SR)));
+        builder.connect(source, gain).connect(gain, pan).connect(pan, mute).connect(mute, solo).connect(solo, master);
         faders.push(Faders {
             gain: ParamId::new(gain, Gain::PARAM_GAIN),
             pan: ParamId::new(pan, Pan::PARAM_POSITION),
             mute: ParamId::new(mute, Mute::PARAM_MUTED),
+            solo: ParamId::new(solo, Solo::PARAM_SOLOED),
         });
     }
 
@@ -81,7 +85,7 @@ fn mixer(tracks: usize) -> (Graph, Vec<Faders>) {
     builder.connect(master, ceiling).output(ceiling);
 
     let graph = builder.build(CHANNELS, BLOCK_FRAMES).expect("a mixer is acyclic by construction");
-    (graph, faders)
+    (graph, faders, bus)
 }
 
 /// The steepest the mix is allowed to move between two consecutive samples.
@@ -95,8 +99,8 @@ fn slope_bound(tracks: usize) -> f32 {
     let signal: f32 = (0..tracks)
         .map(|track| TRACK_AMPLITUDE * TRACK_GAIN * share * std::f32::consts::TAU * frequency(track) / SR)
         .sum();
-    // Gain, pan and mute can all be moving at once on every track.
-    let ramps = 3.0 * tracks as f32 * TRACK_AMPLITUDE * share / (PARAM_RAMP_MS * 1e-3 * SR);
+    // Gain, pan, mute and solo can all be moving at once on every track.
+    let ramps = 4.0 * tracks as f32 * TRACK_AMPLITUDE * share / (PARAM_RAMP_MS * 1e-3 * SR);
     let limiting = CEILING / (LIMITER_LOOKAHEAD_MS * 1e-3 * SR);
     signal + ramps + limiting
 }
@@ -106,8 +110,16 @@ fn slope_bound(tracks: usize) -> f32 {
 fn schedule(sender: &mut AutomationSender, faders: &[Faders], block: usize, frame: u64) {
     let track = &faders[block % faders.len()];
     let sweep = (block as f32 * 0.037).sin();
-    let moves =
-        [(track.gain, 0.5 + 0.45 * sweep), (track.pan, sweep), (track.mute, if block % 97 < 48 { 0.0 } else { 1.0 })];
+    // Solo one track at a time and only now and then. The state is sent on
+    // every visit rather than on the change, so a track can never be left
+    // soloed by a rotation that happened to skip it.
+    let soloing = block % 400 < 80 && block % faders.len() == (block / 400) % faders.len();
+    let moves = [
+        (track.gain, 0.5 + 0.45 * sweep),
+        (track.pan, sweep),
+        (track.mute, if block % 97 < 48 { 0.0 } else { 1.0 }),
+        (track.solo, if soloing { 1.0 } else { 0.0 }),
+    ];
     for (step, (param, value)) in moves.into_iter().enumerate() {
         let at = frame + step as u64 * (BLOCK_FRAMES as u64 / 4);
         sender.send(ParamEvent::new(param, value, at)).expect("the queue is drained every block");
@@ -117,14 +129,17 @@ fn schedule(sender: &mut AutomationSender, faders: &[Faders], block: usize, fram
 struct Run {
     worst_step: f32,
     peak: f32,
+    /// Whether a solo was ever engaged. Without it the run would pass having
+    /// never exercised the control the phase's criterion names.
+    soloed: bool,
 }
 
 fn play(tracks: usize) -> Run {
-    let (mut graph, faders) = mixer(tracks);
+    let (mut graph, faders, bus) = mixer(tracks);
     let (mut sender, mut queue) = automation_channel(64);
     let mut out = vec![0.0f32; BLOCK_FRAMES * CHANNELS];
     let mut frame = 0u64;
-    let mut run = Run { worst_step: 0.0, peak: 0.0 };
+    let mut run = Run { worst_step: 0.0, peak: 0.0, soloed: false };
     // Carried across blocks: a discontinuity at a callback boundary is exactly
     // the kind this engine could produce, and looking only inside blocks would
     // step straight over it.
@@ -133,6 +148,7 @@ fn play(tracks: usize) -> Run {
     for block in 0..SECONDS * SR as usize / BLOCK_FRAMES {
         schedule(&mut sender, &faders, block, frame);
         graph.process_automated(&mut out, &mut queue, frame);
+        run.soloed |= bus.any();
 
         for chunk in out.as_chunks::<CHANNELS>().0 {
             for (channel, sample) in chunk.iter().enumerate() {
@@ -155,6 +171,7 @@ fn eight_tracks_mix_without_a_glitch() {
     let bound = slope_bound(8);
     assert!(run.worst_step <= bound, "worst step {} over the {bound} the signal allows", run.worst_step);
     assert!(run.peak > 0.5, "peak {}: the mix was too quiet to prove anything", run.peak);
+    assert!(run.soloed, "no solo was ever engaged, so the run did not test one");
     println!("8 tracks: worst step {} against a bound of {bound}, peak {}", run.worst_step, run.peak);
 }
 
@@ -164,6 +181,7 @@ fn sixteen_tracks_mix_without_a_glitch() {
     let bound = slope_bound(16);
     assert!(run.worst_step <= bound, "worst step {} over the {bound} the signal allows", run.worst_step);
     assert!(run.peak > 0.5, "peak {}: the mix was too quiet to prove anything", run.peak);
+    assert!(run.soloed, "no solo was ever engaged, so the run did not test one");
     println!("16 tracks: worst step {} against a bound of {bound}, peak {}", run.worst_step, run.peak);
 }
 

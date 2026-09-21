@@ -187,10 +187,50 @@ débordé. 78 échanges de graphe pendant la lecture, aucune discontinuité. La
 charge est la même à la 30ᵉ minute qu'à la première, ce que le run offline de
 30 minutes disait déjà mais sans l'ordonnanceur réel.
 
-**Il manque le solo.** Le critère du plan dit « paramètres (gain/pan/mute/solo)
-modifiables en live » et `Solo` n'existe nulle part dans le code. Le reste du
-critère est atteint et dépassé (16 pistes au lieu de 8), mais tant que le solo
-n'est pas là, la phase 2 n'est pas close au sens du plan.
+Ce run **précède le solo** : la tranche de voie n'avait alors que gain, pan et
+mute, donc il ne couvre pas tout le critère. Voir ci-dessous.
+
+### Solo (incrément 10)
+
+Le solo est le seul contrôle auquel une piste ne peut pas répondre seule : une
+piste n'est jamais « dé-soloée », elle est silencieuse *parce qu'une autre est
+en solo*. La résolution est globale, donc il faut quelque chose qui tienne ce
+fait pour toutes — c'est `SoloBus`, un compteur de pistes en solo partagé par
+tous les `Solo` d'un graphe. Un bus par graphe : un graphe qui en remplace un
+autre a le sien, et le thread de contrôle reporte l'état en reconstruisant avec
+les mêmes pistes en solo.
+
+C'est un atomique parce qu'un `Graph` traverse vers le thread audio et que tout
+ce qu'il contient doit être `Send` ; un seul thread le lit ou l'écrit à la fois,
+donc l'ordering le moins cher suffit.
+
+Comme `Mute`, c'est une rampe et pas un court-circuit du traitement : les nœuds
+en amont continuent de tourner, donc relâcher un solo ne redémarre pas un filtre
+et ne coupe pas une traîne qui décroissait derrière. C'est ce qui rend le solo
+sûr à presser et relâcher pendant que ça joue, ce que le plan demandait
+explicitement.
+
+Trois pièges traités :
+
+- **Le compteur compte des pistes, pas des appuis.** `set_soloed` ne touche au
+  bus que si l'état change vraiment ; sinon un double appui laisserait toutes
+  les autres pistes muettes après le relâchement.
+- **Une piste retirée rend son compte** (`Drop`), donc un graphe retiré alors
+  qu'une de ses pistes était en solo ne peut pas coincer un bus au-dessus de
+  zéro.
+- **La valeur de départ ne peut être connue qu'au premier bloc.** Le bus n'a
+  pas fini de compter quand un nœud est construit — les autres pistes n'existent
+  pas encore. Partir de la mauvaise laisserait passer une piste soloée-out
+  pendant toute une rampe, d'où le `settled` résolu au premier `process`.
+
+Le solo n'est **pas exclusif** (plusieurs pistes peuvent l'être, elles jouent
+toutes) et ne **prime pas sur le mute** : les deux nœuds sont en série, donc
+leurs gains se multiplient et une piste que l'utilisateur a muette le reste
+quand on la solo — ce que fait une console.
+
+Le test de charge vérifie maintenant qu'un solo a bien été engagé pendant le
+run, au même titre que « le mix n'était pas silencieux » : sans ça il passerait
+sans jamais avoir exercé le contrôle que le critère nomme.
 
 ### Deux dettes réglées au passage
 
