@@ -166,6 +166,14 @@ Trois écarts au plan valent d'être notés :
 ### Critère de sortie
 UI fluide à 60fps avec 8 pistes en lecture, chaque action a un undo qui restaure l'état exact précédent, aucune interaction UI ne cause de glitch audio.
 
+**Critère revu le 2026-09-22.** « Fluide à 60 fps » est faible : de l'immediate mode avec quelques widgets y arrive sans effort, et ce n'est pas ce qui casse. Le vrai risque est que le thread UI perturbe le thread audio *indirectement* — par le mécanisme d'instantané, une allocation sur un chemin partagé, une contention. Remplacé par :
+
+- **pendant une action UI continue** (fader tiré sans relâche, timeline scrollée en pleine lecture, pistes ajoutées et retirées) : **zéro xrun et zéro discontinuité sur 10 minutes**, mesurés par les compteurs du moteur et le détecteur à borne analytique de la phase 2 ;
+- **undo** : test de propriété sur des séquences de commandes arbitraires, l'historique remonté pas à pas contre un instantané de chaque état ;
+- **fluidité** : percentiles de temps de frame, sur le modèle de l'histogramme de charge.
+
+Les trois sont mesurables. Voir `docs/REPRISE.md` pour l'état : le premier est partiellement établi (0 xrun sur ~12 min d'interaction), le détecteur de discontinuité n'est pas encore branché sur l'UI.
+
 ---
 
 ## Phase 5 — Effets intégrés
@@ -238,6 +246,42 @@ Chargement d'au moins un plugin VST3 ou CLAP réel, traitement audio à travers 
 
 ---
 
+## Ordre révisé (2026-09-22)
+
+Les phases 0 à 3 sont faites et validées sur matériel ; la 4 est entamée et utilisable. L'ordre du plan d'origine tenait pour un projet qu'on n'avait pas encore commencé. Ce qu'on sait maintenant le change sur deux points.
+
+**La persistance passe devant la timeline.** La phase 6 est la plus petite qui reste et c'est celle qui débloque le reste : aujourd'hui chaque relance perd les fichiers chargés et tous les réglages, donc chaque cycle de test des phases suivantes recommence à zéro. Construire la timeline avant la sauvegarde voudrait dire replacer les clips à la main à chaque essai. Le modèle est prêt — données simples, champ `version` depuis le premier commit, chemin de fichier porté par la piste.
+
+**Le transport passe devant les effets.** Il n'y a aucun moyen d'arrêter le son : un fichier chargé boucle indéfiniment. Play/pause/stop et une position lue par l'UI sont petits, et une timeline ne veut rien dire sans eux.
+
+| ordre | ce que c'est | phase d'origine | taille |
+|---|---|---|---|
+| 1 | Sauvegarde et chargement de projet | 6 | petite |
+| 2 | Transport (play/pause/stop, position) | 4 | petite |
+| 3 | EQ paramétrique | 5 | moyenne |
+| 4 | Waveform (peak files) et timeline avec clips | 4 | **la plus grosse du projet** |
+| 5 | Compresseur, reverb, delay | 5 | moyenne |
+| 6 | MIDI externe validé sur matériel | 3 | en attente d'un clavier |
+| 7 | Hébergement CLAP | 7 | optionnelle |
+
+Chaque étape ajoute sa fonctionnalité à l'UI au passage, plutôt que d'attendre une phase « interface » séparée : c'est l'usage qui trouve les défauts, et trois l'ont déjà prouvé (voir le journal).
+
+---
+
+## Ce que le projet a appris
+
+**Le CPU n'a jamais été la contrainte.** Le plan consacre plusieurs points d'attention au coût par piste. Mesuré : 16 pistes avec tranche complète et automation coûtent **1,2 % d'un buffer de 10 ms**, deux fichiers stéréo mixés **0,1 %**. Il y a un ordre de grandeur de marge. Le goulot identifié — la tranche de voie, ~3 µs/piste — ne vaut pas la peine d'être touché.
+
+**Les défauts réels portaient sur l'état, pas sur la vitesse.** Aucun des bugs sérieux de ce projet n'était du DSP : un `RefCell` emprunté pendant une reconstruction de graphe, un undo qui enregistrait soixante pas pour un geste, une énumération de source qui jetait le chemin du fichier, un événement d'automation appliqué au graphe sortant au lieu de l'entrant. Tous sont des désaccords entre deux dépositaires de la même vérité. C'est là qu'il faut regarder en priorité, pas sur les nanosecondes.
+
+**« Mesure, pas impression » tient aussi pour l'interface.** On croyait ce critère réservé au moteur. Deux des trois moitiés du critère de la phase 4 se mesurent avec ce qui existe déjà, et la troisième aussi. Un critère qui ne se mesure pas est un critère à réécrire, pas une exception à accepter.
+
+**Les surfaces d'extension sont décidées et elles sont petites.** `Node` pour le DSP (déjà stable : `process`, `reset`, `set_param`, `set_frame`, `latency_frames`), `Command` pour tout ce qui s'édite et s'annule, le thème en donnée, et CLAP en phase 7 pour les tiers. Rust n'ayant pas d'ABI stable, un système de plugins maison contaminerait tout le code en `#[repr(C)]` pour servir zéro contributeur aujourd'hui ; CLAP résout déjà le problème.
+
+**La règle sur les dépendances a payé.** `midly` sans `rayon` (6 crates évités pour un parsing de quelques millisecondes), pas de `rfd` (le glisser-déposer d'egui suffit et fait mieux), pas de `serde` tant qu'aucun fichier n'est écrit. Chaque ajout a été justifié et pesé.
+
+---
+
 ## Journal de bord (à tenir à jour)
 
 Section à compléter au fil du projet : décisions d'architecture prises, bugs non triviaux résolus (et pourquoi ils arrivaient), benchmarks CPU par phase. C'est ce journal qui devient la vraie preuve de compétence si tu veux en parler en entretien — pas le code final seul.
@@ -255,3 +299,24 @@ Section à compléter au fil du projet : décisions d'architecture prises, bugs 
 | 2026-09-19 | 0 | `LinearSmoother` calcule chaque valeur depuis la cible (`target - step × remaining`) au lieu d'accumuler `current += step`. | L'accumulation en f32 dérivait jusqu'à dépasser la cible (≈ 0,009 Hz à 4,4 kHz ; un gain à 1,0 pouvait dépasser 1,0) avant le recalage final, ce qui cassait la monotonie de la rampe. |
 | 2026-09-19 | 0 | **Phase 0 validée en natif Windows (WASAPI, casque PRO X 2 en 7.1, 48 kHz, buffer imposé à 480 frames = 10 ms).** 10 min puis 30 min : 0 xrun, 0 erreur de flux, 1800/1800 commandes appliquées, 86 404 032 frames en 1800,1 s (48 000/s, pas de dérive), charge max 1,4-6,1 %. Aucun clic aux changements de note ni pendant les rafales ci-dessous (écoute). | Confirme que les décrochages de WSL venaient de WSLg, pas de l'architecture. Tests temps réel désormais lancés depuis WSL par `scripts/windows.sh phase0` (logs dans `target/windows-logs/`). |
 | 2026-09-19 | 0 | Rafales de rattrapage WASAPI (buffers de 960/1056 frames, parfois `LatencyShift` jusqu'à +820 frames) **toutes les 10 min pile, à xx:x0:26 heure murale**, prédites puis vérifiées (1591,18 s). Sans perte : le débit total reste exact, et aucun détecteur ne se déclenche. | Tâche périodique de Windows qui retarde un callback (hypothèse non vérifiée : G HUB interroge le casque sans fil). Inaudible à 10 ms de buffer, mais à surveiller quand les buffers seront plus petits (phase 2+). |
+| 2026-09-20 | 1 | Réponse en fréquence mesurée par **sonde à sinus** (rapport RMS entrée/sortie après extinction du transitoire) plutôt que par FFT comme le plan le demandait. | Mesure exactement la même chose aux fréquences qui comptent, sans ajouter `rustfft`. Mesurer l'entrée plutôt que la supposer à 1/√2 annule l'essentiel de l'erreur d'un nombre de cycles non entier. |
+| 2026-09-21 | 2 | Automation par événements portant une **frame absolue**, et bloc découpé à chaque frame d'événement (`EventQueue::span`). | Le plan disait « consommé au début de chaque callback ». À 256 frames et 48 kHz, la frontière du callback est à 5,3 ms — audible sur un élément joué en rythme. |
+| 2026-09-21 | 2 | Limiteur master **à lookahead** (2 ms), garantie exacte : maximum glissant sur tout le retard, descente dimensionnée pour arriver dans le temps du retard, remontée seulement si plus rien ne la réclame. | Un limiteur sans lookahead ne peut pas empêcher un dépassement : quand il connaît le pic, ce pic est déjà la sortie. Mesuré sur démarrage à froid en pleine échelle, pics isolés et surcharge tenue. |
+| 2026-09-21 | 2 | Maximum glissant par **file monotone décroissante** (O(1) amorti) au lieu d'un balayage du retard. | Rebalayer coûterait le lookahead sur chaque sample (96 comparaisons à 48 kHz). Vérifiée contre la version naïve. |
+| 2026-09-21 | 2 | Solo résolu par un **compteur partagé** (`SoloBus`) plutôt que par piste ; valeur de départ résolue au premier bloc. | Une piste n'est jamais « dé-soloée », elle est silencieuse *parce qu'une autre* est en solo : la résolution est globale. Le bus n'a pas fini de compter quand un nœud est construit, donc partir de la mauvaise valeur laisserait passer une piste soloée-out pendant toute une rampe. |
+| 2026-09-21 | 2 | **Bug trouvé par un test** : `GraphPlayer::process_automated` appliquait les événements avant de récupérer le graphe entrant, donc un changement programmé dans le même bloc qu'un échange atterrissait sur le graphe sortant — puis était fondu au noir avec lui. | L'ordre importait et la documentation affirmait le contraire. Le graphe entrant est récupéré en premier. |
+| 2026-09-21 | 2 | **Erreur d'attribution corrigée** : un pic de charge à 17,3 % avait été expliqué par une compilation lancée en parallèle. Le run de 30 min de la phase 3, machine au repos, atteint 12,7 % avec un p50 de 0,1 %. | L'explication était fausse. Sur 180 000 callbacks, un pic isolé de cet ordre apparaît de toute façon ; seuls p50 et p99 veulent dire quelque chose. |
+| 2026-09-21 | 3 | Enveloppe ADSR en **segments linéaires**, pas exponentiels. | Un pôle n'atteint jamais zéro : il faut un seuil d'arrêt, et une voix laissée à 1e-30 est un dénormal, dont ce projet a déjà mesuré le coût. Le linéaire atterrit exactement, donc « cette voix est finie » est un fait que le pool peut exploiter. |
+| 2026-09-21 | 3 | Le synthé **ne découpe pas le bloc** : il consulte sa file en arrivant sur chaque frame. Horloge partagée ajoutée au trait (`Node::set_frame`), distribuée aux deux graphes pendant un fondu. | Le plan prescrivait le découpage — nécessaire pour un nœud qui travaille par blocs, inutile pour un générateur échantillon par échantillon. Même précision, aucun coût pour le reste du graphe. Mesuré : 21 601 notes à 180 BPM, écart 0 frame. |
+| 2026-09-21 | 3 | Saw et square **band-limités (PolyBLEP)**, non demandés par le plan. | Un saw naïf à 5 kHz met de l'énergie à 3 kHz par repliement, où aucune de ses harmoniques n'a affaire, et rien en aval ne peut l'en séparer. Écart mesuré par corrélation contre la version naïve. |
+| 2026-09-21 | 3 | `midly` avec `default-features = false`. | Les défauts tirent `rayon` et `crossbeam` — 6 crates transitifs — pour paralléliser un parsing de quelques millisecondes, hors thread audio. Sans eux, `midly` n'a aucune dépendance. |
+| 2026-09-21 | 3 | Le piège du MIDI n'est pas le format mais **l'horloge** : pistes fusionnées sur une timeline unique d'abord, puis chaque changement de tempo ne vaut que pour ce qui le suit. | Un fichier mesure le temps en ticks dont la durée dépend d'un tempo qu'il peut changer quand il veut. Lire le premier et l'appliquer partout décale tout ce qui suit, de plus en plus loin. Un format 1 met son tempo dans une piste sans notes. |
+| 2026-09-21 | 4 | Trois crates au lieu d'un : `project-model` (données, commandes, undo), `project-engine` (la couture), `daw` (fenêtre). Le modèle ne dépend pas du moteur et le moteur ne connaît pas le modèle. | Un projet survit à une façon particulière de le jouer, et le thread audio n'a rien à faire d'un état éditable. Le nom `project-model` casse la convention `engine-*` exprès. |
+| 2026-09-21 | 4 | Une commande se résout **une fois** en un `Edit`, et c'est l'`Edit` qui est historisé ; identifiants de piste **dérivés** (`max + 1`) plutôt que comptés. | Rejouer un `AddTrack` depuis la commande frapperait un nouvel identifiant et toutes les étapes suivantes rateraient leur cible. Un compteur serait un état de plus à restaurer à chaque undo, donc une façon de plus de le restaurer mal. |
+| 2026-09-21 | 4 | `route` sépare une fois pour toutes ce qui **reconstruit** le graphe (structure, source) de ce qui **l'atteint en vol** (gain, pan, mute, solo, master). | Reconstruire à chaque mouvement de fader donnerait un fondu croisé de 10 ms par frame de souris. Un test fait passer la même modification par les deux chemins et compare les sorties. |
+| 2026-09-21 | 4 | Les gestes continus **fusionnent** dans le pas qu'ils prolongent ; l'UI « scelle » au relâchement. Un interrupteur ne fusionne jamais. | Un fader tiré émet une commande par frame : ~60 entrées d'historique pour un geste, et un undo qui repasse image par image. Un mute est une décision, pas un geste. |
+| 2026-09-21 | 4 | Aucune couleur nommée hors du thème, dès la première ligne d'UI ; test de contraste texte/fond par thème. | Cheap à tenir dès le départ, coûteux à imposer après. C'est ce qui fait d'un second thème une addition plutôt qu'une chasse dans chaque widget — et le contraste est la première erreur qu'un contributeur fera. |
+| 2026-09-22 | 4 | **Bug trouvé en utilisant l'app** : `RefCell already mutably borrowed` au dépôt d'un fichier. Corrigé non par un `let` mais en **retirant la mutabilité intérieure** — la fabrique de sources est passée en argument à chaque appel au lieu d'être tenue par le `Studio`. | Le vrai défaut était d'avoir mis un `RefCell` là où le compilateur pouvait prouver la chose. La même erreur est désormais refusée à la compilation. Les huit tests du `Studio` passaient : ils utilisent une fabrique sans état partagé, le bug n'existait que dans le câblage réel. |
+| 2026-09-22 | 4 | **Défaut de conception trouvé à l'usage** : `eject` remettait le sinus de secours, et une piste neuve bourdonnait. Une piste vide est silencieuse ; le sinus se demande. | Le sinus servait à rendre une piste audible *avant* que les fichiers marchent. Il a survécu à son utilité. Exception gardée : un fichier nommé mais non lu joue le sinus, parce qu'une piste discrètement disparue serait plus difficile à remarquer. |
+| 2026-09-22 | 4 | **Second défaut à l'usage** : basculer sur le sinus jetait le chemin du fichier. Ce qu'une piste *contient* et ce qu'elle *joue* sont deux champs. | C'était le même champ, donc changer l'un perdait l'autre. Trois états choisis (silent / tone / file), aucun ne perd rien ; `eject` retire le fichier pour de bon. |
+| 2026-09-22 | 4 | Le script de lancement **demande** la fermeture de la fenêtre précédente au lieu de la tuer. | Windows verrouille l'exécutable d'un processus en cours. Une terminaison forcée n'exécute pas le `Drop`, donc jette le rapport de fin : le commit qui ajoutait le confort supprimait l'observabilité que le commit précédent venait d'ajouter. |
