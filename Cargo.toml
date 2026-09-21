@@ -21,6 +21,9 @@ rubato = "5.0.0"
 # parallel, which is six crates for work measured in milliseconds, off the
 # audio thread.
 midly = { version = "0.5.3", default-features = false, features = ["std"] }
+# Live MIDI input. On Linux this reaches ALSA, which cpal already requires, so
+# it adds no system dependency the audio side did not already have.
+midir = "0.11.0"
 rtrb = "0.4.0"
 assert_no_alloc = "1.1.2"
 proptest = "1.11.0"

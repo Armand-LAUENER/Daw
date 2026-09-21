@@ -23,7 +23,7 @@ engine-io-file.workspace = true
 # Same rule for the graph and for MIDI: the phase2 and phase3 examples wire
 # them to the device, the library does not depend on either.
 engine-core.workspace = true
-engine-midi.workspace = true
+engine-midi = { workspace = true, features = ["live"] }
 
 [lints]
 workspace = true

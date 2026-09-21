@@ -8,6 +8,12 @@ license.workspace = true
 [dependencies]
 engine-core.workspace = true
 midly.workspace = true
+midir = { workspace = true, optional = true }
+
+[features]
+# Live input links the system's MIDI stack (ALSA here, WinMM on Windows).
+# Reading a file does not, so it stays out unless it is asked for.
+live = ["dep:midir"]
 
 [lints]
 workspace = true

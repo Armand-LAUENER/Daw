@@ -14,6 +14,11 @@ use std::fmt;
 use std::path::Path;
 
 use engine_core::{Note, PianoRoll};
+
+#[cfg(feature = "live")]
+mod live;
+#[cfg(feature = "live")]
+pub use live::{MidiInput, connect, list_inputs};
 use midly::{Format, MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
 
 /// The tempo a file is at until it says otherwise: 120 BPM, in microseconds
@@ -31,6 +36,10 @@ pub enum MidiError {
     /// Format 2: tracks that are separate pieces rather than parts of one.
     /// Merging them onto a single timeline would stack unrelated music.
     SequentialTracks,
+    /// The system's MIDI stack refused to open or enumerate.
+    Backend(String),
+    /// No input port, or none matching what was asked for.
+    NoInput(String),
 }
 
 impl fmt::Display for MidiError {
@@ -41,6 +50,8 @@ impl fmt::Display for MidiError {
             Self::SequentialTracks => {
                 write!(f, "format 2 files hold independent pieces, which have no common timeline")
             }
+            Self::Backend(e) => write!(f, "the system's MIDI stack refused: {e}"),
+            Self::NoInput(e) => write!(f, "{e}"),
         }
     }
 }

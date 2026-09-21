@@ -247,17 +247,17 @@ PASS: no xrun, no discontinuity
 (0,034680) pour une limite montée à 0,089604, la rampe de solo ayant ajouté son
 terme : marge à 39 %.
 
-**Le `max 17,3 %` n'est pas une mesure du moteur.** Le run précédent plafonnait
-à 4,6 %. p50 et p99 sont inchangés (1,3 % et 2,6 %), donc ni le coût typique ni
-la queue proche n'ont bougé — c'est un `fetch_max` sur 180 000 callbacks, donc
-le pire tirage d'une distribution à queue lourde. Et pendant ce run, la même
-machine compilait le workspace et passait clippy et la suite de tests, parce que
-c'est là que j'ai fait le travail sur le plan. Le chiffre mesure cette
-contention, pas le graphe. Les valeurs à retenir sont p50 et p99 ; le seuil
-d'overload est à 70 % et rien ne l'a approché.
+**Le `max 17,3 %` ne dit pas grand-chose.** p50 et p99 sont inchangés (1,3 % et
+2,6 %), donc ni le coût typique ni la queue proche n'ont bougé : c'est un
+`fetch_max` sur 180 000 callbacks, soit le pire tirage d'une distribution à
+queue lourde.
 
-À refaire sur une machine au repos si on veut un `max` qui veuille dire quelque
-chose.
+*(Correction du 2026-09-21 : on avait d'abord écrit ici que ce pic mesurait la
+compilation lancée en parallèle sur la même machine. Le run de 30 minutes de la
+phase 3, fait sur une machine au repos, atteint quand même 12,7 % avec un p50 de
+0,1 %. L'explication était donc fausse, ou au mieux non étayée — un pic isolé de
+cet ordre apparaît de toute façon sur 180 000 callbacks. Les valeurs à retenir
+restent p50 et p99 ; le seuil d'overload est à 70 % et rien ne l'a approché.)*
 
 ### Deux dettes réglées au passage
 
@@ -355,6 +355,58 @@ Un vrai fichier est joué mais **pas vérifié** : ses notes se chevauchent, il 
 a pas de silence entre elles pour mesurer un front. Le self-test provoque ce
 qu'il mesure, ce qui est la seule façon que le chiffre veuille dire quelque
 chose.
+
+### Run de 30 minutes, 2026-09-21
+
+`scripts/windows.sh phase3 --self-test --bpm 180 --minutes 30` :
+
+```
+[ 1800.01s] callbacks 179999 | xruns 0 | overloads 0 | load p50 0,1 % p99 0,2 % max 12,7 %
+onsets 21601 | off their frame 0 | worst 0 frames (0.000 ms)
+PASS: no xrun, every note on its frame
+```
+
+**21 601 notes, pire écart 0 frame.** Aucune dérive accumulée sur une demi-heure,
+ce qu'un run de 60 s ne pouvait pas établir. Les frames de note se calculent en
+entier (`n × step`), donc il n'y a rien à accumuler — mais c'est ce run qui le
+montre plutôt que de l'affirmer.
+
+### MIDI externe (`midir`) — écrit, **non validé**
+
+Derrière une feature `live`, parce que lire un `.mid` ne doit pas lier la pile
+MIDI système. Coût : 8 crates (`midir`, `alsa`, `alsa-sys`, `bitflags`,
+`cfg-if`, `libc`, `log` et leurs build-deps) contre 0 pour `midly`. Sur Linux ça
+passe par ALSA, que `cpal` exige déjà, donc aucune contrainte système nouvelle.
+
+**Le point de conception : un seul producteur.** La file de notes est SPSC. En
+mode live le callback du port y écrit, il doit donc en être le seul écrivain ;
+un score pompé en parallèle serait un second producteur. Deux garde-fous :
+l'exemple refuse toute combinaison autre qu'exactement un parmi `FILE.mid`,
+`--self-test` et `--midi-in` ; et le thread de contrôle n'a pas de sender du
+tout en mode live — il est `Option<NoteSender>` et le port le prend.
+
+Les notes live visent la frame 0, toujours dans le passé, donc appliquées au
+début du bloc suivant. Il n'y a rien de mieux à viser : la touche a déjà été
+enfoncée, et le délai restant est celui du buffer du périphérique.
+
+**Ce qui n'est pas validé** : aucun clavier MIDI n'est disponible, donc
+l'ouverture d'un port réel et la latence perçue n'ont jamais été exercées. Les
+ports virtuels ne sont pas une échappatoire — `midir` ne les gère pas sur
+Windows (WinMM), et WSL n'expose pas `/dev/snd/seq`, ce que
+`phase3 --list-midi` confirme en refusant proprement plutôt qu'en plantant.
+
+Ce qui est testé est la part qui appartient à ce moteur : la traduction des
+messages (`NoteOn` vélocité 0 lu comme un `NoteOff`, messages non-notes
+ignorés) et le passage inter-threads dans `tests/live_notes.rs` — une note
+envoyée depuis un autre thread arrive, une note qui tombe en plein bloc est
+jouée au suivant au lieu d'être perdue, une file pleine refuse au lieu de
+bloquer le thread du port.
+
+**La phase 3 est donc à moitié close.** « Lecture d'un fichier MIDI sans
+décalage audible à 160+ BPM » est atteint et mesuré ; « réaction en direct à un
+contrôleur externe avec latence perçue nulle » ne l'est pas et ne peut pas
+l'être ici. `scripts/windows.sh phase3 --midi-in` est prêt pour le jour où un
+clavier sera branché.
 
 ## Architecture actuelle
 

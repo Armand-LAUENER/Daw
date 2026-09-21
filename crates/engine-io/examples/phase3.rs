@@ -8,6 +8,7 @@
 //!
 //!   cargo run --release -p engine-io --example phase3 -- --self-test --bpm 180
 //!   cargo run --release -p engine-io --example phase3 -- song.mid
+//!   cargo run --release -p engine-io --example phase3 -- --midi-in
 //!
 //! A real file is played but not checked: its notes overlap, so there is no
 //! silence between them to measure an onset against. The self test provokes the
@@ -26,9 +27,9 @@ use engine_core::{
 use engine_dsp::{Adsr, Waveform};
 use engine_io::{AudioEngine, EngineOptions, StatsSnapshot, default_output_config, list_output_devices, map_frames};
 
-const USAGE: &str = "usage: phase3 [FILE.mid | --self-test] [--list] [--bpm N] [--voices N] \
-                     [--wave sine|saw|square] [--minutes N | --seconds N] [--host NAME] \
-                     [--device SUBSTR] [--gain 0..1]";
+const USAGE: &str = "usage: phase3 [FILE.mid | --self-test | --midi-in] [--list] [--list-midi] \
+                     [--midi-port SUBSTR] [--bpm N] [--voices N] [--wave sine|saw|square] \
+                     [--minutes N | --seconds N] [--host NAME] [--device SUBSTR] [--gain 0..1]";
 
 const GRAPH_CHANNELS: usize = 2;
 const MAX_GRAPH_FRAMES: usize = 2_048;
@@ -61,6 +62,9 @@ enum Score {
     SelfTest { step: u64, next: u64 },
     /// A decoded file, played once through.
     Roll { events: Vec<NoteEvent>, next: usize },
+    /// A keyboard. Nothing is pumped from here: the port's own callback is the
+    /// queue's single producer, and a second writer would corrupt it.
+    Live,
 }
 
 impl Score {
@@ -91,6 +95,7 @@ impl Score {
                     sent += 1;
                 }
             }
+            Self::Live => {}
         }
         sent
     }
@@ -110,7 +115,10 @@ struct OnsetCheck {
 struct Args {
     file: Option<PathBuf>,
     self_test: bool,
+    midi_in: bool,
+    midi_port: Option<String>,
     list: bool,
+    list_midi: bool,
     bpm: f64,
     voices: usize,
     wave: Waveform,
@@ -143,8 +151,26 @@ fn main() {
         return;
     }
 
-    if args.file.is_none() && !args.self_test {
-        eprintln!("{USAGE}");
+    if args.list_midi {
+        match engine_midi::list_inputs() {
+            Ok(ports) if ports.is_empty() => println!("no MIDI input ports are connected"),
+            Ok(ports) => {
+                for (i, name) in ports.iter().enumerate() {
+                    println!("{i}: {name}");
+                }
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // One source of notes: the synth's queue takes a single producer, and a
+    // keyboard's callback writing into it alongside a score would corrupt it.
+    if [args.file.is_some(), args.self_test, args.midi_in].iter().filter(|on| **on).count() != 1 {
+        eprintln!("give exactly one of FILE.mid, --self-test or --midi-in\n{USAGE}");
         process::exit(2);
     }
 
@@ -185,13 +211,14 @@ fn run(args: &Args) -> Result<(), String> {
             let duration = seq.duration();
             (Score::Roll { events: seq.piano_roll().events(), next: 0 }, sustained(sample_rate), Some(duration))
         }
+        None if args.midi_in => (Score::Live, sustained(sample_rate), None),
         None => {
             println!("self test: sixteenths at {} BPM, one every {step} frames", args.bpm);
             (Score::SelfTest { step, next: 0 }, staccato(sample_rate), None)
         }
     };
 
-    let (mut sender, queue) = note_channel(1_024);
+    let (sender, queue) = note_channel(1_024);
     let graph = build_graph(args, &envelope, queue, sample_rate);
     let latency = graph.latency_frames() as u64;
     println!(
@@ -200,6 +227,20 @@ fn run(args: &Args) -> Result<(), String> {
         args.wave,
         latency as f64 * 1e3 / f64::from(rate),
     );
+
+    // In live mode the control thread has no sender at all: the port owns it,
+    // and it is the queue's only producer. Held for the whole run, because
+    // dropping it closes the port.
+    let mut sender = Some(sender);
+    let keyboard = if args.midi_in {
+        let to_synth = sender.take().expect("nothing else has taken it yet");
+        let input = engine_midi::connect(args.midi_port.as_deref(), to_synth)
+            .map_err(|e| format!("cannot open a MIDI input: {e}"))?;
+        println!("midi in: {}", input.name());
+        Some(input)
+    } else {
+        None
+    };
 
     let (_swapper, mut player) = graph_channel(Some(graph), GRAPH_CHANNELS, MAX_GRAPH_FRAMES, sample_rate);
     let check = Arc::new(OnsetCheck::default());
@@ -277,7 +318,9 @@ fn run(args: &Args) -> Result<(), String> {
         while let Ok(event) = engine.events.pop() {
             println!("[{:>8.2}s] {event:?}", started.elapsed().as_secs_f64());
         }
-        queued += score.pump(&mut sender, position.load(Ordering::Relaxed) + lead);
+        if let Some(sender) = sender.as_mut() {
+            queued += score.pump(sender, position.load(Ordering::Relaxed) + lead);
+        }
 
         if Instant::now() >= next_report {
             print_status(started.elapsed(), &engine.stats.snapshot(), &check, queued);
@@ -291,6 +334,10 @@ fn run(args: &Args) -> Result<(), String> {
     print_status(started.elapsed(), &stats, &check, queued);
     for (kind, n) in stats.error_breakdown() {
         println!("  stream error {kind}: {n}");
+    }
+
+    if let Some(input) = &keyboard {
+        println!("midi in: {} | notes refused because the queue was full: {}", input.name(), input.dropped());
     }
 
     let seen = check.seen.load(Ordering::Relaxed);
@@ -332,7 +379,10 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut args = Args {
         file: None,
         self_test: false,
+        midi_in: false,
+        midi_port: None,
         list: false,
+        list_midi: false,
         bpm: 180.0,
         voices: 16,
         wave: Waveform::Saw,
@@ -344,7 +394,13 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Args, String> {
         let mut value = || argv.next().ok_or_else(|| format!("{arg}: missing value"));
         match arg.as_str() {
             "--list" => args.list = true,
+            "--list-midi" => args.list_midi = true,
             "--self-test" => args.self_test = true,
+            "--midi-in" => args.midi_in = true,
+            "--midi-port" => {
+                args.midi_port = Some(value()?);
+                args.midi_in = true;
+            }
             "--minutes" => args.duration = Some(seconds(value()?, 60.0)?),
             "--seconds" => args.duration = Some(seconds(value()?, 1.0)?),
             "--bpm" => {
@@ -478,6 +534,20 @@ mod tests {
         let (mut sender, _queue) = note_channel(64);
         assert_eq!(score.pump(&mut sender, 200), 2, "the first note's start and stop");
         assert_eq!(score.pump(&mut sender, 10_000), 2, "the second note's");
+    }
+
+    #[test]
+    fn naming_a_port_is_enough_to_ask_for_live_input() {
+        let args = parse(&["--midi-port", "Keystation"]).unwrap();
+        assert!(args.midi_in, "naming a port should not also need --midi-in");
+        assert_eq!(args.midi_port.as_deref(), Some("Keystation"));
+    }
+
+    #[test]
+    fn live_input_pumps_nothing_because_the_port_is_the_producer() {
+        // Two writers into one single-producer queue is the bug this guards.
+        let (mut sender, _queue) = note_channel(64);
+        assert_eq!(Score::Live.pump(&mut sender, u64::MAX), 0);
     }
 
     #[test]
