@@ -242,7 +242,7 @@ impl eframe::App for App {
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([900.0, 600.0]).with_title("Daw"),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 640.0]).with_title("Daw"),
         ..Default::default()
     };
     eframe::run_native("Daw", options, Box::new(|cc| Ok(Box::new(App::new(cc)?))))
