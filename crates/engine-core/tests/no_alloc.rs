@@ -10,7 +10,7 @@
 
 use assert_no_alloc::{AllocDisabler, assert_no_alloc};
 use engine_core::{
-    AudioBuffer, Gain, GraphBuilder, Mute, Node, Pan, ParamEvent, ParamId, automation_channel, graph_channel,
+    AudioBuffer, Gain, GraphBuilder, Limiter, Mute, Node, Pan, ParamEvent, ParamId, automation_channel, graph_channel,
 };
 
 #[global_allocator]
@@ -54,7 +54,8 @@ fn processing_a_graph_does_not_allocate() {
         let mute = builder.add(Box::new(Mute::new(false, SR)));
         builder.connect(tone, gain).connect(gain, pan).connect(pan, mute).connect(mute, master);
     }
-    builder.output(master);
+    let ceiling = builder.add(Box::new(Limiter::new(0.9, CHANNELS, SR)));
+    builder.connect(master, ceiling).output(ceiling);
     let mut graph = builder.build(CHANNELS, MAX_FRAMES).unwrap();
 
     let mut out = vec![0.0f32; MAX_FRAMES * CHANNELS];
@@ -126,7 +127,8 @@ fn automating_a_graph_does_not_allocate() {
         builder.connect(tone, gain).connect(gain, pan).connect(pan, mute).connect(mute, master);
         faders.push((ParamId::new(gain, Gain::PARAM_GAIN), ParamId::new(pan, Pan::PARAM_POSITION)));
     }
-    builder.output(master);
+    let ceiling = builder.add(Box::new(Limiter::new(0.9, CHANNELS, SR)));
+    builder.connect(master, ceiling).output(ceiling);
     let mut graph = builder.build(CHANNELS, MAX_FRAMES).unwrap();
 
     let (mut sender, mut queue) = automation_channel(64);

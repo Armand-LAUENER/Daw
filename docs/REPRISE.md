@@ -50,8 +50,8 @@ spatialisation du casque — n'est couvert.
 **Phase 2 en cours** : `engine-core` a le tampon planaire, les nœuds de base, le
 graphe avec ordre topologique, l'échange atomique de graphe (fondu croisé de
 10 ms, graphes retirés renvoyés au thread de contrôle pour y être libérés) et
-l'automation sample-accurate. Restent le limiteur master et le test de charge
-8/16 pistes.
+l'automation sample-accurate et le limiteur master. Reste le test de charge
+8/16 pistes, qui est le critère de sortie.
 
 L'automation passe par un anneau SPSC `rtrb` de `ParamEvent { param, value,
 frame }`, où `frame` est absolu sur la timeline du moteur — le thread de
@@ -62,6 +62,27 @@ près au lieu d'être arrondi à la frontière du callback (5,3 ms à 256 frames
 réinitialise pas les rampes des nœuds : `automating_a_gain_still_ramps` vérifie
 que les deux moitiés se rejoignent sans marche, et
 `automating_a_graph_does_not_allocate` tient le chemin hors de l'allocateur.
+
+Le **limiteur** (`Limiter`) est à lookahead, parce qu'un limiteur sans lookahead
+ne peut pas empêcher un dépassement : quand il connaît le niveau du pic, ce pic
+est déjà la sortie, et tout ce qu'il peut faire c'est l'écrêter. Celui-ci retarde
+le signal de 2 ms et surveille le retard, donc le gain est déjà descendu quand le
+pic arrive. La garantie est exacte, pas approchée : le maximum glissant couvre
+tout le retard (fenêtre de `lookahead + 1`), la descente est dimensionnée pour
+arriver dans le temps du retard, et le gain ne remonte que si plus rien dans la
+fenêtre ne le réclame. `nothing_escapes_the_ceiling` vérifie ça sur un démarrage
+à froid en pleine échelle, des pics isolés et une surcharge tenue.
+
+Le maximum glissant est une file monotone décroissante (O(1) amorti par sample)
+plutôt qu'un balayage du retard à chaque sample, qui coûterait le lookahead une
+fois de plus sur chacun. Elle est vérifiée contre la version naïve dans
+`the_sliding_maximum_agrees_with_scanning_the_window`. La détente est un pôle à
+100 ms — lente exprès, une détente rapide re-nivelle tout ce qui passe sous le
+transitoire, c'est le « pompage » des limiteurs mal réglés.
+
+**Attention à la latence** : le limiteur ajoute `latency_frames()` (2 ms, soit 96
+samples à 48 kHz). Tout ce qui doit s'aligner sur cette sortie — métronome, prise
+enregistrée, autre chemin du graphe — devra la compenser. Rien ne le fait encore.
 
 **Ce qui n'est pas encore branché** : `process_automated` est au niveau de
 `Graph`, pas de `GraphPlayer`. Pendant le fondu croisé d'un échange de graphe,
