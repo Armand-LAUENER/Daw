@@ -50,8 +50,7 @@ spatialisation du casque — n'est couvert.
 **Phase 2 en cours** : `engine-core` a le tampon planaire, les nœuds de base, le
 graphe avec ordre topologique, l'échange atomique de graphe (fondu croisé de
 10 ms, graphes retirés renvoyés au thread de contrôle pour y être libérés) et
-l'automation sample-accurate et le limiteur master. Reste le test de charge
-8/16 pistes, qui est le critère de sortie.
+l'automation sample-accurate, le limiteur master et le test de charge.
 
 L'automation passe par un anneau SPSC `rtrb` de `ParamEvent { param, value,
 frame }`, où `frame` est absolu sur la timeline du moteur — le thread de
@@ -83,6 +82,62 @@ transitoire, c'est le « pompage » des limiteurs mal réglés.
 **Attention à la latence** : le limiteur ajoute `latency_frames()` (2 ms, soit 96
 samples à 48 kHz). Tout ce qui doit s'aligner sur cette sortie — métronome, prise
 enregistrée, autre chemin du graphe — devra la compenser. Rien ne le fait encore.
+
+### Test de charge (incrément 8)
+
+`cargo run --release -p engine-core --example load` mesure, et
+`cargo test -p engine-core --test load` vérifie. Les cas s'empilent, donc
+l'écart entre deux lignes est le coût de ce qu'on a ajouté — un total dit
+qu'un graphe est lent, une différence dit quelle partie l'est.
+
+Mesuré le 2026-09-21 sur le desktop (WSL2, blocs de 480 frames à 48 kHz) :
+
+| cas | 8 pistes | 16 pistes | 32 pistes |
+|---|---|---|---|
+| sources dans un bus | 4,6 µs/piste | 4,6 | 4,6 |
+| + gain, pan, mute | 7,4 | 7,5 | 7,7 |
+| + limiteur master | 7,9 | 7,6 | 7,6 |
+| + automation | 7,7 | 7,6 | 7,7 |
+| **% d'un buffer de 10 ms** | **0,62 %** | **1,21 %** | **2,46 %** |
+
+Trois choses à en retenir. Le coût par piste est **plat** de 8 à 32 pistes :
+le mixage est linéaire, il n'y a pas de quadratique cachée. Le limiteur et
+l'automation sont **gratuits** à l'échelle du bruit de mesure — le limiteur est
+un seul nœud sur le master, et le découpage de bloc de l'automation coûte
+quelques passes de plus sur un graphe qui en fait 480. Le goulot d'étranglement
+est la **tranche de voie** : elle ajoute ~3 µs/piste au-dessus de la source, soit
+40 % du coût par piste.
+
+Si ça devient un jour un problème, le premier endroit à regarder est
+`Gain::process` et `Mute::process`, qui font `buffer.channel_mut(c)[frame]` dans
+une boucle par frame — un accès borné recalculé à chaque sample au lieu de
+parcourir le canal une fois. Ça n'en est pas un aujourd'hui : 16 pistes, c'est
+1,2 % d'un buffer.
+
+**Run de 30 minutes** (16 pistes, chaîne complète, automation) : moyenne entre
+119 et 131 µs par bloc, charge 1,19–1,31 %, dérive du premier au dernier
+intervalle de dix secondes **-0,0 %**. Rien ne s'accumule. Le rapport est
+découpé par tranches de dix secondes exprès : une moyenne sur tout le run
+cacherait justement une file que personne ne vide.
+
+**Le « sans glitch » est vérifié automatiquement**, pas à l'oreille. Un glitch,
+c'est un saut plus grand que ce que le signal peut produire ; le test dérive
+cette borne (pente des sinus + pente maximale d'une rampe de paramètre + chute
+maximale du gain du limiteur) et vérifie que la sortie ne la dépasse jamais, en
+suivant aussi les frontières de bloc. Les marges observées :
+
+- 8 pistes : pire pas 0,0298 pour une borne de 0,0599 (50 %)
+- 16 pistes : pire pas 0,0488 pour une borne de 0,0825 (59 %)
+- un paramètre appliqué **sans rampe** : 1,598, soit **27× la borne**
+
+C'est ce dernier chiffre qui rend les deux premiers utiles — une borne que rien
+ne peut dépasser ne prouverait rien. Le pic sort à 0,90000004 dans les deux cas,
+donc le limiteur tient bien le plafond pendant tout le run.
+
+**Ce que ça ne prouve pas** : tout ça est hors périphérique. Ça établit le coût
+et la justesse du graphe, pas que le callback tient sous un vrai ordonnanceur
+avec sa gigue. La phase 1 avait été validée sur matériel (WASAPI natif) ; le
+même run pour la phase 2 attend que le graphe soit branché dans `engine-io`.
 
 **Ce qui n'est pas encore branché** : `process_automated` est au niveau de
 `Graph`, pas de `GraphPlayer`. Pendant le fondu croisé d'un échange de graphe,
