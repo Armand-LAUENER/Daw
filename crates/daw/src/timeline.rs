@@ -44,6 +44,8 @@ pub struct View {
     /// Pixels scrolled down past the first track.
     pub scroll_y: f32,
     pub selected: Option<PlacementId>,
+    /// A MIDI clip double-clicked, for the note editor to open on.
+    pub open: Option<PlacementId>,
     /// A clip being dragged, and how far into it it was picked up, in ticks,
     /// so it moves with the pointer instead of jumping its start to it.
     drag: Option<(PlacementId, f64)>,
@@ -51,7 +53,7 @@ pub struct View {
 
 impl Default for View {
     fn default() -> Self {
-        Self { pixels_per_beat: 40.0, scroll: 0.0, scroll_y: 0.0, selected: None, drag: None }
+        Self { pixels_per_beat: 40.0, scroll: 0.0, scroll_y: 0.0, selected: None, open: None, drag: None }
     }
 }
 
@@ -139,6 +141,8 @@ pub struct Context<'a> {
     pub playhead: u64,
     pub playing: bool,
     pub peaks: &'a dyn Fn(AssetId) -> Option<Arc<Peaks>>,
+    /// Whether the keyboard is the timeline's: the last click was in it.
+    pub keys: bool,
 }
 
 pub fn show(ui: &mut Ui, project: &Project, view: &mut View, cx: &Context<'_>, actions: &mut Actions) {
@@ -211,7 +215,12 @@ pub fn show(ui: &mut Ui, project: &Project, view: &mut View, cx: &Context<'_>, a
         handle_clip(ui, response, project, placement, length, view, lanes, &tracks, actions);
     }
 
-    keyboard(ui, project, view, cx, actions);
+    if ui.input(|i| i.pointer.any_pressed()) && ui.rect_contains_pointer(rect) {
+        actions.keys_to_editor = Some(false);
+    }
+    if cx.keys {
+        keyboard(ui, project, view, cx, actions);
+    }
 
     // The playhead, over the clips.
     let head = lanes.left() + view.x_of(cx.timing.tick_of(cx.playhead));
@@ -372,6 +381,9 @@ fn handle_clip(
     let meter = project.meter();
     if response.clicked() || response.drag_started() {
         view.selected = Some(placement.id);
+    }
+    if response.double_clicked() && project.clip(placement.clip).is_some_and(|c| c.length().is_some()) {
+        view.open = Some(placement.id);
     }
     if response.drag_started()
         && let Some(pos) = response.interact_pointer_pos()

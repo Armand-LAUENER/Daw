@@ -7,6 +7,7 @@
 //! of the split: the engine is the part that has to stay still.
 
 mod clip;
+mod editor;
 mod import;
 mod layout;
 mod peaks;
@@ -180,6 +181,10 @@ struct App {
     /// Zoom, scroll and selection in the arrangement. Like the layout, a
     /// preference of whoever is looking: never in the project or its history.
     timeline: timeline::View,
+    /// The note editor, when a MIDI clip is open in it.
+    editor: Option<editor::Editor>,
+    /// Keys go to the editor rather than the timeline: the last click was there.
+    editor_keys: bool,
     /// Files already read, so a rebuild reuses what was decoded rather than
     /// reading it again.
     sources: FileSources,
@@ -270,6 +275,8 @@ impl App {
             show_layout: false,
             arrange: true,
             timeline: timeline::View::default(),
+            editor: None,
+            editor_keys: false,
             sources,
             transport,
             trouble: None,
@@ -427,6 +434,9 @@ impl App {
         if let Some(arrange) = actions.arrange {
             self.arrange = arrange;
         }
+        if let Some(editor) = actions.keys_to_editor {
+            self.editor_keys = editor;
+        }
         if actions.save {
             self.save();
         }
@@ -565,6 +575,33 @@ impl eframe::App for App {
             ui::status(ui, &theme, &health);
         });
 
+        // A clip double-clicked in the timeline opens here, under it, so the
+        // arrangement stays in sight while its notes are edited.
+        if let Some(placement) = self.timeline.open.take() {
+            self.editor = Some(editor::Editor::new(placement));
+            self.editor_keys = true;
+        }
+        if self.arrange
+            && let Some(open) = self.editor.as_mut()
+        {
+            let project = self.studio.project();
+            let cx = editor::Context {
+                theme: &theme,
+                timing: Timing::new(project.tempo(), self.sources.rate),
+                playhead: self.transport.clock().position(),
+                keys: self.editor_keys,
+            };
+            let still_open = egui::Panel::bottom("editor")
+                .resizable(true)
+                .default_size(280.0)
+                .show(root, |ui| editor::show(ui, project, open, &cx, &mut actions))
+                .inner;
+            if !still_open {
+                self.editor = None;
+                self.editor_keys = false;
+            }
+        }
+
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme.background)).show(root, |ui| {
             if self.arrange {
                 let project = self.studio.project();
@@ -576,6 +613,7 @@ impl eframe::App for App {
                     playhead: self.transport.clock().position(),
                     playing: self.transport.is_playing(),
                     peaks: &peaks,
+                    keys: !(self.editor.is_some() && self.editor_keys),
                 };
                 timeline::show(ui, project, &mut self.timeline, &cx, &mut actions);
             } else {

@@ -28,6 +28,10 @@ pub struct Actions {
     pub toggle_layout: bool,
     /// The arrangement (true) or the mixer (false) was chosen.
     pub arrange: Option<bool>,
+    /// Where the last click landed: in the note editor (true) or the
+    /// timeline (false). Keys go there, so Delete removes the note being
+    /// edited rather than the clip around it.
+    pub keys_to_editor: Option<bool>,
     /// The project is to be written to disk.
     pub save: bool,
     /// Play, pause, stop or seek. Not a [`Command`]: where the playhead is
