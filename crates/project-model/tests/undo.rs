@@ -49,6 +49,9 @@ enum Action {
     /// A band, a shape, and frequency, gain and Q over ranges wider than
     /// the valid ones.
     Eq(u8, u8, u8, f32, f32, f32),
+    /// A track, which effect, whether it is on, and a value over a range
+    /// wider than the valid ones.
+    Effect(u8, u8, bool, f32),
 }
 
 /// One of four files, by content. Few enough that tracks keep landing on the
@@ -88,6 +91,7 @@ fn action() -> impl Strategy<Value = Action> {
         1 => (0u8..40, 0u8..40).prop_map(|(b, u)| Action::Meter(b, u)),
         2 => (any::<u8>(), 0u8..6, 0u8..5, 1.0f32..30_000.0, -40.0f32..40.0, 0.0f32..25.0)
             .prop_map(|(t, band, shape, f, g, q)| Action::Eq(t, band, shape, f, g, q)),
+        2 => (any::<u8>(), 0u8..3, any::<bool>(), -2.0f32..2.0).prop_map(|(t, e, on, v)| Action::Effect(t, e, on, v)),
     ]
 }
 
@@ -130,6 +134,23 @@ fn to_command(project: &Project, action: &Action) -> Option<Command> {
             let shape = project_model::BandShape::ALL[usize::from(*shape) % 5];
             let value = project_model::EqBand { shape, freq: *freq, gain: *gain, q: *q, on: freq % 2.0 < 1.0 };
             Command::SetEqBand { track: pick(*t)?, band: *band, value }
+        }
+        Action::Effect(t, which, on, v) => {
+            let track = pick(*t)?;
+            match which {
+                0 => Command::SetCompressor {
+                    track,
+                    value: project_model::CompSettings { on: *on, ratio: 1.0 + v * 4.0, ..Default::default() },
+                },
+                1 => Command::SetDelay {
+                    track,
+                    value: project_model::DelaySettings { on: *on, feedback: *v, ..Default::default() },
+                },
+                _ => Command::SetReverb {
+                    track,
+                    value: project_model::ReverbSettings { on: *on, size: *v, ..Default::default() },
+                },
+            }
         }
         Action::AddAudio(t, f, s) => Command::AddAudioClip { track: pick(*t)?, asset: asset(*f), start: beats(*s) },
         Action::AddMidi(t, s, l) => {

@@ -303,3 +303,30 @@ fn the_sequencer_never_allocates_even_when_it_jumps() {
         });
     }
 }
+
+#[test]
+fn the_effects_never_allocate_while_playing_or_being_moved() {
+    // Their lines are all allocated when they are built; nothing after that
+    // may reach for more.
+    let settings = engine_dsp::CompressorSettings {
+        threshold_db: -20.0,
+        ratio: 4.0,
+        attack_ms: 5.0,
+        release_ms: 80.0,
+        makeup_db: 3.0,
+    };
+    let mut nodes: Vec<Box<dyn Node>> = vec![
+        Box::new(engine_core::Compress::new(settings, SR)),
+        Box::new(engine_core::Echo::new(CHANNELS, 12_000.0, 0.6, 0.4, SR)),
+        Box::new(engine_core::Room::new(CHANNELS, 0.7, 0.4, 0.3, SR)),
+    ];
+    let mut data = vec![0.3f32; MAX_FRAMES * CHANNELS];
+    assert_no_alloc(|| {
+        for block in 0..16u32 {
+            for node in &mut nodes {
+                node.set_param(block % 3, 0.5 + block as f32 * 0.01);
+                node.process(&mut AudioBuffer::new(&mut data, CHANNELS));
+            }
+        }
+    });
+}

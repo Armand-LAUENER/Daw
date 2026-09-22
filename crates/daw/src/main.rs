@@ -9,6 +9,7 @@
 mod clip;
 mod editor;
 mod eq_view;
+mod fx_view;
 mod import;
 mod layout;
 mod peaks;
@@ -207,6 +208,8 @@ struct App {
     editor_keys: bool,
     /// The track whose equaliser is open, in the mixer.
     eq_track: Option<project_model::TrackId>,
+    /// The track whose effects are open, in the mixer.
+    fx_track: Option<project_model::TrackId>,
     /// Files already read, so a rebuild reuses what was decoded rather than
     /// reading it again.
     sources: FileSources,
@@ -320,6 +323,7 @@ impl App {
             editor: None,
             editor_keys: false,
             eq_track: None,
+            fx_track: None,
             sources,
             transport,
             preview,
@@ -481,6 +485,9 @@ impl App {
         }
         if let Some(track) = actions.eq {
             self.eq_track = Some(track);
+        }
+        if let Some(track) = actions.fx {
+            self.fx_track = Some(track);
         }
         if let Some(editor) = actions.keys_to_editor {
             self.editor_keys = editor;
@@ -649,6 +656,21 @@ impl eframe::App for App {
                 .inner;
             if !still_open {
                 self.eq_track = None;
+            }
+        }
+
+        // A track's effects, under the mixer too.
+        if !self.arrange
+            && let Some(track) = self.fx_track
+        {
+            let project = self.studio.project();
+            let still_open = egui::Panel::bottom("fx")
+                .resizable(true)
+                .default_size(200.0)
+                .show(root, |ui| fx_view::show(ui, project, track, &theme, &mut actions))
+                .inner;
+            if !still_open {
+                self.fx_track = None;
             }
         }
 

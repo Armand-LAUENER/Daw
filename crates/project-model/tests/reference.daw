@@ -1,6 +1,6 @@
 {
   "format": "daw-project",
-  "version": 5,
+  "version": 6,
   "next_ids": {
     "track": 2,
     "clip": 2,
@@ -56,7 +56,27 @@
             "q": 0.70710677,
             "on": true
           }
-        ]
+        ],
+        "comp": {
+          "on": false,
+          "threshold": -18.0,
+          "ratio": 3.0,
+          "attack": 10.0,
+          "release": 120.0,
+          "makeup": 0.0
+        },
+        "delay": {
+          "on": false,
+          "time": 480,
+          "feedback": 0.35,
+          "mix": 0.25
+        },
+        "reverb": {
+          "on": false,
+          "size": 0.5,
+          "damping": 0.5,
+          "mix": 0.2
+        }
       },
       "1": {
         "id": 1,
@@ -95,7 +115,27 @@
             "q": 0.70710677,
             "on": true
           }
-        ]
+        ],
+        "comp": {
+          "on": false,
+          "threshold": -18.0,
+          "ratio": 3.0,
+          "attack": 10.0,
+          "release": 120.0,
+          "makeup": 0.0
+        },
+        "delay": {
+          "on": false,
+          "time": 480,
+          "feedback": 0.35,
+          "mix": 0.25
+        },
+        "reverb": {
+          "on": false,
+          "size": 0.5,
+          "damping": 0.5,
+          "mix": 0.2
+        }
       }
     },
     "clips": {

@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::history::Ids;
 use crate::{
-    Asset, AssetId, AudioWindow, BANDS, Clip, ClipId, Content, EqBand, Meter, NewClip, Note, NoteId, Placement,
-    PlacementId, Project, Source, Tempo, Tick, Track, TrackId, Window, time,
+    Asset, AssetId, AudioWindow, BANDS, Clip, ClipId, CompSettings, Content, DelaySettings, EqBand, Meter, NewClip,
+    Note, NoteId, Placement, PlacementId, Project, ReverbSettings, Source, Tempo, Tick, Track, TrackId, Window, time,
 };
 
 /// A change someone asked for.
@@ -76,6 +76,19 @@ pub enum Command {
         track: TrackId,
         band: u8,
         value: EqBand,
+    },
+    /// A track's compressor. Dragged, so one step per gesture.
+    SetCompressor {
+        track: TrackId,
+        value: CompSettings,
+    },
+    SetDelay {
+        track: TrackId,
+        value: DelaySettings,
+    },
+    SetReverb {
+        track: TrackId,
+        value: ReverbSettings,
     },
     /// Removes every placement on a track, keeping the track and its settings.
     ClearTrack {
@@ -185,7 +198,10 @@ impl Command {
             Self::SetWindow { id, .. } | Self::TrimPlacement { id, .. } => Some(Target(5, id.0)),
             Self::SetNote { id, .. } => Some(Target(6, id.0)),
             // One target per band, above every other kind.
-            Self::SetEqBand { track, band, .. } => Some(Target(8 + band, track.0)),
+            Self::SetEqBand { track, band, .. } => Some(Target(8u8.saturating_add(*band), track.0)),
+            Self::SetCompressor { track, .. } => Some(Target(200, track.0)),
+            Self::SetDelay { track, .. } => Some(Target(201, track.0)),
+            Self::SetReverb { track, .. } => Some(Target(202, track.0)),
             Self::AddTrack { .. }
             | Self::RemoveTrack { .. }
             | Self::RenameTrack { .. }
@@ -327,6 +343,18 @@ pub(crate) enum Edit {
         band: usize,
         value: EqBand,
     },
+    SetCompressor {
+        id: TrackId,
+        value: CompSettings,
+    },
+    SetDelay {
+        id: TrackId,
+        value: DelaySettings,
+    },
+    SetReverb {
+        id: TrackId,
+        value: ReverbSettings,
+    },
     SetClipName {
         id: ClipId,
         name: String,
@@ -457,6 +485,27 @@ pub(crate) fn resolve(project: &Project, ids: &mut Ids, command: Command) -> Res
                 return Err(CommandError::OutOfRange("an equaliser band"));
             }
             one(Edit::SetEqBand { id, band, value }, Edit::SetEqBand { id, band, value: was })
+        }
+        Command::SetCompressor { track: id, value } => {
+            let was = track(id)?.comp;
+            if !value.is_valid() {
+                return Err(CommandError::OutOfRange("a compressor setting"));
+            }
+            one(Edit::SetCompressor { id, value }, Edit::SetCompressor { id, value: was })
+        }
+        Command::SetDelay { track: id, value } => {
+            let was = track(id)?.delay;
+            if !value.is_valid() {
+                return Err(CommandError::OutOfRange("a delay setting"));
+            }
+            one(Edit::SetDelay { id, value }, Edit::SetDelay { id, value: was })
+        }
+        Command::SetReverb { track: id, value } => {
+            let was = track(id)?.reverb;
+            if !value.is_valid() {
+                return Err(CommandError::OutOfRange("a reverb setting"));
+            }
+            one(Edit::SetReverb { id, value }, Edit::SetReverb { id, value: was })
         }
         Command::ClearTrack { id } => {
             track(id)?;
@@ -738,6 +787,9 @@ fn apply_one(project: &mut Project, edit: &Edit) {
         Edit::SetTempo { tempo } => project.tempo = *tempo,
         Edit::SetMeter { meter } => project.meter = *meter,
         Edit::SetSource { id, source } => on(*id, &mut |t| t.source = *source),
+        Edit::SetCompressor { id, value } => on(*id, &mut |t| t.comp = *value),
+        Edit::SetDelay { id, value } => on(*id, &mut |t| t.delay = *value),
+        Edit::SetReverb { id, value } => on(*id, &mut |t| t.reverb = *value),
         Edit::SetEqBand { id, band, value } => on(*id, &mut |t| {
             if *band < BANDS {
                 t.eq[*band] = *value;

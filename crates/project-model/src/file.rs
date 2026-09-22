@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::history::Ids;
-use crate::{FORMAT_VERSION, Invalid, Meter, Project, Session, Tempo, default_eq};
+use crate::{
+    CompSettings, DelaySettings, FORMAT_VERSION, Invalid, Meter, Project, ReverbSettings, Session, Tempo, default_eq,
+};
 
 /// What the first field of every project file says, so a JSON file that
 /// happens to parse is not taken for a project.
@@ -235,6 +237,19 @@ fn migrate(value: &mut Value, from: u32) -> Result<(), FileError> {
                     .ok_or(FileError::NotAProject)?;
                 for track in tracks.values_mut().filter_map(Value::as_object_mut) {
                     track.insert("eq".into(), json!(default_eq()));
+                }
+            }
+            // Version 6 gave every track a compressor, a delay and a reverb,
+            // all off — which is how a track from before sounded.
+            5 => {
+                let tracks = project_of(value)?
+                    .get_mut("tracks")
+                    .and_then(Value::as_object_mut)
+                    .ok_or(FileError::NotAProject)?;
+                for track in tracks.values_mut().filter_map(Value::as_object_mut) {
+                    track.insert("comp".into(), json!(CompSettings::default()));
+                    track.insert("delay".into(), json!(DelaySettings::default()));
+                    track.insert("reverb".into(), json!(ReverbSettings::default()));
                 }
             }
             // Version 0 never existed: no file was written before the header.

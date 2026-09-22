@@ -37,6 +37,8 @@ pub struct Actions {
     pub preview: Option<(u8, u8)>,
     /// A track whose equaliser was asked for.
     pub eq: Option<TrackId>,
+    /// A track whose effects were asked for.
+    pub fx: Option<TrackId>,
     /// The project is to be written to disk.
     pub save: bool,
     /// Play, pause, stop or seek. Not a [`Command`]: where the playhead is
@@ -238,6 +240,11 @@ fn strip(
             let eq_colour = if shaped { theme.accent } else { theme.dim };
             if ui.add(egui::Button::new(RichText::new("EQ").color(eq_colour).small())).clicked() {
                 actions.eq = Some(id);
+            }
+            let effects_on = track.comp.on || track.delay.on || track.reverb.on;
+            let fx_colour = if effects_on { theme.accent } else { theme.dim };
+            if ui.add(egui::Button::new(RichText::new("FX").color(fx_colour).small())).clicked() {
+                actions.fx = Some(id);
             }
 
             ui.label(RichText::new("gain").color(theme.dim).small());

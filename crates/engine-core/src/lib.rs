@@ -11,6 +11,7 @@
 
 mod automation;
 mod buffer;
+mod effects;
 mod eq;
 mod event;
 mod graph;
@@ -24,6 +25,7 @@ mod transport;
 
 pub use automation::{AutomationQueue, AutomationSender, ParamEvent, ParamId, automation_channel};
 pub use buffer::AudioBuffer;
+pub use effects::{Compress, Echo, Room};
 pub use eq::{BandSettings, Eq};
 pub use event::{EventQueue, EventSender, Scheduled, event_channel};
 pub use graph::{Graph, GraphBuilder, GraphError, NodeId};

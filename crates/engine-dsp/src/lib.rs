@@ -5,8 +5,11 @@
 
 mod adsr;
 mod biquad;
+mod delay;
+mod dynamics;
 mod eq;
 mod oscillator;
+mod reverb;
 mod smoothed_biquad;
 mod smoother;
 #[cfg(test)]
@@ -14,7 +17,10 @@ mod test_util;
 
 pub use adsr::{Adsr, Stage};
 pub use biquad::{Biquad, Coefficients, FilterKind};
+pub use delay::{Delay, MAX_DELAY_S};
+pub use dynamics::{Compressor, CompressorSettings, reduction_db};
 pub use eq::{EQ_RAMP_MS, EqBand, Shape, coefficients};
 pub use oscillator::{Osc, SineOsc, Waveform};
+pub use reverb::Reverb;
 pub use smoothed_biquad::{DEFAULT_UPDATE_INTERVAL, SmoothedBiquad};
 pub use smoother::LinearSmoother;

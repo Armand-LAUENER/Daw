@@ -25,9 +25,10 @@ pub use plan::{AudioSpan, audio_spans, note_plan};
 pub use time::{Position, Timing};
 
 use engine_core::{
-    BandSettings, Eq, Gain, Graph, GraphBuilder, GraphError, Limiter, Mute, Node, NodeId, Pan, ParamId, Solo, SoloBus,
+    BandSettings, Compress, Echo, Eq, Gain, Graph, GraphBuilder, GraphError, Limiter, Mute, Node, NodeId, Pan, ParamId,
+    Room, Solo, SoloBus,
 };
-use engine_dsp::Shape;
+use engine_dsp::{CompressorSettings, Shape};
 use project_model::{BANDS, BandShape, Command, Project, Track, TrackId};
 
 /// The ceiling the master sits under.
@@ -46,6 +47,12 @@ pub struct TrackBinding {
     /// that is not needs the graph rebuilt.
     pub eq: NodeId,
     pub eq_built: [(BandShape, bool); BANDS],
+    /// Each effect's node, when it is on. An effect that is off is not in
+    /// the graph, so its settings have nowhere to go until it is switched on,
+    /// which rebuilds.
+    pub comp: Option<NodeId>,
+    pub delay: Option<NodeId>,
+    pub reverb: Option<NodeId>,
     pub gain: ParamId,
     pub pan: ParamId,
     pub muted: ParamId,
@@ -60,6 +67,9 @@ pub struct TrackBinding {
 #[derive(Debug, Clone, Default)]
 pub struct Bindings {
     master_gain: Option<ParamId>,
+    /// The tempo and rate the graph was built at, to turn a delay's ticks
+    /// into frames.
+    timing: Option<Timing>,
     tracks: Vec<TrackBinding>,
 }
 
@@ -115,13 +125,32 @@ pub fn compile(
             on: b.on,
         });
         let eq = builder.add(Box::new(Eq::new(&bands, channels, sample_rate)));
+        // The effects that are on, in order, after the equaliser.
+        let timing = Timing::new(project.tempo(), sample_rate as u32);
+        let comp = track.comp.on.then(|| builder.add(Box::new(Compress::new(comp_settings(&track.comp), sample_rate))));
+        let delay = track.delay.on.then(|| {
+            let d = &track.delay;
+            let time = timing.frame_of(d.time) as f32;
+            builder.add(Box::new(Echo::new(channels, time, d.feedback, d.mix, sample_rate)))
+        });
+        let reverb = track.reverb.on.then(|| {
+            let r = &track.reverb;
+            builder.add(Box::new(Room::new(channels, r.size, r.damping, r.mix, sample_rate)))
+        });
         let gain = builder.add(Box::new(Gain::new(track.gain, sample_rate)));
         let pan = builder.add(Box::new(Pan::new(track.pan, sample_rate)));
         let muted = builder.add(Box::new(Mute::new(track.muted, sample_rate)));
         let soloed = builder.add(Box::new(Solo::new(&bus, track.soloed, sample_rate)));
+        builder.connect(source, eq);
+        // Each effect that is on takes the chain's end; whatever is last feeds
+        // the fader.
+        let mut last = eq;
+        for effect in [comp, delay, reverb].into_iter().flatten() {
+            builder.connect(last, effect);
+            last = effect;
+        }
         builder
-            .connect(source, eq)
-            .connect(eq, gain)
+            .connect(last, gain)
             .connect(gain, pan)
             .connect(pan, muted)
             .connect(muted, soloed)
@@ -131,6 +160,9 @@ pub fn compile(
             id: track.id,
             eq,
             eq_built: track.eq.map(|b| (b.shape, b.on)),
+            comp,
+            delay,
+            reverb,
             gain: ParamId::new(gain, Gain::PARAM_GAIN),
             pan: ParamId::new(pan, Pan::PARAM_POSITION),
             muted: ParamId::new(muted, Mute::PARAM_MUTED),
@@ -142,8 +174,37 @@ pub fn compile(
     builder.connect(master, ceiling).output(ceiling);
 
     let graph = builder.build(channels, max_frames)?;
-    let bindings = Bindings { master_gain: Some(ParamId::new(master, Gain::PARAM_GAIN)), tracks };
+    let timing = Some(Timing::new(project.tempo(), sample_rate as u32));
+    let bindings = Bindings { master_gain: Some(ParamId::new(master, Gain::PARAM_GAIN)), timing, tracks };
     Ok(Compiled { graph: Box::new(graph), bindings })
+}
+
+/// How an effect's settings reach the engine: as parameters when it is in the
+/// graph and stays on, a rebuild when it is switched on or off, and nothing
+/// while it is off — there is nothing to hear.
+fn effect(
+    bindings: &Bindings,
+    track: TrackId,
+    on: bool,
+    node: impl Fn(&TrackBinding) -> Option<NodeId>,
+    params: impl Fn(NodeId) -> Vec<(ParamId, f32)>,
+) -> Change {
+    let Some(binding) = bindings.track(track) else { return Change::Rebuild };
+    match (node(binding), on) {
+        (Some(id), true) => Change::Params(params(id)),
+        (None, false) => Change::Nothing,
+        _ => Change::Rebuild,
+    }
+}
+
+fn comp_settings(c: &project_model::CompSettings) -> CompressorSettings {
+    CompressorSettings {
+        threshold_db: c.threshold,
+        ratio: c.ratio,
+        attack_ms: c.attack,
+        release_ms: c.release,
+        makeup_db: c.makeup,
+    }
 }
 
 /// The model's band shape as the DSP knows it. Two enums rather than one, so
@@ -170,15 +231,15 @@ pub fn band_gain_db(band: &project_model::EqBand, freq_hz: f32, sample_rate: f32
 }
 
 /// What the engine has to do about a command.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Change {
     /// Nothing the audio thread can hear. A name is not a sound.
     Nothing,
     /// Can be aimed at the graph that is already playing.
     Param { param: ParamId, value: f32 },
     /// Several values aimed at once — an equaliser band's frequency, gain and
-    /// Q — which only mean anything together.
-    Params([(ParamId, f32); 3]),
+    /// Q, a compressor's settings — which only mean anything together.
+    Params(Vec<(ParamId, f32)>),
     /// The graph is a different shape now and has to be built again.
     Rebuild,
 }
@@ -227,7 +288,7 @@ pub fn route(bindings: &Bindings, command: &Command) -> Change {
             match bindings.track(*track) {
                 Some(b) if b.eq_built.get(band_index) == Some(&(value.shape, value.on)) => {
                     let param = |which| ParamId::new(b.eq, Eq::param(band_index, which));
-                    Change::Params([
+                    Change::Params(vec![
                         (param(Eq::PARAM_FREQ), value.freq),
                         (param(Eq::PARAM_GAIN), value.gain),
                         (param(Eq::PARAM_Q), value.q),
@@ -239,6 +300,27 @@ pub fn route(bindings: &Bindings, command: &Command) -> Change {
                 _ => Change::Rebuild,
             }
         }
+        Command::SetCompressor { track, value } => effect(bindings, *track, value.on, |b| b.comp, |node| {
+            let p = |which| ParamId::new(node, which);
+            vec![
+                (p(Compress::PARAM_THRESHOLD), value.threshold),
+                (p(Compress::PARAM_RATIO), value.ratio),
+                (p(Compress::PARAM_ATTACK), value.attack),
+                (p(Compress::PARAM_RELEASE), value.release),
+                (p(Compress::PARAM_MAKEUP), value.makeup),
+            ]
+        }),
+        // The time is sent in ticks' worth of frames at the tempo the graph
+        // was built for; a new tempo rebuilds, and recomputes it.
+        Command::SetDelay { track, value } => effect(bindings, *track, value.on, |b| b.delay, |node| {
+            let p = |which| ParamId::new(node, which);
+            let time = bindings.timing.map_or(0.0, |t| t.frame_of(value.time) as f32);
+            vec![(p(Echo::PARAM_TIME), time), (p(Echo::PARAM_FEEDBACK), value.feedback), (p(Echo::PARAM_MIX), value.mix)]
+        }),
+        Command::SetReverb { track, value } => effect(bindings, *track, value.on, |b| b.reverb, |node| {
+            let p = |which| ParamId::new(node, which);
+            vec![(p(Room::PARAM_SIZE), value.size), (p(Room::PARAM_DAMPING), value.damping), (p(Room::PARAM_MIX), value.mix)]
+        }),
         Command::SetMasterGain { gain } => {
             bindings.master_gain().map_or(Change::Rebuild, |param| Change::Param { param, value: *gain })
         }

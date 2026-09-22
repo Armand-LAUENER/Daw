@@ -22,6 +22,7 @@
 mod arrangement;
 mod asset;
 mod command;
+mod effects;
 mod eq;
 mod file;
 mod history;
@@ -36,6 +37,7 @@ use serde::{Deserialize, Serialize};
 pub use arrangement::{AudioWindow, Clip, ClipId, Content, NewClip, Note, NoteId, Placement, PlacementId, Window};
 pub use asset::{Asset, AssetId};
 pub use command::{Command, CommandError};
+pub use effects::{CompSettings, DelaySettings, ReverbSettings};
 pub use eq::{BANDS, BandShape, EqBand, default_eq};
 pub use file::FileError;
 pub use history::Session;
@@ -47,7 +49,7 @@ pub use time::{Meter, PPQ, Tempo, Tick};
 /// written. Adding a version to a format that already has files in the wild
 /// means guessing what the unversioned ones were, and that guess is always
 /// wrong for somebody.
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 
 /// Identifies a track for the life of a project.
 ///
@@ -90,11 +92,27 @@ pub struct Track {
     pub source: Source,
     /// Applied before the fader, in band order.
     pub eq: [EqBand; BANDS],
+    /// After the equaliser, in this order: dynamics first, then the space.
+    pub comp: CompSettings,
+    pub delay: DelaySettings,
+    pub reverb: ReverbSettings,
 }
 
 impl Track {
     pub fn new(id: TrackId, name: impl Into<String>, source: Source) -> Self {
-        Self { id, name: name.into(), gain: 1.0, pan: 0.0, muted: false, soloed: false, source, eq: default_eq() }
+        Self {
+            id,
+            name: name.into(),
+            gain: 1.0,
+            pan: 0.0,
+            muted: false,
+            soloed: false,
+            source,
+            eq: default_eq(),
+            comp: CompSettings::default(),
+            delay: DelaySettings::default(),
+            reverb: ReverbSettings::default(),
+        }
     }
 }
 
@@ -282,6 +300,9 @@ impl Project {
             }
             if !track.eq.iter().all(EqBand::is_valid) {
                 return Err(Invalid::OutOfRange("an equaliser band"));
+            }
+            if !(track.comp.is_valid() && track.delay.is_valid() && track.reverb.is_valid()) {
+                return Err(Invalid::OutOfRange("an effect's settings"));
             }
         }
         for (key, clip) in &self.clips {

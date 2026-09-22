@@ -271,3 +271,49 @@ fn moving_a_band_is_parameters_but_reshaping_it_is_a_rebuild() {
     let off = project_model::EqBand { on: false, ..band };
     assert_eq!(route(&compiled.bindings, &Command::SetEqBand { track: id, band: 1, value: off }), Change::Rebuild);
 }
+
+#[test]
+fn effects_that_are_on_are_in_the_chain() {
+    let dry = {
+        let mut compiled = build(&with_tracks(1));
+        settled(&mut compiled, 8).0
+    };
+
+    // A hard compressor far under the level: the track comes out quieter.
+    let mut session = with_tracks(1);
+    let id = ids(&session)[0];
+    let comp = project_model::CompSettings { on: true, threshold: -40.0, ratio: 20.0, ..Default::default() };
+    session.apply(Command::SetCompressor { track: id, value: comp }).unwrap();
+    let mut compiled = build(&session);
+    let squashed = settled(&mut compiled, 200).0;
+    assert!(squashed < dry * 0.3, "compressed {squashed}, dry {dry}");
+
+    // An echo on a constant adds its repeats to it: louder, once they arrive.
+    let mut session = with_tracks(1);
+    let id = ids(&session)[0];
+    let echo = project_model::DelaySettings { on: true, ..Default::default() };
+    session.apply(Command::SetDelay { track: id, value: echo }).unwrap();
+    let mut compiled = build(&session);
+    let echoed = settled(&mut compiled, 400).0;
+    assert!(echoed > dry * 1.1, "echoed {echoed}, dry {dry}");
+}
+
+#[test]
+fn an_effects_settings_are_parameters_while_it_stays_on() {
+    let mut session = with_tracks(1);
+    let id = ids(&session)[0];
+    let off = project_model::CompSettings::default();
+    let compiled = build(&session);
+    // Off, and staying off: nothing to hear.
+    assert_eq!(route(&compiled.bindings, &Command::SetCompressor { track: id, value: off }), Change::Nothing);
+    // Switched on: a rebuild.
+    let on = project_model::CompSettings { on: true, ..off };
+    assert_eq!(route(&compiled.bindings, &Command::SetCompressor { track: id, value: on }), Change::Rebuild);
+
+    session.apply(Command::SetCompressor { track: id, value: on }).unwrap();
+    let compiled = build(&session);
+    let moved = project_model::CompSettings { threshold: -30.0, ..on };
+    assert!(
+        matches!(route(&compiled.bindings, &Command::SetCompressor { track: id, value: moved }), Change::Params(p) if p.len() == 5)
+    );
+}
