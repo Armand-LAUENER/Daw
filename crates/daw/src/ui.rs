@@ -35,6 +35,8 @@ pub struct Actions {
     /// A note to hear, as pitch and velocity: one just placed, picked up, or
     /// moved to another pitch in the editor.
     pub preview: Option<(u8, u8)>,
+    /// A track whose equaliser was asked for.
+    pub eq: Option<TrackId>,
     /// The project is to be written to disk.
     pub save: bool,
     /// Play, pause, stop or seek. Not a [`Command`]: where the playhead is
@@ -229,6 +231,13 @@ fn strip(
                 .min_size(egui::vec2(layout.switch_width, 0.0));
             if ui.add(solo).clicked() {
                 actions.commands.push(Command::SetSoloed { id, soloed: !track.soloed });
+            }
+            // Lit when any band is doing something, so a shaped track can be
+            // told from a flat one at a glance.
+            let shaped = track.eq.iter().any(|b| b.on && (!b.shape.has_gain() || b.gain != 0.0));
+            let eq_colour = if shaped { theme.accent } else { theme.dim };
+            if ui.add(egui::Button::new(RichText::new("EQ").color(eq_colour).small())).clicked() {
+                actions.eq = Some(id);
             }
 
             ui.label(RichText::new("gain").color(theme.dim).small());

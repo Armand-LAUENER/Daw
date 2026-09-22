@@ -116,6 +116,15 @@ impl<E: Engine> Studio<E> {
                     self.owed_rebuild = true;
                 }
             }
+            Change::Params(params) => {
+                // All of them, even after one is refused: a rebuild is owed
+                // either way, and the rest landing now is closer meanwhile.
+                for (param, value) in params {
+                    if !self.engine.send(param, value) {
+                        self.owed_rebuild = true;
+                    }
+                }
+            }
         }
         Ok(())
     }

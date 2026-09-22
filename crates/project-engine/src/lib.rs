@@ -24,8 +24,11 @@ mod time;
 pub use plan::{AudioSpan, audio_spans, note_plan};
 pub use time::{Position, Timing};
 
-use engine_core::{Gain, Graph, GraphBuilder, GraphError, Limiter, Mute, Node, Pan, ParamId, Solo, SoloBus};
-use project_model::{Command, Project, Track, TrackId};
+use engine_core::{
+    BandSettings, Eq, Gain, Graph, GraphBuilder, GraphError, Limiter, Mute, Node, NodeId, Pan, ParamId, Solo, SoloBus,
+};
+use engine_dsp::Shape;
+use project_model::{BANDS, BandShape, Command, Project, Track, TrackId};
 
 /// The ceiling the master sits under.
 ///
@@ -38,6 +41,11 @@ pub const CEILING: f32 = 0.95;
 #[derive(Debug, Clone, Copy)]
 pub struct TrackBinding {
     pub id: TrackId,
+    /// The equaliser, and the shape and state each band was built with: a
+    /// band still built the same way can take new values as parameters, one
+    /// that is not needs the graph rebuilt.
+    pub eq: NodeId,
+    pub eq_built: [(BandShape, bool); BANDS],
     pub gain: ParamId,
     pub pan: ParamId,
     pub muted: ParamId,
@@ -99,12 +107,21 @@ pub fn compile(
         let source = builder.add(source_for(track));
         // Built at the values the project already holds, so a compiled graph
         // starts where the model is rather than ramping towards it.
+        let bands = track.eq.map(|b| BandSettings {
+            shape: dsp_shape(b.shape),
+            freq_hz: b.freq,
+            gain_db: b.gain,
+            q: b.q,
+            on: b.on,
+        });
+        let eq = builder.add(Box::new(Eq::new(&bands, channels, sample_rate)));
         let gain = builder.add(Box::new(Gain::new(track.gain, sample_rate)));
         let pan = builder.add(Box::new(Pan::new(track.pan, sample_rate)));
         let muted = builder.add(Box::new(Mute::new(track.muted, sample_rate)));
         let soloed = builder.add(Box::new(Solo::new(&bus, track.soloed, sample_rate)));
         builder
-            .connect(source, gain)
+            .connect(source, eq)
+            .connect(eq, gain)
             .connect(gain, pan)
             .connect(pan, muted)
             .connect(muted, soloed)
@@ -112,6 +129,8 @@ pub fn compile(
 
         tracks.push(TrackBinding {
             id: track.id,
+            eq,
+            eq_built: track.eq.map(|b| (b.shape, b.on)),
             gain: ParamId::new(gain, Gain::PARAM_GAIN),
             pan: ParamId::new(pan, Pan::PARAM_POSITION),
             muted: ParamId::new(muted, Mute::PARAM_MUTED),
@@ -127,6 +146,29 @@ pub fn compile(
     Ok(Compiled { graph: Box::new(graph), bindings })
 }
 
+/// The model's band shape as the DSP knows it. Two enums rather than one, so
+/// the saved format and the filter code can each change without the other.
+fn dsp_shape(shape: BandShape) -> Shape {
+    match shape {
+        BandShape::LowCut => Shape::LowCut,
+        BandShape::LowShelf => Shape::LowShelf,
+        BandShape::Bell => Shape::Bell,
+        BandShape::HighShelf => Shape::HighShelf,
+        BandShape::HighCut => Shape::HighCut,
+    }
+}
+
+/// What one band does at `freq_hz`, in dB — from the same coefficients the
+/// compiled graph uses, so a curve drawn from this is what is heard. A band
+/// that is off does nothing.
+pub fn band_gain_db(band: &project_model::EqBand, freq_hz: f32, sample_rate: f32) -> f32 {
+    if !band.on {
+        return 0.0;
+    }
+    let coefficients = engine_dsp::coefficients(dsp_shape(band.shape), band.freq, band.gain, band.q, sample_rate);
+    20.0 * coefficients.magnitude(freq_hz, sample_rate).max(1e-9).log10()
+}
+
 /// What the engine has to do about a command.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Change {
@@ -134,6 +176,9 @@ pub enum Change {
     Nothing,
     /// Can be aimed at the graph that is already playing.
     Param { param: ParamId, value: f32 },
+    /// Several values aimed at once — an equaliser band's frequency, gain and
+    /// Q — which only mean anything together.
+    Params([(ParamId, f32); 3]),
     /// The graph is a different shape now and has to be built again.
     Rebuild,
 }
@@ -177,6 +222,23 @@ pub fn route(bindings: &Bindings, command: &Command) -> Change {
         Command::SetPan { id, pan } => aimed(*id, |b| b.pan, pan.clamp(-1.0, 1.0)),
         Command::SetMuted { id, muted } => aimed(*id, |b| b.muted, flag(*muted)),
         Command::SetSoloed { id, soloed } => aimed(*id, |b| b.soloed, flag(*soloed)),
+        Command::SetEqBand { track, band, value } => {
+            let band_index = usize::from(*band);
+            match bindings.track(*track) {
+                Some(b) if b.eq_built.get(band_index) == Some(&(value.shape, value.on)) => {
+                    let param = |which| ParamId::new(b.eq, Eq::param(band_index, which));
+                    Change::Params([
+                        (param(Eq::PARAM_FREQ), value.freq),
+                        (param(Eq::PARAM_GAIN), value.gain),
+                        (param(Eq::PARAM_Q), value.q),
+                    ])
+                }
+                // A different shape, or a band switched on or off, is a
+                // different filter: rebuilt, and crossfaded, rather than
+                // jumped to.
+                _ => Change::Rebuild,
+            }
+        }
         Command::SetMasterGain { gain } => {
             bindings.master_gain().map_or(Change::Rebuild, |param| Change::Param { param, value: *gain })
         }

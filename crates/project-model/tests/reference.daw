@@ -1,6 +1,6 @@
 {
   "format": "daw-project",
-  "version": 4,
+  "version": 5,
   "next_ids": {
     "track": 2,
     "clip": 2,
@@ -26,7 +26,37 @@
         "pan": 0.0,
         "muted": false,
         "soloed": false,
-        "source": "clips"
+        "source": "clips",
+        "eq": [
+          {
+            "shape": "low_shelf",
+            "freq": 100.0,
+            "gain": 0.0,
+            "q": 0.70710677,
+            "on": true
+          },
+          {
+            "shape": "bell",
+            "freq": 500.0,
+            "gain": 0.0,
+            "q": 1.0,
+            "on": true
+          },
+          {
+            "shape": "bell",
+            "freq": 2000.0,
+            "gain": 0.0,
+            "q": 1.0,
+            "on": true
+          },
+          {
+            "shape": "high_shelf",
+            "freq": 8000.0,
+            "gain": 0.0,
+            "q": 0.70710677,
+            "on": true
+          }
+        ]
       },
       "1": {
         "id": 1,
@@ -35,7 +65,37 @@
         "pan": -0.3,
         "muted": false,
         "soloed": false,
-        "source": "tone"
+        "source": "tone",
+        "eq": [
+          {
+            "shape": "low_shelf",
+            "freq": 100.0,
+            "gain": 0.0,
+            "q": 0.70710677,
+            "on": true
+          },
+          {
+            "shape": "bell",
+            "freq": 500.0,
+            "gain": 0.0,
+            "q": 1.0,
+            "on": true
+          },
+          {
+            "shape": "bell",
+            "freq": 2000.0,
+            "gain": 0.0,
+            "q": 1.0,
+            "on": true
+          },
+          {
+            "shape": "high_shelf",
+            "freq": 8000.0,
+            "gain": 0.0,
+            "q": 0.70710677,
+            "on": true
+          }
+        ]
       }
     },
     "clips": {

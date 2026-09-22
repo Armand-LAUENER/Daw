@@ -8,6 +8,7 @@
 
 mod clip;
 mod editor;
+mod eq_view;
 mod import;
 mod layout;
 mod peaks;
@@ -204,6 +205,8 @@ struct App {
     editor: Option<editor::Editor>,
     /// Keys go to the editor rather than the timeline: the last click was there.
     editor_keys: bool,
+    /// The track whose equaliser is open, in the mixer.
+    eq_track: Option<project_model::TrackId>,
     /// Files already read, so a rebuild reuses what was decoded rather than
     /// reading it again.
     sources: FileSources,
@@ -316,6 +319,7 @@ impl App {
             timeline: timeline::View::default(),
             editor: None,
             editor_keys: false,
+            eq_track: None,
             sources,
             transport,
             preview,
@@ -475,6 +479,9 @@ impl App {
         if let Some(arrange) = actions.arrange {
             self.arrange = arrange;
         }
+        if let Some(track) = actions.eq {
+            self.eq_track = Some(track);
+        }
         if let Some(editor) = actions.keys_to_editor {
             self.editor_keys = editor;
         }
@@ -628,6 +635,22 @@ impl eframe::App for App {
             };
             ui::status(ui, &theme, &health);
         });
+
+        // A track's equaliser, under the mixer.
+        if !self.arrange
+            && let Some(track) = self.eq_track
+        {
+            let project = self.studio.project();
+            let rate = self.sources.sample_rate;
+            let still_open = egui::Panel::bottom("eq")
+                .resizable(true)
+                .default_size(340.0)
+                .show(root, |ui| eq_view::show(ui, project, track, &theme, rate, &mut actions))
+                .inner;
+            if !still_open {
+                self.eq_track = None;
+            }
+        }
 
         // A clip double-clicked in the timeline opens here, under it, so the
         // arrangement stays in sight while its notes are edited.

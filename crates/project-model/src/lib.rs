@@ -22,6 +22,7 @@
 mod arrangement;
 mod asset;
 mod command;
+mod eq;
 mod file;
 mod history;
 mod id;
@@ -35,6 +36,7 @@ use serde::{Deserialize, Serialize};
 pub use arrangement::{AudioWindow, Clip, ClipId, Content, NewClip, Note, NoteId, Placement, PlacementId, Window};
 pub use asset::{Asset, AssetId};
 pub use command::{Command, CommandError};
+pub use eq::{BANDS, BandShape, EqBand, default_eq};
 pub use file::FileError;
 pub use history::Session;
 pub use time::{Meter, PPQ, Tempo, Tick};
@@ -45,7 +47,7 @@ pub use time::{Meter, PPQ, Tempo, Tick};
 /// written. Adding a version to a format that already has files in the wild
 /// means guessing what the unversioned ones were, and that guess is always
 /// wrong for somebody.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// Identifies a track for the life of a project.
 ///
@@ -86,11 +88,13 @@ pub struct Track {
     /// where they are, which is what lets a person hear what a setting does
     /// and come back to their material.
     pub source: Source,
+    /// Applied before the fader, in band order.
+    pub eq: [EqBand; BANDS],
 }
 
 impl Track {
     pub fn new(id: TrackId, name: impl Into<String>, source: Source) -> Self {
-        Self { id, name: name.into(), gain: 1.0, pan: 0.0, muted: false, soloed: false, source }
+        Self { id, name: name.into(), gain: 1.0, pan: 0.0, muted: false, soloed: false, source, eq: default_eq() }
     }
 }
 
@@ -275,6 +279,9 @@ impl Project {
             }
             if !(-1.0..=1.0).contains(&track.pan) {
                 return Err(Invalid::OutOfRange("a pan position"));
+            }
+            if !track.eq.iter().all(EqBand::is_valid) {
+                return Err(Invalid::OutOfRange("an equaliser band"));
             }
         }
         for (key, clip) in &self.clips {

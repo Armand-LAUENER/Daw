@@ -47,6 +47,9 @@ const REFERENCE: &str = include_str!("reference.daw");
 /// Version 3 as it was written, before audio placements had a window.
 const VERSION_3: &str = include_str!("version_3.daw");
 
+/// Version 4 as it was written, before tracks had an equaliser.
+const VERSION_4: &str = include_str!("version_4.daw");
+
 fn demo() -> Session {
     let mut session = Session::new();
     let kick = Asset::new(AssetId::of_bytes(b"kick"), folder().join("audio").join("kick.wav"));
@@ -197,10 +200,12 @@ fn older_files_open_as_the_project_they_always_were() {
 }
 
 #[test]
-fn a_version_3_file_opens_as_the_same_project() {
-    let session = Session::from_json(VERSION_3, Some(&folder())).unwrap();
-    assert_eq!(session.project(), demo_v3().project());
-    assert_eq!(session.to_json(Some(&folder())), REFERENCE);
+fn versions_3_and_4_open_as_the_same_project() {
+    for (version, text) in [(3, VERSION_3), (4, VERSION_4)] {
+        let session = Session::from_json(text, Some(&folder())).unwrap();
+        assert_eq!(session.project(), demo_v3().project(), "version {version}");
+        assert_eq!(session.to_json(Some(&folder())), REFERENCE, "version {version}");
+    }
 }
 
 #[test]

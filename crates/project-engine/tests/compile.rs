@@ -233,3 +233,41 @@ fn the_source_survives_being_undone_and_redone() {
     session.redo();
     assert_eq!(session.project().track(id).unwrap().source, source);
 }
+
+#[test]
+fn a_tracks_equaliser_is_in_its_chain() {
+    // The test source is a constant: DC. A low cut removes it entirely, which
+    // it can only do if the equaliser sits between the source and the output.
+    let mut session = with_tracks(1);
+    let id = ids(&session)[0];
+    let cut =
+        project_model::EqBand { shape: project_model::BandShape::LowCut, freq: 80.0, gain: 0.0, q: 0.707, on: true };
+    session.apply(Command::SetEqBand { track: id, band: 0, value: cut }).unwrap();
+    let mut compiled = build(&session);
+    let (left, _) = settled(&mut compiled, 400);
+    assert!(left.abs() < 1e-3, "DC came through a low cut: {left}");
+
+    // And the default bands, flat, leave the level exactly as it was.
+    let mut flat = build(&with_tracks(1));
+    let (left, _) = settled(&mut flat, 8);
+    assert!((left - LEVEL * std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-4, "a flat equaliser changed the level");
+}
+
+#[test]
+fn moving_a_band_is_parameters_but_reshaping_it_is_a_rebuild() {
+    let session = with_tracks(1);
+    let id = ids(&session)[0];
+    let compiled = build(&session);
+    let band = session.project().track(id).unwrap().eq[1];
+
+    let moved = project_model::EqBand { freq: 1_200.0, gain: 4.0, ..band };
+    assert!(matches!(
+        route(&compiled.bindings, &Command::SetEqBand { track: id, band: 1, value: moved }),
+        Change::Params(_)
+    ));
+
+    let reshaped = project_model::EqBand { shape: project_model::BandShape::HighCut, ..band };
+    assert_eq!(route(&compiled.bindings, &Command::SetEqBand { track: id, band: 1, value: reshaped }), Change::Rebuild);
+    let off = project_model::EqBand { on: false, ..band };
+    assert_eq!(route(&compiled.bindings, &Command::SetEqBand { track: id, band: 1, value: off }), Change::Rebuild);
+}

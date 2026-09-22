@@ -3038,6 +3038,7 @@ name = "project-engine"
 version = "0.1.0"
 dependencies = [
  "engine-core",
+ "engine-dsp",
  "project-model",
  "proptest",
 ]

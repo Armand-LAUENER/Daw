@@ -5,6 +5,7 @@
 
 mod adsr;
 mod biquad;
+mod eq;
 mod oscillator;
 mod smoothed_biquad;
 mod smoother;
@@ -13,6 +14,7 @@ mod test_util;
 
 pub use adsr::{Adsr, Stage};
 pub use biquad::{Biquad, Coefficients, FilterKind};
+pub use eq::{EQ_RAMP_MS, EqBand, Shape, coefficients};
 pub use oscillator::{Osc, SineOsc, Waveform};
 pub use smoothed_biquad::{DEFAULT_UPDATE_INTERVAL, SmoothedBiquad};
 pub use smoother::LinearSmoother;

@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::history::Ids;
 use crate::{
-    Asset, AssetId, AudioWindow, Clip, ClipId, Content, Meter, NewClip, Note, NoteId, Placement, PlacementId, Project,
-    Source, Tempo, Tick, Track, TrackId, Window, time,
+    Asset, AssetId, AudioWindow, BANDS, Clip, ClipId, Content, EqBand, Meter, NewClip, Note, NoteId, Placement,
+    PlacementId, Project, Source, Tempo, Tick, Track, TrackId, Window, time,
 };
 
 /// A change someone asked for.
@@ -69,6 +69,13 @@ pub enum Command {
     SetSource {
         id: TrackId,
         source: Source,
+    },
+    /// One band of a track's equaliser. Dragged, so a sweep is one step per
+    /// band.
+    SetEqBand {
+        track: TrackId,
+        band: u8,
+        value: EqBand,
     },
     /// Removes every placement on a track, keeping the track and its settings.
     ClearTrack {
@@ -177,6 +184,8 @@ impl Command {
             Self::MovePlacement { id, .. } => Some(Target(4, id.0)),
             Self::SetWindow { id, .. } | Self::TrimPlacement { id, .. } => Some(Target(5, id.0)),
             Self::SetNote { id, .. } => Some(Target(6, id.0)),
+            // One target per band, above every other kind.
+            Self::SetEqBand { track, band, .. } => Some(Target(8 + band, track.0)),
             Self::AddTrack { .. }
             | Self::RemoveTrack { .. }
             | Self::RenameTrack { .. }
@@ -313,6 +322,11 @@ pub(crate) enum Edit {
         id: TrackId,
         source: Source,
     },
+    SetEqBand {
+        id: TrackId,
+        band: usize,
+        value: EqBand,
+    },
     SetClipName {
         id: ClipId,
         name: String,
@@ -435,6 +449,14 @@ pub(crate) fn resolve(project: &Project, ids: &mut Ids, command: Command) -> Res
         Command::SetSource { id, source } => {
             let was = track(id)?.source;
             one(Edit::SetSource { id, source }, Edit::SetSource { id, source: was })
+        }
+        Command::SetEqBand { track: id, band, value } => {
+            let band = usize::from(band);
+            let was = *track(id)?.eq.get(band).ok_or(CommandError::OutOfRange("a band number"))?;
+            if !value.is_valid() {
+                return Err(CommandError::OutOfRange("an equaliser band"));
+            }
+            one(Edit::SetEqBand { id, band, value }, Edit::SetEqBand { id, band, value: was })
         }
         Command::ClearTrack { id } => {
             track(id)?;
@@ -716,6 +738,11 @@ fn apply_one(project: &mut Project, edit: &Edit) {
         Edit::SetTempo { tempo } => project.tempo = *tempo,
         Edit::SetMeter { meter } => project.meter = *meter,
         Edit::SetSource { id, source } => on(*id, &mut |t| t.source = *source),
+        Edit::SetEqBand { id, band, value } => on(*id, &mut |t| {
+            if *band < BANDS {
+                t.eq[*band] = *value;
+            }
+        }),
         Edit::SetClipName { id, name } => {
             if let Some(clip) = project.clips.get_mut(id) {
                 clip.name.clone_from(name);

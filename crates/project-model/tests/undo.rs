@@ -46,6 +46,9 @@ enum Action {
     /// tempos are exercised too.
     Tempo(u32),
     Meter(u8, u8),
+    /// A band, a shape, and frequency, gain and Q over ranges wider than
+    /// the valid ones.
+    Eq(u8, u8, u8, f32, f32, f32),
 }
 
 /// One of four files, by content. Few enough that tracks keep landing on the
@@ -83,6 +86,8 @@ fn action() -> impl Strategy<Value = Action> {
         1 => any::<(u8, u8)>().prop_map(|(c, n)| Action::RemoveNote(c, n)),
         1 => (0u32..1_200_000).prop_map(Action::Tempo),
         1 => (0u8..40, 0u8..40).prop_map(|(b, u)| Action::Meter(b, u)),
+        2 => (any::<u8>(), 0u8..6, 0u8..5, 1.0f32..30_000.0, -40.0f32..40.0, 0.0f32..25.0)
+            .prop_map(|(t, band, shape, f, g, q)| Action::Eq(t, band, shape, f, g, q)),
     ]
 }
 
@@ -121,6 +126,11 @@ fn to_command(project: &Project, action: &Action) -> Option<Command> {
         Action::Mute(i, muted) => Command::SetMuted { id: pick(*i)?, muted: *muted },
         Action::Solo(i, soloed) => Command::SetSoloed { id: pick(*i)?, soloed: *soloed },
         Action::Master(gain) => Command::SetMasterGain { gain: *gain },
+        Action::Eq(t, band, shape, freq, gain, q) => {
+            let shape = project_model::BandShape::ALL[usize::from(*shape) % 5];
+            let value = project_model::EqBand { shape, freq: *freq, gain: *gain, q: *q, on: freq % 2.0 < 1.0 };
+            Command::SetEqBand { track: pick(*t)?, band: *band, value }
+        }
         Action::AddAudio(t, f, s) => Command::AddAudioClip { track: pick(*t)?, asset: asset(*f), start: beats(*s) },
         Action::AddMidi(t, s, l) => {
             Command::AddMidiClip { track: pick(*t)?, name: "midi".into(), start: beats(*s), length: quarters(*l) }

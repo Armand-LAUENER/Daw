@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::history::Ids;
-use crate::{FORMAT_VERSION, Invalid, Meter, Project, Session, Tempo};
+use crate::{FORMAT_VERSION, Invalid, Meter, Project, Session, Tempo, default_eq};
 
 /// What the first field of every project file says, so a JSON file that
 /// happens to parse is not taken for a project.
@@ -224,6 +224,17 @@ fn migrate(value: &mut Value, from: u32) -> Result<(), FileError> {
                     .ok_or(FileError::NotAProject)?;
                 for placement in placements.values_mut().filter_map(Value::as_object_mut) {
                     placement.insert("audio".into(), Value::Null);
+                }
+            }
+            // Version 5 gave every track an equaliser. A track from before had
+            // none, which is what the default's flat bands sound like.
+            4 => {
+                let tracks = project_of(value)?
+                    .get_mut("tracks")
+                    .and_then(Value::as_object_mut)
+                    .ok_or(FileError::NotAProject)?;
+                for track in tracks.values_mut().filter_map(Value::as_object_mut) {
+                    track.insert("eq".into(), json!(default_eq()));
                 }
             }
             // Version 0 never existed: no file was written before the header.

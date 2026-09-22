@@ -11,6 +11,7 @@
 
 mod automation;
 mod buffer;
+mod eq;
 mod event;
 mod graph;
 mod limiter;
@@ -23,6 +24,7 @@ mod transport;
 
 pub use automation::{AutomationQueue, AutomationSender, ParamEvent, ParamId, automation_channel};
 pub use buffer::AudioBuffer;
+pub use eq::{BandSettings, Eq};
 pub use event::{EventQueue, EventSender, Scheduled, event_channel};
 pub use graph::{Graph, GraphBuilder, GraphError, NodeId};
 pub use limiter::{LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_MS, Limiter};

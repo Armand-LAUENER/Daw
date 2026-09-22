@@ -60,6 +60,67 @@ impl Coefficients {
         Self::normalised(b, -(1.0 + cos_w0), b, 1.0 + alpha, -2.0 * cos_w0, 1.0 - alpha)
     }
 
+    /// A bell: `gain_db` at `centre_hz`, returning to unity either side. `q`
+    /// sets the width — about an octave between the half-gain points at 1.4.
+    pub fn peak(centre_hz: f32, q: f32, gain_db: f32, sample_rate: f32) -> Self {
+        let (cos_w0, alpha) = rbj_terms(centre_hz, q, sample_rate);
+        let a = amplitude(gain_db);
+        Self::normalised(
+            1.0 + alpha * a,
+            -2.0 * cos_w0,
+            1.0 - alpha * a,
+            1.0 + alpha / a,
+            -2.0 * cos_w0,
+            1.0 - alpha / a,
+        )
+    }
+
+    /// Everything below `corner_hz` raised or lowered by `gain_db`, half of it
+    /// at the corner. `q` of `1/sqrt(2)` is the steepest slope without a bump.
+    pub fn low_shelf(corner_hz: f32, q: f32, gain_db: f32, sample_rate: f32) -> Self {
+        let (cos_w0, alpha) = rbj_terms(corner_hz, q, sample_rate);
+        let a = amplitude(gain_db);
+        let root = 2.0 * a.sqrt() * alpha;
+        Self::normalised(
+            a * ((a + 1.0) - (a - 1.0) * cos_w0 + root),
+            2.0 * a * ((a - 1.0) - (a + 1.0) * cos_w0),
+            a * ((a + 1.0) - (a - 1.0) * cos_w0 - root),
+            (a + 1.0) + (a - 1.0) * cos_w0 + root,
+            -2.0 * ((a - 1.0) + (a + 1.0) * cos_w0),
+            (a + 1.0) + (a - 1.0) * cos_w0 - root,
+        )
+    }
+
+    /// Everything above `corner_hz` raised or lowered by `gain_db`: the mirror
+    /// of [`Coefficients::low_shelf`].
+    pub fn high_shelf(corner_hz: f32, q: f32, gain_db: f32, sample_rate: f32) -> Self {
+        let (cos_w0, alpha) = rbj_terms(corner_hz, q, sample_rate);
+        let a = amplitude(gain_db);
+        let root = 2.0 * a.sqrt() * alpha;
+        Self::normalised(
+            a * ((a + 1.0) + (a - 1.0) * cos_w0 + root),
+            -2.0 * a * ((a - 1.0) + (a + 1.0) * cos_w0),
+            a * ((a + 1.0) + (a - 1.0) * cos_w0 - root),
+            (a + 1.0) - (a - 1.0) * cos_w0 + root,
+            2.0 * ((a - 1.0) - (a + 1.0) * cos_w0),
+            (a + 1.0) - (a - 1.0) * cos_w0 - root,
+        )
+    }
+
+    /// How much these coefficients scale a sine at `freq_hz`, worked out from
+    /// the transfer function rather than measured. What an EQ curve on screen
+    /// is drawn from, so it shows exactly what will be heard.
+    pub fn magnitude(&self, freq_hz: f32, sample_rate: f32) -> f32 {
+        let w = 2.0 * PI * f64::from(freq_hz) / f64::from(sample_rate);
+        let (cos1, sin1, cos2, sin2) = (w.cos(), w.sin(), (2.0 * w).cos(), (2.0 * w).sin());
+        let (b0, b1, b2) = (f64::from(self.b0), f64::from(self.b1), f64::from(self.b2));
+        let (a1, a2) = (f64::from(self.a1), f64::from(self.a2));
+        // H(e^-jw) = (b0 + b1 e^-jw + b2 e^-2jw) / (1 + a1 e^-jw + a2 e^-2jw)
+        let (num_re, num_im) = (b0 + b1 * cos1 + b2 * cos2, -(b1 * sin1 + b2 * sin2));
+        let (den_re, den_im) = (1.0 + a1 * cos1 + a2 * cos2, -(a1 * sin1 + a2 * sin2));
+        ((num_re * num_re + num_im * num_im) / (den_re * den_re + den_im * den_im)).sqrt() as f32
+    }
+
     /// The per-sample increment that walks `self` onto `target` in `samples`.
     ///
     /// Coefficients are recomputed only every so many samples, because each one
@@ -96,6 +157,12 @@ impl Coefficients {
             a2: (a2 * inv_a0) as f32,
         }
     }
+}
+
+/// The RBJ `A`: the square root of the linear gain, which is what a bell or
+/// a shelf is built around.
+fn amplitude(gain_db: f32) -> f64 {
+    10f64.powf(f64::from(gain_db) / 40.0)
 }
 
 /// The two terms every RBJ filter is built from: `cos(w0)` and `alpha`.
