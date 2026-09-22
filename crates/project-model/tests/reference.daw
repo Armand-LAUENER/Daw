@@ -1,6 +1,6 @@
 {
   "format": "daw-project",
-  "version": 3,
+  "version": 4,
   "next_ids": {
     "track": 2,
     "clip": 2,
@@ -76,14 +76,16 @@
         "clip": 0,
         "track": 0,
         "start": 0,
-        "window": null
+        "window": null,
+        "audio": null
       },
       "1": {
         "id": 1,
         "clip": 1,
         "track": 1,
         "start": 0,
-        "window": null
+        "window": null,
+        "audio": null
       },
       "2": {
         "id": 2,
@@ -93,7 +95,8 @@
         "window": {
           "offset": 0,
           "length": 1920
-        }
+        },
+        "audio": null
       }
     },
     "assets": {

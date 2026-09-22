@@ -193,7 +193,7 @@ fn trimming_the_front_keeps_the_notes_where_they_were_in_time() {
     let (clip, placement) = midi_clip(&mut session, track);
     session.apply(Command::AddNote { clip, note: Note::new(60, 100, Tick(1_920), Tick(960)) }).unwrap();
     let window = Some(project_model::Window { offset: Tick(960), length: Tick(2_880) });
-    session.apply(Command::TrimPlacement { id: placement, start: Tick(960), window }).unwrap();
+    session.apply(Command::TrimPlacement { id: placement, start: Tick(960), window, audio: None }).unwrap();
     let p = *session.project().placement(placement).unwrap();
     // The note is 1 920 into the clip; the window starts 960 in, placed at 960:
     // it still sounds at 960 + (1 920 - 960) = 1 920 on the timeline.
@@ -202,9 +202,40 @@ fn trimming_the_front_keeps_the_notes_where_they_were_in_time() {
     // A trim and then a trim again is one gesture.
     let depth = session.depth();
     let window = Some(project_model::Window { offset: Tick(0), length: Tick(1_920) });
-    session.apply(Command::TrimPlacement { id: placement, start: Tick(0), window }).unwrap();
+    session.apply(Command::TrimPlacement { id: placement, start: Tick(0), window, audio: None }).unwrap();
     assert_eq!(session.depth(), depth, "a trim continuing the same gesture took a new step");
 
     let outside = Some(project_model::Window { offset: Tick(3_000), length: Tick(960) });
-    assert!(session.apply(Command::TrimPlacement { id: placement, start: Tick(0), window: outside }).is_err());
+    assert!(
+        session.apply(Command::TrimPlacement { id: placement, start: Tick(0), window: outside, audio: None }).is_err()
+    );
+}
+
+#[test]
+fn an_audio_window_goes_on_audio_clips_only() {
+    let (mut session, track) = with_track();
+    let asset = Asset::new(AssetId::of_bytes(b"x"), "/a/x.wav");
+    session.apply(Command::AddAudioClip { track, asset, start: Tick(0) }).unwrap();
+    let audio_placement = session.project().placements_on(track)[0].id;
+    let (_, midi_placement) = midi_clip(&mut session, track);
+
+    let audio = Some(project_model::AudioWindow { offset: 4_800, length: 48_000, rate: 48_000 });
+    session.apply(Command::TrimPlacement { id: audio_placement, start: Tick(960), window: None, audio }).unwrap();
+    assert_eq!(session.project().placement(audio_placement).unwrap().audio, audio);
+    session.check().unwrap();
+
+    assert!(
+        session.apply(Command::TrimPlacement { id: midi_placement, start: Tick(0), window: None, audio }).is_err(),
+        "a MIDI clip was given an audio window"
+    );
+    let empty = Some(project_model::AudioWindow { offset: 0, length: 0, rate: 48_000 });
+    let refused = Command::TrimPlacement { id: audio_placement, start: Tick(0), window: None, audio: empty };
+    assert!(session.apply(refused).is_err());
+}
+
+#[test]
+fn an_audio_window_means_the_same_moment_at_any_rate() {
+    let window = project_model::AudioWindow { offset: 44_100, length: 22_050, rate: 44_100 };
+    assert_eq!(window.at(48_000), (48_000, 24_000));
+    assert_eq!(window.at(44_100), (44_100, 22_050));
 }

@@ -79,14 +79,32 @@ impl Node for Silence {
 /// Clips that overlap are summed, as two regions on one track would be heard
 /// in any case; which one wins is a question for the editor, not the engine.
 pub struct Lane {
-    /// Start frame and audio, earliest first.
-    clips: Vec<(u64, Shared)>,
+    /// Each clip's part of its file, earliest first.
+    clips: Vec<Played>,
     /// Where the timeline is. Read once per block, lock-free.
     clock: Arc<Clock>,
 }
 
+/// One clip on a lane: a file, where it starts on the timeline, and which part
+/// of the file it plays.
+pub struct Played {
+    pub audio: Shared,
+    pub start: u64,
+    pub offset: u64,
+    /// `None` plays to the end of the file.
+    pub length: Option<u64>,
+}
+
+impl Played {
+    /// Frames it plays: its length, cut short by the end of the file.
+    fn frames(&self) -> u64 {
+        let rest = (self.audio.frames() as u64).saturating_sub(self.offset);
+        self.length.map_or(rest, |l| l.min(rest))
+    }
+}
+
 impl Lane {
-    pub fn new(clips: Vec<(u64, Shared)>, clock: Arc<Clock>) -> Self {
+    pub fn new(clips: Vec<Played>, clock: Arc<Clock>) -> Self {
         Self { clips, clock }
     }
 }
@@ -101,18 +119,19 @@ impl Node for Lane {
         let now = self.clock.position();
         let block_end = now + frames as u64;
 
-        for (start, audio) in &self.clips {
+        for clip in &self.clips {
+            let (audio, start) = (&clip.audio, clip.start);
             let source_channels = usize::from(audio.channels);
-            let total = audio.frames() as u64;
-            if source_channels == 0 || *start >= block_end || start + total <= now {
+            let total = clip.frames();
+            if source_channels == 0 || start >= block_end || start + total <= now {
                 continue;
             }
-            // Where in the block the clip begins, and where in the file.
+            // Where in the block the clip begins, and where in its part.
             let first = start.saturating_sub(now) as usize;
-            let into = now.saturating_sub(*start) as usize;
+            let into = now.saturating_sub(start) as usize;
             let count = (frames - first).min(total as usize - into);
             for frame in 0..count {
-                let position = into + frame;
+                let position = clip.offset as usize + into + frame;
                 for channel in 0..channels {
                     // A mono file feeds both sides; a file with more channels
                     // than the graph has keeps the ones that fit. Neither is a
@@ -170,7 +189,10 @@ mod tests {
     }
 
     fn lane(clips: Vec<(u64, Shared)>, clock: Arc<Clock>) -> Lane {
-        Lane::new(clips, clock)
+        Lane::new(
+            clips.into_iter().map(|(start, audio)| Played { audio, start, offset: 0, length: None }).collect(),
+            clock,
+        )
     }
 
     #[test]
@@ -207,6 +229,24 @@ mod tests {
         let (clock, _t) = clock_at(10);
         let mut clip = lane(vec![(0, audio(vec![1.0, 2.0, 3.0], 1))], clock);
         assert!(render(&mut clip, 4, 1).iter().all(|s| *s == 0.0), "a file played past its end");
+    }
+
+    #[test]
+    fn a_trimmed_clip_plays_only_its_part() {
+        // Frames 2..5 of the file, placed at frame 1.
+        let (clock, _t) = clock_at(0);
+        let played =
+            Played { audio: audio(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 1), start: 1, offset: 2, length: Some(3) };
+        let mut clip = Lane::new(vec![played], clock);
+        assert_eq!(render(&mut clip, 6, 1), vec![0.0, 3.0, 4.0, 5.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_window_past_the_end_of_the_file_stops_at_the_file() {
+        let (clock, _t) = clock_at(0);
+        let played = Played { audio: audio(vec![1.0, 2.0, 3.0], 1), start: 0, offset: 1, length: Some(99) };
+        let mut clip = Lane::new(vec![played], clock);
+        assert_eq!(render(&mut clip, 4, 1), vec![2.0, 3.0, 0.0, 0.0]);
     }
 
     #[test]

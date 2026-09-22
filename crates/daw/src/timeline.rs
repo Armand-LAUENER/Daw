@@ -17,7 +17,9 @@ use std::sync::Arc;
 use eframe::egui::{self, Align2, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
 use engine_core::TransportCommand;
 use project_engine::Timing;
-use project_model::{AssetId, Command, Content, Meter, PPQ, Placement, PlacementId, Project, Tick, TrackId, Window};
+use project_model::{
+    AssetId, AudioWindow, Command, Content, Meter, PPQ, Placement, PlacementId, Project, Tick, TrackId, Window,
+};
 
 use crate::peaks::Peaks;
 use crate::theme::Theme;
@@ -166,6 +168,59 @@ pub fn trim_start(
     (Tick(new_start), window(new_offset, end - new_start, clip))
 }
 
+/// The part of its file an audio placement plays, as offset and length in
+/// frames at `rate`, cut short by the end of a file `file` frames long.
+fn audio_part(placement: &Placement, file: u64, rate: u32) -> (u64, u64) {
+    let (offset, length) = placement.audio.map_or((0, file), |w| w.at(rate));
+    let offset = offset.min(file);
+    (offset, length.min(file - offset))
+}
+
+/// An audio window, or `None` when it is the whole file.
+fn audio_window(offset: u64, length: u64, file: u64, rate: u32) -> Option<AudioWindow> {
+    (offset != 0 || length < file).then_some(AudioWindow { offset, length, rate })
+}
+
+/// The end of an audio placement dragged to the frame `pointer`: at least
+/// `min` frames long, and never past the end of the file.
+pub fn trim_audio_end(start: u64, offset: u64, file: u64, pointer: u64, min: u64) -> u64 {
+    let room = file.saturating_sub(offset).max(1);
+    pointer.saturating_sub(start).clamp(min.clamp(1, room), room)
+}
+
+/// The start of an audio placement dragged to the tick `pointer`, its end
+/// staying where it is in time and the file's offset moving by the same
+/// frames, so what is heard stays where it was. Returns the new start, offset
+/// and length.
+///
+/// The start is a tick and the offset a frame, so the start is settled first
+/// and the offset worked out from the frame that tick actually falls on — the
+/// sound cannot slide by the rounding between the two.
+pub fn trim_audio_start(
+    start: Tick,
+    offset: u64,
+    length: u64,
+    pointer: Tick,
+    min: u64,
+    timing: Timing,
+) -> (Tick, u64, u64) {
+    let at = timing.frame_of(start);
+    let end = at + length;
+    let earliest = at.saturating_sub(offset);
+    let latest = end.saturating_sub(min.max(1)).max(earliest);
+    let wanted = timing.frame_of(pointer).clamp(earliest, latest);
+    // Back to a tick, then forward to the first frame not before `earliest`.
+    let mut tick = timing.tick_of(wanted);
+    if timing.frame_of(tick) < earliest {
+        tick.0 += 1;
+    }
+    let frame = timing.frame_of(tick);
+    if frame >= end {
+        return (start, offset, length);
+    }
+    (tick, offset + frame - earliest - (at - earliest), end - frame)
+}
+
 /// How long a placement is on the timeline, in ticks.
 ///
 /// A MIDI clip knows its length; an audio clip lasts as long as its file,
@@ -180,9 +235,14 @@ fn length_of(
     let Some(clip) = project.clip(placement.clip) else { return 0 };
     match &clip.content {
         Content::Midi { length, .. } => placement.window.map_or(length.0, |w| w.length.0),
-        Content::Audio { asset } => {
-            peaks(*asset).map_or(project.meter().bar_length().0, |p| timing.tick_of(p.frames()).0.max(1))
-        }
+        Content::Audio { asset } => match peaks(*asset) {
+            Some(peaks) => {
+                let (_, frames) = audio_part(placement, peaks.frames(), timing.sample_rate);
+                let start = timing.frame_of(placement.start);
+                timing.tick_of(start + frames).0.saturating_sub(placement.start.0).max(1)
+            }
+            None => project.meter().bar_length().0,
+        },
     }
 }
 
@@ -266,7 +326,7 @@ pub fn show(ui: &mut Ui, project: &Project, view: &mut View, cx: &Context<'_>, a
 
         let response =
             ui.interact(body.intersect(lanes), ui.id().with(("placement", placement.id.0)), Sense::click_and_drag());
-        handle_clip(ui, response, project, placement, length, view, lanes, &tracks, actions);
+        handle_clip(ui, response, project, placement, length, view, lanes, &tracks, cx, actions);
     }
 
     if ui.input(|i| i.pointer.any_pressed()) && ui.rect_contains_pointer(rect) {
@@ -354,7 +414,10 @@ fn draw_clip(
     let inner = body.shrink2(Vec2::new(2.0, 16.0)).translate(Vec2::new(0.0, 6.0));
     match &clip.content {
         Content::Audio { asset } => match (cx.peaks)(*asset) {
-            Some(peaks) => draw_waveform(painter, &peaks, inner, body, cx),
+            Some(peaks) => {
+                let part = audio_part(placement, peaks.frames(), cx.timing.sample_rate);
+                draw_waveform(painter, &peaks, part, inner, body, cx);
+            }
             // Named by the project but not read: say so where it is drawn.
             None => {
                 painter.text(
@@ -401,17 +464,19 @@ fn draw_clip(
     );
 }
 
-fn draw_waveform(painter: &egui::Painter, peaks: &Peaks, inner: Rect, body: Rect, cx: &Context<'_>) {
+/// Draws the part of a file a placement plays, `(offset, length)` in frames,
+/// across the clip's body.
+fn draw_waveform(painter: &egui::Painter, peaks: &Peaks, part: (u64, u64), inner: Rect, body: Rect, cx: &Context<'_>) {
     let visible = body.intersect(painter.clip_rect());
     let centre = inner.center().y;
     let half = inner.height() / 2.0;
-    let frames_per_pixel = peaks.frames() as f64 / f64::from(body.width().max(1.0));
+    let frames_per_pixel = part.1 as f64 / f64::from(body.width().max(1.0));
     let colour = cx.theme.accent.gamma_multiply(0.8);
     // One line per visible pixel, from the lowest sample under it to the highest.
     let mut x = visible.left().floor();
     while x < visible.right() {
-        let from = ((f64::from(x - body.left())) * frames_per_pixel).max(0.0) as u64;
-        let to = ((f64::from(x + 1.0 - body.left())) * frames_per_pixel).ceil() as u64;
+        let from = part.0 + ((f64::from(x - body.left())) * frames_per_pixel).max(0.0) as u64;
+        let to = part.0 + ((f64::from(x + 1.0 - body.left())) * frames_per_pixel).ceil() as u64;
         if let Some((low, high)) = peaks.range(from, to.max(from + 1)) {
             let (top, bottom) = (centre - high.clamp(-1.0, 1.0) * half, centre - low.clamp(-1.0, 1.0) * half);
             painter.line_segment([Pos2::new(x, top), Pos2::new(x, bottom.max(top + 1.0))], Stroke::new(1.0, colour));
@@ -430,6 +495,7 @@ fn handle_clip(
     view: &mut View,
     lanes: Rect,
     tracks: &[TrackId],
+    cx: &Context<'_>,
     actions: &mut Actions,
 ) {
     let meter = project.meter();
@@ -439,11 +505,13 @@ fn handle_clip(
     if response.double_clicked() && project.clip(placement.clip).is_some_and(|c| c.length().is_some()) {
         view.open = Some(placement.id);
     }
-    // A MIDI clip's ends trim it; audio clips have no window to trim yet.
+    // Either end of a clip trims it: a MIDI clip in ticks, an audio clip in
+    // frames — once its file has been read, since its length is the file's.
     let clip_length = project.clip(placement.clip).and_then(|c| c.length()).map(|l| l.0);
+    let file = project.clip(placement.clip).and_then(|c| c.asset()).and_then(|a| (cx.peaks)(a)).map(|p| p.frames());
     let edge = |pos: Pos2| {
         let body = response.rect;
-        clip_length.and_then(|_| {
+        clip_length.or(file).and_then(|_| {
             if pos.x <= body.left() + EDGE {
                 Some(Drag::TrimStart { id: placement.id })
             } else if pos.x >= body.right() - EDGE {
@@ -481,19 +549,56 @@ fn handle_clip(
                     actions.commands.push(Command::MovePlacement { id, track, start });
                 }
             }
-            Some(Drag::TrimEnd { id }) if id == placement.id => {
-                let window = trim_end(placement.start, offset, clip_length.unwrap_or(length), pointer, grid);
-                if window != placement.window {
-                    actions.commands.push(Command::TrimPlacement { id, start: placement.start, window });
+            Some(Drag::TrimEnd { id }) if id == placement.id => match (clip_length, file) {
+                (Some(clip), _) => {
+                    let window = trim_end(placement.start, offset, clip, pointer, grid);
+                    if window != placement.window {
+                        actions.commands.push(Command::TrimPlacement {
+                            id,
+                            start: placement.start,
+                            window,
+                            audio: None,
+                        });
+                    }
                 }
-            }
-            Some(Drag::TrimStart { id }) if id == placement.id => {
-                let clip = clip_length.unwrap_or(length);
-                let (start, window) = trim_start(placement.start, offset, played, clip, pointer, grid);
-                if start != placement.start || window != placement.window {
-                    actions.commands.push(Command::TrimPlacement { id, start, window });
+                (None, Some(file)) => {
+                    let rate = cx.timing.sample_rate;
+                    let (offset, _) = audio_part(placement, file, rate);
+                    let end = cx.timing.frame_of(snap(pointer, grid));
+                    let min = cx.timing.frame_of(Tick(grid.unwrap_or(1)));
+                    let length = trim_audio_end(cx.timing.frame_of(placement.start), offset, file, end, min);
+                    let audio = audio_window(offset, length, file, rate);
+                    if audio != placement.audio {
+                        actions.commands.push(Command::TrimPlacement {
+                            id,
+                            start: placement.start,
+                            window: None,
+                            audio,
+                        });
+                    }
                 }
-            }
+                _ => {}
+            },
+            Some(Drag::TrimStart { id }) if id == placement.id => match (clip_length, file) {
+                (Some(clip), _) => {
+                    let (start, window) = trim_start(placement.start, offset, played, clip, pointer, grid);
+                    if start != placement.start || window != placement.window {
+                        actions.commands.push(Command::TrimPlacement { id, start, window, audio: None });
+                    }
+                }
+                (None, Some(file)) => {
+                    let rate = cx.timing.sample_rate;
+                    let (offset, length) = audio_part(placement, file, rate);
+                    let min = cx.timing.frame_of(Tick(grid.unwrap_or(1)));
+                    let (start, offset, length) =
+                        trim_audio_start(placement.start, offset, length, snap(pointer, grid), min, cx.timing);
+                    let audio = audio_window(offset, length, file, rate);
+                    if start != placement.start || audio != placement.audio {
+                        actions.commands.push(Command::TrimPlacement { id, start, window: None, audio });
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -726,6 +831,49 @@ mod tests {
         // Pushed up to the end: a grid step is left.
         let (late, w) = trim_start(Tick(3_840), 0, 3_840, 3_840, 99_999.0, Some(960));
         assert_eq!((late, w.map(|w| w.length)), (Tick(6_720), Some(Tick(960))));
+    }
+
+    fn at_120() -> Timing {
+        // A beat is 24 000 frames, a tick 25.
+        Timing::new(project_model::Tempo::default(), 48_000)
+    }
+
+    #[test]
+    fn trimming_an_audio_clips_end_stays_inside_the_file() {
+        // A four-second file placed at frame 96 000.
+        let file = 192_000;
+        assert_eq!(trim_audio_end(96_000, 0, file, 96_000 + 48_000, 24_000), 48_000);
+        assert_eq!(trim_audio_end(96_000, 0, file, 999_999, 24_000), file, "stretched past the file's end");
+        assert_eq!(trim_audio_end(96_000, 0, file, 0, 24_000), 24_000, "trimmed to nothing");
+        assert_eq!(trim_audio_end(96_000, 48_000, file, 999_999, 1), file - 48_000);
+    }
+
+    #[test]
+    fn trimming_an_audio_clips_front_keeps_the_sound_where_it_was() {
+        let timing = at_120();
+        // The whole file at bar 2 (frame 96 000); the front dragged a beat on.
+        let (start, offset, length) = trim_audio_start(Tick(3_840), 0, 192_000, Tick(4_800), 1, timing);
+        assert_eq!((start, offset, length), (Tick(4_800), 24_000, 168_000));
+        // What was at file frame 24 000 still plays at timeline frame 120 000.
+        assert_eq!(timing.frame_of(start) - offset, 96_000);
+
+        // Pulled back before the file's own start: it stops at the file's start.
+        let (start, offset, length) = trim_audio_start(Tick(4_800), 24_000, 168_000, Tick(0), 1, timing);
+        assert_eq!((start, offset, length), (Tick(3_840), 0, 192_000));
+    }
+
+    #[test]
+    fn a_front_trim_never_slides_the_sound_by_a_rounding() {
+        // At 44.1 kHz and 128.5 BPM a tick is not a whole number of frames,
+        // so the offset has to come from the frame the new start lands on.
+        let timing = Timing::new(project_model::Tempo::from_bpm(128.5).unwrap(), 44_100);
+        let start = Tick(3_840);
+        let at = timing.frame_of(start);
+        for pointer in [3_841u64, 3_900, 4_321, 5_000] {
+            let (new, offset, length) = trim_audio_start(start, 0, 441_000, Tick(pointer), 1, timing);
+            assert_eq!(timing.frame_of(new) - offset, at, "the sound slid when trimmed to {pointer}");
+            assert_eq!(timing.frame_of(new) + length, at + 441_000, "the end moved");
+        }
     }
 
     #[test]

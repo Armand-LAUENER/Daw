@@ -123,6 +123,32 @@ pub struct Window {
     pub length: Tick,
 }
 
+/// The part of an audio file a placement plays: from `offset` into the file,
+/// for `length`, both in frames counted at `rate`.
+///
+/// Real time, not ticks: a recording lasts the same whatever the tempo, so
+/// the part of it that is kept must too. The rate is written with the frames
+/// rather than assumed, so the window means the same moment in the file on any
+/// machine — exact at the rate it was made at, converted once, in whole
+/// numbers, at any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioWindow {
+    pub offset: u64,
+    pub length: u64,
+    pub rate: u32,
+}
+
+impl AudioWindow {
+    /// Offset and length in frames at another rate, rounded to the nearest.
+    pub fn at(&self, rate: u32) -> (u64, u64) {
+        let convert = |frames: u64| {
+            let (num, den) = (u128::from(frames) * u128::from(rate), u128::from(self.rate.max(1)));
+            u64::try_from((num + den / 2) / den).unwrap_or(u64::MAX)
+        };
+        (convert(self.offset), convert(self.length))
+    }
+}
+
 /// A clip put on a track at a moment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Placement {
@@ -130,9 +156,11 @@ pub struct Placement {
     pub clip: ClipId,
     pub track: TrackId,
     pub start: Tick,
-    /// `None` plays the whole clip. Only a MIDI clip can be windowed: an audio
-    /// clip has no length in ticks to window.
+    /// The part of a MIDI clip played, in ticks. `None` plays all of it.
     pub window: Option<Window>,
+    /// The part of an audio clip's file played, in real time. `None` plays
+    /// the whole file. Each kind of clip has only its own kind of window.
+    pub audio: Option<AudioWindow>,
 }
 
 /// A clip made together with the track it goes on, placed at the start.

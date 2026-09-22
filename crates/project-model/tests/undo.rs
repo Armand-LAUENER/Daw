@@ -133,7 +133,7 @@ fn to_command(project: &Project, action: &Action) -> Option<Command> {
         }
         Action::Trim(p, s, o, l) => {
             let window = (*l != 0).then(|| Window { offset: quarters(*o), length: quarters(*l) });
-            Command::TrimPlacement { id: placement(*p)?, start: beats(*s), window }
+            Command::TrimPlacement { id: placement(*p)?, start: beats(*s), window, audio: None }
         }
         Action::Duplicate(p, t, s, linked) => {
             Command::DuplicatePlacement { id: placement(*p)?, track: pick(*t)?, start: beats(*s), linked: *linked }

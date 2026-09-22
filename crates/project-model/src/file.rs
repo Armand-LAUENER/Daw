@@ -215,6 +215,17 @@ fn migrate(value: &mut Value, from: u32) -> Result<(), FileError> {
                 next.insert("placement".into(), json!(made));
                 next.insert("note".into(), json!(0));
             }
+            // Version 4 gave placements of audio clips a window of their own,
+            // in real time. Nothing was trimmed before it existed.
+            3 => {
+                let placements = project_of(value)?
+                    .get_mut("placements")
+                    .and_then(Value::as_object_mut)
+                    .ok_or(FileError::NotAProject)?;
+                for placement in placements.values_mut().filter_map(Value::as_object_mut) {
+                    placement.insert("audio".into(), Value::Null);
+                }
+            }
             // Version 0 never existed: no file was written before the header.
             _ => return Err(FileError::NotAProject),
         }

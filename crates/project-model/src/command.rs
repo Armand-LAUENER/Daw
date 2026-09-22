@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::history::Ids;
 use crate::{
-    Asset, AssetId, Clip, ClipId, Content, Meter, NewClip, Note, NoteId, Placement, PlacementId, Project, Source,
-    Tempo, Tick, Track, TrackId, Window, time,
+    Asset, AssetId, AudioWindow, Clip, ClipId, Content, Meter, NewClip, Note, NoteId, Placement, PlacementId, Project,
+    Source, Tempo, Tick, Track, TrackId, Window, time,
 };
 
 /// A change someone asked for.
@@ -103,10 +103,14 @@ pub enum Command {
     /// Trims a placement from either end in one gesture: a new start and a new
     /// window together, so trimming the front moves the start and the offset
     /// by the same amount and the notes stay where they were in time.
+    ///
+    /// `window` trims a MIDI clip, `audio` an audio clip; each must be `None`
+    /// on the other kind.
     TrimPlacement {
         id: PlacementId,
         start: Tick,
         window: Option<Window>,
+        audio: Option<AudioWindow>,
     },
     /// Puts a placement's clip somewhere else too. Linked, the new placement
     /// plays the same clip and follows its edits; not linked, it gets a copy of
@@ -473,10 +477,16 @@ pub(crate) fn resolve(project: &Project, ids: &mut Ids, command: Command) -> Res
             let now = Placement { window, ..was };
             one(Edit::SetPlacement { placement: now }, Edit::SetPlacement { placement: was })
         }
-        Command::TrimPlacement { id, start, window } => {
+        Command::TrimPlacement { id, start, window, audio } => {
             let was = placement(id)?;
-            window_fits(clip(was.clip)?, window)?;
-            let now = Placement { start, window, ..was };
+            let trimmed = clip(was.clip)?;
+            window_fits(trimmed, window)?;
+            if let Some(audio) = audio
+                && (trimmed.asset().is_none() || audio.length == 0 || audio.rate == 0)
+            {
+                return Err(CommandError::OutOfRange("an audio window"));
+            }
+            let now = Placement { start, window, audio, ..was };
             one(Edit::SetPlacement { placement: now }, Edit::SetPlacement { placement: was })
         }
         Command::DuplicatePlacement { id, track: to, start, linked } => {
@@ -619,7 +629,7 @@ impl Change {
 
     /// Adds a clip and one placement of it.
     fn place(&mut self, ids: &mut Ids, clip: Clip, track: TrackId, start: Tick) {
-        let placement = Placement { id: ids.take_placement(), clip: clip.id, track, start, window: None };
+        let placement = Placement { id: ids.take_placement(), clip: clip.id, track, start, window: None, audio: None };
         let (clip_id, placement_id) = (clip.id, placement.id);
         self.push(Edit::InsertClip { clip }, Edit::RemoveClip { id: clip_id });
         self.push(Edit::InsertPlacement { placement }, Edit::RemovePlacement { id: placement_id });

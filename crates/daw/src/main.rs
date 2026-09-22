@@ -27,10 +27,10 @@ use engine_core::{
 };
 use engine_dsp::{Adsr, SineOsc, Waveform};
 use engine_io::{AudioEngine, EngineOptions, Stats, default_output_config, map_frames};
-use project_engine::{Position, Timing, audio_starts, note_plan};
+use project_engine::{Position, Timing, audio_spans, note_plan};
 use project_model::{Asset, Command, NewClip, Project, Session, Source, Track};
 
-use clip::{Lane, Layers, Library, Silence};
+use clip::{Lane, Layers, Library, Played, Silence};
 use layout::Layout;
 use studio::{Engine, Sources, Studio};
 use theme::Theme;
@@ -96,10 +96,13 @@ impl Sources for FileSources {
             // like a track that had quietly gone missing.
             Source::Clips => {
                 let timing = Timing::new(project.tempo(), self.rate);
-                let starts = audio_starts(project, track.id, timing);
+                let starts = audio_spans(project, track.id, timing);
                 let clips: Vec<_> = starts
                     .iter()
-                    .filter_map(|(asset, start)| Some((*start, self.library.get(&project.asset(*asset)?.path)?)))
+                    .filter_map(|span| {
+                        let audio = self.library.get(&project.asset(span.asset)?.path)?;
+                        Some(Played { audio, start: span.start, offset: span.offset, length: span.length })
+                    })
                     .collect();
                 // Clips the library could not read: the tone says so audibly.
                 if clips.len() < starts.len() {

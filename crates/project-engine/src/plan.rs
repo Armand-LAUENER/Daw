@@ -13,12 +13,35 @@ use project_model::{AssetId, Content, Project, Tick, TrackId};
 
 use crate::Timing;
 
-/// Where each audio clip on a track starts, earliest first.
-pub fn audio_starts(project: &Project, track: TrackId, timing: Timing) -> Vec<(AssetId, u64)> {
+/// One audio clip on the timeline, in frames at the engine's rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioSpan {
+    pub asset: AssetId,
+    /// Where on the timeline it starts.
+    pub start: u64,
+    /// How far into the file it starts playing.
+    pub offset: u64,
+    /// How much of the file it plays; `None` to the end.
+    pub length: Option<u64>,
+}
+
+/// Each audio clip on a track, earliest first: where it starts, and which part
+/// of its file it plays, converted to the engine's rate.
+pub fn audio_spans(project: &Project, track: TrackId, timing: Timing) -> Vec<AudioSpan> {
     project
         .placements_on(track)
         .into_iter()
-        .filter_map(|p| Some((project.clip(p.clip)?.asset()?, timing.frame_of(p.start))))
+        .filter_map(|p| {
+            let asset = project.clip(p.clip)?.asset()?;
+            let (offset, length) = match p.audio {
+                Some(window) => {
+                    let (offset, length) = window.at(timing.sample_rate);
+                    (offset, Some(length))
+                }
+                None => (0, None),
+            };
+            Some(AudioSpan { asset, start: timing.frame_of(p.start), offset, length })
+        })
         .collect()
 }
 
@@ -148,8 +171,29 @@ mod tests {
         let asset = project_model::Asset::new(AssetId::of_bytes(b"a"), "/a.wav");
         session.apply(Command::AddAudioClip { track, asset, start: BAR }).unwrap();
 
-        assert_eq!(audio_starts(session.project(), track, timing())[0].1, 96_000);
+        assert_eq!(audio_spans(session.project(), track, timing())[0].start, 96_000);
         let faster = Timing::new(Tempo::from_bpm(240.0).unwrap(), 48_000);
-        assert_eq!(audio_starts(session.project(), track, faster)[0].1, 48_000, "the clip did not move with the tempo");
+        assert_eq!(
+            audio_spans(session.project(), track, faster)[0].start,
+            48_000,
+            "the clip did not move with the tempo"
+        );
+    }
+
+    #[test]
+    fn a_trimmed_audio_clip_plays_its_part_at_the_engines_rate() {
+        let mut session = Session::new();
+        session.apply(Command::AddTrack { name: "t".into(), source: Source::Clips, clip: None }).unwrap();
+        let track = session.project().tracks().next().unwrap().id;
+        let asset = project_model::Asset::new(AssetId::of_bytes(b"a"), "/a.wav");
+        session.apply(Command::AddAudioClip { track, asset, start: Tick(0) }).unwrap();
+        let id = session.project().placements_on(track)[0].id;
+        // Trimmed at 44.1 kHz: from half a second in, for a second.
+        let audio = Some(project_model::AudioWindow { offset: 22_050, length: 44_100, rate: 44_100 });
+        session.apply(Command::TrimPlacement { id, start: Tick(960), window: None, audio }).unwrap();
+
+        // Played at 48 kHz: the same moments of the file.
+        let span = audio_spans(session.project(), track, timing())[0];
+        assert_eq!((span.start, span.offset, span.length), (24_000, 24_000, Some(48_000)));
     }
 }

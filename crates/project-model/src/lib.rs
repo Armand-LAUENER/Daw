@@ -32,7 +32,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub use arrangement::{Clip, ClipId, Content, NewClip, Note, NoteId, Placement, PlacementId, Window};
+pub use arrangement::{AudioWindow, Clip, ClipId, Content, NewClip, Note, NoteId, Placement, PlacementId, Window};
 pub use asset::{Asset, AssetId};
 pub use command::{Command, CommandError};
 pub use file::FileError;
@@ -45,7 +45,7 @@ pub use time::{Meter, PPQ, Tempo, Tick};
 /// written. Adding a version to a format that already has files in the wild
 /// means guessing what the unversioned ones were, and that guess is always
 /// wrong for somebody.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// Identifies a track for the life of a project.
 ///
@@ -316,6 +316,13 @@ impl Project {
                 if !fits {
                     return Err(Invalid::WindowOutside(*key));
                 }
+            }
+            // An audio window: on an audio clip, and not empty. Whether it
+            // ends inside the file is for whoever has read the file to say.
+            if let Some(audio) = placement.audio
+                && (clip.asset().is_none() || audio.length == 0 || audio.rate == 0)
+            {
+                return Err(Invalid::WindowOutside(*key));
             }
         }
         for (key, asset) in &self.assets {

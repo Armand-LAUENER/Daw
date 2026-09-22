@@ -44,6 +44,9 @@ fn demo_v3() -> Session {
 /// purpose, bump `FORMAT_VERSION`, write the migration, and update this.
 const REFERENCE: &str = include_str!("reference.daw");
 
+/// Version 3 as it was written, before audio placements had a window.
+const VERSION_3: &str = include_str!("version_3.daw");
+
 fn demo() -> Session {
     let mut session = Session::new();
     let kick = Asset::new(AssetId::of_bytes(b"kick"), folder().join("audio").join("kick.wav"));
@@ -194,6 +197,13 @@ fn older_files_open_as_the_project_they_always_were() {
 }
 
 #[test]
+fn a_version_3_file_opens_as_the_same_project() {
+    let session = Session::from_json(VERSION_3, Some(&folder())).unwrap();
+    assert_eq!(session.project(), demo_v3().project());
+    assert_eq!(session.to_json(Some(&folder())), REFERENCE);
+}
+
+#[test]
 fn an_opened_project_keeps_retiring_ids() {
     // The counter is saved, so a track removed before saving keeps its id
     // retired afterwards: the next track must not take it.
@@ -226,7 +236,8 @@ fn a_file_outside_the_project_folder_keeps_its_full_path() {
 
 #[test]
 fn a_file_from_a_newer_version_is_refused_by_name() {
-    let newer = REFERENCE.replace("\"version\": 3", "\"version\": 99");
+    let current = format!("\"version\": {}", project_model::FORMAT_VERSION);
+    let newer = REFERENCE.replace(&current, "\"version\": 99");
     assert!(matches!(Session::from_json(&newer, None), Err(FileError::Newer(99))));
 }
 

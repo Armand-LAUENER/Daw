@@ -21,7 +21,7 @@
 mod plan;
 mod time;
 
-pub use plan::{audio_starts, note_plan};
+pub use plan::{AudioSpan, audio_spans, note_plan};
 pub use time::{Position, Timing};
 
 use engine_core::{Gain, Graph, GraphBuilder, GraphError, Limiter, Mute, Node, Pan, ParamId, Solo, SoloBus};
