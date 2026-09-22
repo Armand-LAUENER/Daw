@@ -15,5 +15,10 @@ project-engine.workspace = true
 project-model.workspace = true
 eframe = "0.36.2"
 
+[features]
+# WSLg and some Linux desktops expose sound through PulseAudio only. Chosen
+# at run time with DAW_HOST=pulseaudio.
+pulseaudio = ["engine-io/pulseaudio"]
+
 [lints]
 workspace = true

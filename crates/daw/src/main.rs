@@ -9,8 +9,10 @@
 mod clip;
 mod import;
 mod layout;
+mod peaks;
 mod studio;
 mod theme;
+mod timeline;
 mod ui;
 
 use std::path::{Path, PathBuf};
@@ -173,6 +175,11 @@ struct App {
     /// here rather than in the project, and never enters the history.
     layout: Layout,
     show_layout: bool,
+    /// The arrangement rather than the mixer.
+    arrange: bool,
+    /// Zoom, scroll and selection in the arrangement. Like the layout, a
+    /// preference of whoever is looking: never in the project or its history.
+    timeline: timeline::View,
     /// Files already read, so a rebuild reuses what was decoded rather than
     /// reading it again.
     sources: FileSources,
@@ -188,11 +195,19 @@ struct App {
     stats: Arc<Stats>,
     /// Kept alive: dropping it stops the stream.
     _engine: AudioEngine,
+    /// Where to write a picture of the window, then close — set by
+    /// `DAW_SCREENSHOT`, so a change to the interface can be looked at from a
+    /// terminal, or by a test run, without a screenshot tool.
+    screenshot: Option<PathBuf>,
+    frames_drawn: u64,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let options = EngineOptions::default();
+        // DAW_HOST picks the audio host ("pulseaudio" under WSLg); unset, the
+        // platform's default. Read here rather than asked for in the window:
+        // it is a property of the machine, not of the project.
+        let options = EngineOptions { host: std::env::var("DAW_HOST").ok(), ..EngineOptions::default() };
         let (rate, channels) = default_output_config(options.host.as_deref(), options.device.as_deref())?;
         let sample_rate = rate as f32;
         // Printed rather than only shown in the window: a run checked from a
@@ -253,12 +268,16 @@ impl App {
             theme_applied: Some(0),
             layout: Layout::default(),
             show_layout: false,
+            arrange: true,
+            timeline: timeline::View::default(),
             sources,
             transport,
             trouble: None,
             project_path: None,
             stats,
             _engine: engine,
+            screenshot: std::env::var_os("DAW_SCREENSHOT").map(PathBuf::from),
+            frames_drawn: 0,
         })
     }
 
@@ -405,6 +424,9 @@ impl App {
         if actions.toggle_layout {
             self.show_layout = !self.show_layout;
         }
+        if let Some(arrange) = actions.arrange {
+            self.arrange = arrange;
+        }
         if actions.save {
             self.save();
         }
@@ -414,6 +436,42 @@ impl App {
             self.transport.send(command);
         }
     }
+}
+
+impl App {
+    /// Asks for a picture once the window has settled, and writes it when it
+    /// arrives.
+    fn take_screenshot(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.screenshot.clone() else { return };
+        self.frames_drawn += 1;
+        // A few frames in, so fonts and layout have settled.
+        if self.frames_drawn == 20 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+        }
+        let image = ctx.input(|i| {
+            i.raw.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(Arc::clone(image)),
+                _ => None,
+            })
+        });
+        if let Some(image) = image {
+            match write_ppm(&path, &image) {
+                Ok(()) => println!("screenshot written to {}", path.display()),
+                Err(e) => println!("screenshot {}: {e}", path.display()),
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        ctx.request_repaint();
+    }
+}
+
+/// Writes an image as binary PPM: a three-line header and the pixels. Every
+/// image tool reads it, and it needs no encoder.
+fn write_ppm(path: &Path, image: &egui::ColorImage) -> std::io::Result<()> {
+    let [width, height] = image.size;
+    let mut bytes = format!("P6\n{width} {height}\n255\n").into_bytes();
+    bytes.extend(image.pixels.iter().flat_map(|p| [p.r(), p.g(), p.b()]));
+    std::fs::write(path, bytes)
 }
 
 impl Drop for App {
@@ -437,6 +495,7 @@ impl Drop for App {
 impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
+        self.take_screenshot(&ctx);
         if self.theme_applied != Some(self.theme) {
             self.themes[self.theme].apply(&ctx);
             self.theme_applied = Some(self.theme);
@@ -480,6 +539,7 @@ impl eframe::App for App {
                 can_undo: self.studio.can_undo(),
                 can_redo: self.studio.can_redo(),
                 project: name.as_deref(),
+                arrange: self.arrange,
                 playing: self.transport.is_playing(),
                 position,
                 tempo: project.tempo(),
@@ -506,9 +566,23 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme.background)).show(root, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui::mixer(ui, self.studio.project(), &theme, &self.layout, &mut actions);
-            });
+            if self.arrange {
+                let project = self.studio.project();
+                let library = &self.sources.library;
+                let peaks = |asset| project.asset(asset).and_then(|a| library.peaks(&a.path));
+                let cx = timeline::Context {
+                    theme: &theme,
+                    timing: Timing::new(project.tempo(), self.sources.rate),
+                    playhead: self.transport.clock().position(),
+                    playing: self.transport.is_playing(),
+                    peaks: &peaks,
+                };
+                timeline::show(ui, project, &mut self.timeline, &cx, &mut actions);
+            } else {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui::mixer(ui, self.studio.project(), &theme, &self.layout, &mut actions);
+                });
+            }
         });
 
         self.carry_out(actions);

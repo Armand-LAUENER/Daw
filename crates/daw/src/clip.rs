@@ -18,6 +18,8 @@ use std::sync::Arc;
 use engine_core::{AudioBuffer, Clock, Node};
 use engine_io_file::{DecodedAudio, FileError, decode_file};
 
+use crate::peaks::Peaks;
+
 /// A file, decoded once at the device's rate and shared by every graph that
 /// wants it.
 pub type Shared = Arc<DecodedAudio>;
@@ -25,7 +27,7 @@ pub type Shared = Arc<DecodedAudio>;
 /// Files already read, so a rebuild costs nothing.
 #[derive(Debug, Default)]
 pub struct Library {
-    entries: Vec<(PathBuf, Shared)>,
+    entries: Vec<(PathBuf, Shared, Arc<Peaks>)>,
 }
 
 impl Library {
@@ -34,7 +36,12 @@ impl Library {
     }
 
     pub fn get(&self, path: &Path) -> Option<Shared> {
-        self.entries.iter().find(|(p, _)| p == path).map(|(_, audio)| Arc::clone(audio))
+        self.entries.iter().find(|(p, ..)| p == path).map(|(_, audio, _)| Arc::clone(audio))
+    }
+
+    /// What the file looks like, for drawing. Taken when it was read.
+    pub fn peaks(&self, path: &Path) -> Option<Arc<Peaks>> {
+        self.entries.iter().find(|(p, ..)| p == path).map(|(.., peaks)| Arc::clone(peaks))
     }
 
     /// Reads a file, or hands back what was read before.
@@ -47,7 +54,8 @@ impl Library {
             return Ok(audio);
         }
         let audio = Arc::new(decode_file(path, target_rate)?);
-        self.entries.push((path.to_path_buf(), Arc::clone(&audio)));
+        let peaks = Arc::new(Peaks::of(&audio));
+        self.entries.push((path.to_path_buf(), Arc::clone(&audio), peaks));
         Ok(audio)
     }
 

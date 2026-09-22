@@ -26,6 +26,8 @@ pub struct Actions {
     pub theme: Option<usize>,
     /// The layout controls were asked for, or dismissed.
     pub toggle_layout: bool,
+    /// The arrangement (true) or the mixer (false) was chosen.
+    pub arrange: Option<bool>,
     /// The project is to be written to disk.
     pub save: bool,
     /// Play, pause, stop or seek. Not a [`Command`]: where the playhead is
@@ -50,6 +52,8 @@ pub struct Bar<'a> {
     pub can_redo: bool,
     /// The project's file name, or `None` before it is first saved.
     pub project: Option<&'a str>,
+    /// Whether the arrangement is showing, rather than the mixer.
+    pub arrange: bool,
     /// Whether play was the last thing asked of the transport.
     pub playing: bool,
     pub position: Position,
@@ -62,6 +66,16 @@ pub fn top_bar(ui: &mut Ui, theme: &Theme, themes: &[Theme], bar: &Bar<'_>, acti
     ui.horizontal(|ui| {
         ui.label(RichText::new("Daw").color(theme.accent).strong());
         ui.label(RichText::new(project.unwrap_or("unsaved")).color(theme.dim));
+        ui.separator();
+
+        // One view at a time, each for one task (decision D5): placing
+        // material in time, or balancing it.
+        if ui.selectable_label(bar.arrange, "Arrange").clicked() && !bar.arrange {
+            actions.arrange = Some(true);
+        }
+        if ui.selectable_label(!bar.arrange, "Mix").clicked() && bar.arrange {
+            actions.arrange = Some(false);
+        }
         ui.separator();
 
         if ui.button("Save").clicked() {
