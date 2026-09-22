@@ -13,6 +13,7 @@ mod fx_view;
 mod import;
 mod layout;
 mod peaks;
+mod projects;
 mod studio;
 mod theme;
 mod timeline;
@@ -37,10 +38,6 @@ use layout::Layout;
 use studio::{Engine, Sources, Studio};
 use theme::Theme;
 use ui::{Actions, Bar, Health};
-
-/// What a project file is called. Anything else dropped on the window is
-/// taken for audio.
-const PROJECT_EXTENSION: &str = "daw";
 
 /// The graph is stereo whatever the device is: panning needs a pair, and the
 /// device's own layout is reached by mapping afterwards.
@@ -189,6 +186,14 @@ impl Engine for LiveEngine {
     }
 }
 
+/// Something that replaces the project, held while the person decides
+/// whether to save first.
+#[derive(Debug, Clone)]
+enum Pending {
+    Open(PathBuf),
+    New,
+}
+
 struct App {
     studio: Studio<LiveEngine>,
     themes: [Theme; 2],
@@ -221,6 +226,13 @@ struct App {
     releases: Vec<(std::time::Instant, u8)>,
     /// The last thing that went wrong, for the strip along the bottom.
     trouble: Option<String>,
+    /// The project's revision when it was last saved or opened: anything else
+    /// is a change not saved yet.
+    saved_revision: u64,
+    /// An open or a new project waiting on whether to save first.
+    confirm: Option<Pending>,
+    /// The name being typed for Save as, while its window is up.
+    naming: Option<String>,
     /// Where the project was last saved or opened from. `None` until then,
     /// and the first save picks a name.
     project_path: Option<PathBuf>,
@@ -329,6 +341,9 @@ impl App {
             preview,
             releases: Vec::new(),
             trouble: None,
+            saved_revision: 0,
+            confirm: None,
+            naming: None,
             project_path: None,
             stats,
             _engine: engine,
@@ -342,8 +357,8 @@ impl App {
     /// One command, so one entry in the history: a file dropped by mistake is
     /// taken back with a single undo.
     fn load(&mut self, path: PathBuf) {
-        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION)) {
-            self.open(&path);
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(projects::EXTENSION)) {
+            self.request(Pending::Open(path));
             return;
         }
         if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mid") || e.eq_ignore_ascii_case("midi")) {
@@ -432,28 +447,151 @@ impl App {
         println!("opened {} ({} tracks)", path.display(), session.project().track_count());
         self.studio.replace(session, &mut self.sources);
         self.project_path = Some(path.to_path_buf());
+        self.saved_revision = self.studio.session().revision();
         self.trouble = None;
         if !problems.is_empty() {
             self.report(problems.join("; "));
         }
     }
 
-    /// Writes the project where it came from, or somewhere new the first time.
+    /// Writes the project where it came from, or as `untitled` in the
+    /// projects folder the first time.
     fn save(&mut self) {
         let path = match self.project_path.clone() {
             Some(path) => path,
-            None => match untitled() {
-                Ok(path) => path,
+            None => match projects::folder() {
+                Ok(folder) => projects::untitled(&folder),
                 Err(e) => return self.report(format!("cannot choose where to save: {e}")),
             },
         };
+        self.save_to(path);
+    }
+
+    /// Writes the project in the projects folder under a name of its own.
+    ///
+    /// Refuses a name another project already has: overwriting it would lose
+    /// that project with no way back, which a save should never do.
+    fn save_as(&mut self, typed: &str) {
+        let Some(file) = projects::file_name(typed) else {
+            return self.report("a project needs a name".into());
+        };
+        let folder = match projects::folder() {
+            Ok(folder) => folder,
+            Err(e) => return self.report(format!("cannot open the projects folder: {e}")),
+        };
+        let path = folder.join(file);
+        if path.exists() && self.project_path.as_ref() != Some(&path) {
+            return self.report(format!("a project called {} already exists", path.display()));
+        }
+        self.save_to(path);
+    }
+
+    fn save_to(&mut self, path: PathBuf) {
         match self.studio.session().save(&path) {
             Ok(()) => {
                 println!("saved {}", path.display());
                 self.project_path = Some(path);
+                self.saved_revision = self.studio.session().revision();
                 self.trouble = None;
             }
             Err(e) => self.report(format!("{}: {e}", path.display())),
+        }
+    }
+
+    /// Whether the project has changed since it was last saved or opened.
+    fn dirty(&self) -> bool {
+        self.studio.session().revision() != self.saved_revision
+    }
+
+    /// Opening another project or starting a new one replaces this one. With
+    /// changes not saved, that is asked about first rather than done.
+    fn request(&mut self, pending: Pending) {
+        if self.dirty() {
+            self.confirm = Some(pending);
+        } else {
+            self.carry_out_pending(pending);
+        }
+    }
+
+    fn carry_out_pending(&mut self, pending: Pending) {
+        match pending {
+            Pending::Open(path) => self.open(&path),
+            Pending::New => {
+                self.studio.replace(Session::new(), &mut self.sources);
+                self.project_path = None;
+                self.saved_revision = self.studio.session().revision();
+                self.trouble = None;
+                self.editor = None;
+                self.eq_track = None;
+                self.fx_track = None;
+            }
+        }
+    }
+
+    /// The two small windows that ask something: whether to save before
+    /// replacing the project, and what to call it.
+    fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(pending) = self.confirm.clone() {
+            let mut choice = None;
+            egui::Window::new("Unsaved changes")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("This project has changes that are not saved.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Save first").clicked() {
+                            choice = Some(0);
+                        }
+                        if ui.button("Discard them").clicked() {
+                            choice = Some(1);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            choice = Some(2);
+                        }
+                    });
+                });
+            match choice {
+                Some(0) => {
+                    self.save();
+                    self.confirm = None;
+                    // Only carried on if the save worked; a failed save says
+                    // why along the bottom and keeps the project.
+                    if !self.dirty() {
+                        self.carry_out_pending(pending);
+                    }
+                }
+                Some(1) => {
+                    self.confirm = None;
+                    self.carry_out_pending(pending);
+                }
+                Some(_) => self.confirm = None,
+                None => {}
+            }
+        }
+
+        if let Some(mut name) = self.naming.take() {
+            let mut keep = true;
+            let mut save = false;
+            egui::Window::new("Save as")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("Name, saved in the projects folder:");
+                    let field = ui.text_edit_singleline(&mut name);
+                    field.request_focus();
+                    save |= field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.horizontal(|ui| {
+                        save |= ui.button("Save").clicked();
+                        keep &= !ui.button("Cancel").clicked();
+                    });
+                });
+            if save {
+                self.save_as(&name);
+            } else if keep {
+                self.naming = Some(name);
+            }
         }
     }
 
@@ -494,6 +632,17 @@ impl App {
         }
         if actions.save {
             self.save();
+        }
+        if actions.save_as {
+            let current =
+                self.project_path.as_deref().and_then(Path::file_stem).map(|n| n.to_string_lossy().into_owned());
+            self.naming = Some(current.unwrap_or_default());
+        }
+        if let Some(path) = actions.open {
+            self.request(Pending::Open(path));
+        }
+        if actions.new_project {
+            self.request(Pending::New);
         }
         if let Some((pitch, velocity)) = actions.preview {
             let level = f32::from(velocity) / 127.0 * INSTRUMENT_LEVEL;
@@ -609,7 +758,10 @@ impl eframe::App for App {
         }
 
         egui::Panel::top("bar").show(root, |ui| {
-            let name = self.project_path.as_deref().and_then(Path::file_name).map(|n| n.to_string_lossy());
+            let name = self.project_path.as_deref().and_then(Path::file_stem).map(|n| n.to_string_lossy());
+            // The folder the Open menu lists. Failing to reach it only empties
+            // the list.
+            let folder = projects::folder().ok();
             let project = self.studio.project();
             let timing = Timing::new(project.tempo(), self.sources.rate);
             let position = Position::of(self.transport.clock().position(), timing, project.meter());
@@ -617,6 +769,8 @@ impl eframe::App for App {
                 can_undo: self.studio.can_undo(),
                 can_redo: self.studio.can_redo(),
                 project: name.as_deref(),
+                dirty: self.dirty(),
+                folder: folder.as_deref(),
                 arrange: self.arrange,
                 playing: self.transport.is_playing(),
                 position,
@@ -722,6 +876,7 @@ impl eframe::App for App {
             }
         });
 
+        self.dialogs(&ctx);
         self.carry_out(actions);
         // Anything the engine had no room for is tried again here rather than
         // dropped, so the graph cannot stay out of step with the mixer.
@@ -734,29 +889,6 @@ impl eframe::App for App {
         let every = if busy { 30 } else { 200 };
         ctx.request_repaint_after(std::time::Duration::from_millis(every));
     }
-}
-
-/// A name for a project saved for the first time: `untitled.daw` in a `Daw`
-/// folder in the home directory, numbered so an earlier one is never
-/// overwritten.
-///
-/// Chosen rather than asked for because asking needs a file dialog, and a
-/// dialog is a dependency; the name shows in the top bar, and the file can be
-/// moved and dropped back on the window.
-fn untitled() -> std::io::Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or_else(|| std::io::Error::other("no home directory"))?;
-    let folder = PathBuf::from(home).join("Daw");
-    std::fs::create_dir_all(&folder)?;
-    let path = (1..)
-        .map(|n| {
-            let name = if n == 1 { "untitled".into() } else { format!("untitled-{n}") };
-            folder.join(format!("{name}.{PROJECT_EXTENSION}"))
-        })
-        .find(|path| !path.exists())
-        .expect("some number is free");
-    Ok(path)
 }
 
 fn main() -> eframe::Result {

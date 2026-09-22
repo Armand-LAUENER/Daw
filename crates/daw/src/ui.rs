@@ -42,6 +42,12 @@ pub struct Actions {
     pub fx: Option<Strip>,
     /// The project is to be written to disk.
     pub save: bool,
+    /// Save under a new name was asked for.
+    pub save_as: bool,
+    /// A project picked from the Open menu.
+    pub open: Option<std::path::PathBuf>,
+    /// A new, empty project was asked for.
+    pub new_project: bool,
     /// Play, pause, stop or seek. Not a [`Command`]: where the playhead is
     /// belongs to the engine, not to the project, and never enters the history.
     pub transport: Option<TransportCommand>,
@@ -64,6 +70,10 @@ pub struct Bar<'a> {
     pub can_redo: bool,
     /// The project's file name, or `None` before it is first saved.
     pub project: Option<&'a str>,
+    /// Changes not saved yet.
+    pub dirty: bool,
+    /// The projects folder, for the Open menu.
+    pub folder: Option<&'a std::path::Path>,
     /// Whether the arrangement is showing, rather than the mixer.
     pub arrange: bool,
     /// Whether play was the last thing asked of the transport.
@@ -77,7 +87,9 @@ pub fn top_bar(ui: &mut Ui, theme: &Theme, themes: &[Theme], bar: &Bar<'_>, acti
     let Bar { can_undo, can_redo, project, .. } = *bar;
     ui.horizontal(|ui| {
         ui.label(RichText::new("Daw").color(theme.accent).strong());
-        ui.label(RichText::new(project.unwrap_or("unsaved")).color(theme.dim));
+        // A dot while there is something to save, as most programs do.
+        let title = format!("{}{}", project.unwrap_or("untitled"), if bar.dirty { " ●" } else { "" });
+        ui.label(RichText::new(title).color(if bar.dirty { theme.text } else { theme.dim }));
         ui.separator();
 
         // One view at a time, each for one task (decision D5): placing
@@ -90,8 +102,28 @@ pub fn top_bar(ui: &mut Ui, theme: &Theme, themes: &[Theme], bar: &Bar<'_>, acti
         }
         ui.separator();
 
-        if ui.button("Save").clicked() {
+        if ui.button("New").clicked() {
+            actions.new_project = true;
+        }
+        ui.menu_button("Open", |ui| {
+            let listed = bar.folder.map(crate::projects::list).unwrap_or_default();
+            if listed.is_empty() {
+                ui.label(RichText::new("no project saved yet").color(theme.dim));
+            }
+            for project in listed {
+                if ui.button(&project.name).clicked() {
+                    actions.open = Some(project.path);
+                    ui.close();
+                }
+            }
+            ui.separator();
+            ui.label(RichText::new("or drop a .daw file on the window").color(theme.dim).small());
+        });
+        if ui.button("Save").on_hover_text("Ctrl+S").clicked() {
             actions.save = true;
+        }
+        if ui.button("Save as…").clicked() {
+            actions.save_as = true;
         }
 
         if ui.add_enabled(can_undo, egui::Button::new("Undo")).clicked() {
@@ -125,11 +157,38 @@ pub fn top_bar(ui: &mut Ui, theme: &Theme, themes: &[Theme], bar: &Bar<'_>, acti
     });
 }
 
+/// The play/pause button, its icon drawn rather than typed: the font egui
+/// ships has a triangle but no pause sign, which showed as two empty boxes
+/// while playing.
+fn play_pause(ui: &mut Ui, playing: bool, theme: &Theme) -> egui::Response {
+    let size = egui::vec2(26.0, ui.spacing().interact_size.y);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let visuals = ui.style().interact(&response);
+    let painter = ui.painter();
+    painter.rect_filled(rect, visuals.corner_radius, visuals.bg_fill);
+    let (centre, half) = (rect.center(), rect.height() * 0.22);
+    if playing {
+        // Two bars.
+        for side in [-1.0f32, 1.0] {
+            let x = centre.x + side * half * 0.55;
+            let bar = egui::Rect::from_center_size(egui::pos2(x, centre.y), egui::vec2(half * 0.6, half * 2.0));
+            painter.rect_filled(bar, 1.0, theme.text);
+        }
+    } else {
+        let points = vec![
+            egui::pos2(centre.x - half * 0.8, centre.y - half),
+            egui::pos2(centre.x - half * 0.8, centre.y + half),
+            egui::pos2(centre.x + half, centre.y),
+        ];
+        painter.add(egui::Shape::convex_polygon(points, theme.text, egui::Stroke::NONE));
+    }
+    response
+}
+
 /// Play/pause, stop, where the playhead is, and the tempo and time signature.
 fn transport(ui: &mut Ui, theme: &Theme, bar: &Bar<'_>, actions: &mut Actions) {
-    let (label, command) =
-        if bar.playing { ("❚❚", TransportCommand::Pause) } else { ("▶", TransportCommand::Play) };
-    if ui.button(label).on_hover_text("play / pause (space)").clicked() {
+    let command = if bar.playing { TransportCommand::Pause } else { TransportCommand::Play };
+    if play_pause(ui, bar.playing, theme).on_hover_text("play / pause (space)").clicked() {
         actions.transport = Some(command);
     }
     if ui.button("■").on_hover_text("stop and go back to the start").clicked() {

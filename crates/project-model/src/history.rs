@@ -97,6 +97,9 @@ struct Step {
     backward: Vec<Edit>,
     /// The control it moved, when a following change could continue it.
     target: Option<Target>,
+    /// Names the project as this step leaves it. Never reused, and renewed
+    /// when a gesture continues the step, since the project changed again.
+    serial: u64,
 }
 
 /// A project together with everything done to it.
@@ -118,6 +121,8 @@ pub struct Session {
     /// through the drag frame by frame. They fold into one step until something
     /// [`seals`](Session::seal) it — which is what letting go of the mouse does.
     open: bool,
+    /// The serial the next step, or the next continuation of one, is given.
+    next_serial: u64,
 }
 
 impl Session {
@@ -128,7 +133,7 @@ impl Session {
     /// Starts from a project that already exists, with nothing to undo.
     pub fn from_project(project: Project) -> Self {
         let ids = Ids::clearing(&project);
-        Self { project, ids, steps: Vec::new(), applied: 0, open: false }
+        Self { project, ids, steps: Vec::new(), applied: 0, open: false, next_serial: 0 }
     }
 
     pub fn project(&self) -> &Project {
@@ -150,7 +155,7 @@ impl Session {
     /// kept, so ids retired before it was saved stay retired.
     pub(crate) fn restored(project: Project, ids: Ids) -> Self {
         let ids = ids.max(Ids::clearing(&project));
-        Self { project, ids, steps: Vec::new(), applied: 0, open: false }
+        Self { project, ids, steps: Vec::new(), applied: 0, open: false, next_serial: 0 }
     }
 
     /// Carries out a command, and remembers how to take it back.
@@ -172,13 +177,16 @@ impl Session {
         {
             apply(&mut self.project, &forward);
             last.forward = forward;
+            self.next_serial += 1;
+            last.serial = self.next_serial;
             return Ok(());
         }
 
         // Anything that was redoable is now a branch nobody can reach.
         self.steps.truncate(self.applied);
         apply(&mut self.project, &forward);
-        self.steps.push(Step { forward, backward, target });
+        self.next_serial += 1;
+        self.steps.push(Step { forward, backward, target, serial: self.next_serial });
         self.applied += 1;
         self.open = target.is_some();
         Ok(())
@@ -226,6 +234,17 @@ impl Session {
     /// How many changes are in effect, for a status line or a test.
     pub fn depth(&self) -> usize {
         self.applied
+    }
+
+    /// Which state the project is in, as a number: equal to one taken before
+    /// only if the project is exactly as it was then.
+    ///
+    /// Remembered at a save and compared later, it says whether there are
+    /// changes to save. Undoing back to the saved state makes the two equal
+    /// again; changing, undoing and changing something else does not, since
+    /// serials are never reused.
+    pub fn revision(&self) -> u64 {
+        self.applied.checked_sub(1).map_or(0, |i| self.steps[i].serial)
     }
 }
 
@@ -318,6 +337,37 @@ mod tests {
         session.apply(Command::RemoveTrack { id: last }).unwrap();
         session.apply(Command::AddTrack { name: "three".into(), source: Default::default(), clip: None }).unwrap();
         assert_ne!(first(&session), last);
+    }
+
+    #[test]
+    fn the_revision_says_whether_the_project_is_as_it_was() {
+        let mut session = with_tracks(1);
+        let id = first(&session);
+        let saved = session.revision();
+
+        session.apply(Command::SetGain { id, gain: 0.5 }).unwrap();
+        assert_ne!(session.revision(), saved, "a change left the revision alone");
+        // Undone back to the saved state: the same revision again.
+        session.undo();
+        assert_eq!(session.revision(), saved, "undoing to the saved state still looked changed");
+
+        // A change, saved; then a drag continuing it. The step is the same,
+        // the project is not, so the revision moves.
+        session.apply(Command::SetGain { id, gain: 0.5 }).unwrap();
+        let saved = session.revision();
+        session.apply(Command::SetGain { id, gain: 0.4 }).unwrap();
+        assert_eq!(session.depth(), 1);
+        assert_ne!(session.revision(), saved, "a continued gesture looked unchanged");
+
+        // A different change on another branch never matches an old revision.
+        session.undo();
+        session.apply(Command::SetPan { id, pan: 0.2 }).unwrap();
+        assert_ne!(session.revision(), saved);
+
+        // A refused command changes nothing, the revision included.
+        let before = session.revision();
+        assert!(session.apply(Command::SetGain { id: TrackId(999), gain: 0.5 }).is_err());
+        assert_eq!(session.revision(), before);
     }
 
     #[test]
