@@ -253,7 +253,7 @@ mod tests {
         }
 
         fn add_track(&mut self) -> TrackId {
-            self.apply(Command::AddTrack { name: "track".into(), source: Default::default(), file: None })
+            self.apply(Command::AddTrack { name: "track".into(), source: Default::default(), clip: None })
                 .expect("adding always works");
             self.studio.project().tracks().last().expect("it was just added").id
         }
@@ -384,7 +384,7 @@ mod tests {
         f.add_track();
         let mut other = Session::new();
         for name in ["a", "b", "c"] {
-            other.apply(Command::AddTrack { name: name.into(), source: Default::default(), file: None }).unwrap();
+            other.apply(Command::AddTrack { name: name.into(), source: Default::default(), clip: None }).unwrap();
         }
         let other = Session::from_project(other.project().clone());
         let swaps = f.swaps();

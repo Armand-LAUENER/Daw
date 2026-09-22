@@ -32,7 +32,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub use arrangement::{Clip, ClipId, Content, Note, NoteId, Placement, PlacementId, Window};
+pub use arrangement::{Clip, ClipId, Content, NewClip, Note, NoteId, Placement, PlacementId, Window};
 pub use asset::{Asset, AssetId};
 pub use command::{Command, CommandError};
 pub use file::FileError;

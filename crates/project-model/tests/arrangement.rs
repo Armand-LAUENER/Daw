@@ -5,13 +5,15 @@
 //! wherever it is placed, a copy is a separate one, and material leaves the
 //! project only when nothing plays it any more.
 
-use project_model::{Asset, AssetId, ClipId, Command, CommandError, Note, PlacementId, Session, Source, Tick, TrackId};
+use project_model::{
+    Asset, AssetId, ClipId, Command, CommandError, NewClip, Note, PlacementId, Session, Source, Tick, TrackId,
+};
 
 const BAR: Tick = Tick(3_840);
 
 fn with_track() -> (Session, TrackId) {
     let mut session = Session::new();
-    session.apply(Command::AddTrack { name: "t".into(), source: Source::Clips, file: None }).expect("adding works");
+    session.apply(Command::AddTrack { name: "t".into(), source: Source::Clips, clip: None }).expect("adding works");
     let id = session.project().tracks().next().expect("one track").id;
     (session, id)
 }
@@ -160,4 +162,27 @@ fn a_dragged_placement_is_one_step() {
     assert_eq!(session.depth(), depth + 1, "a drag left a step per frame");
     session.undo();
     assert_eq!(session.project().placement(placement).unwrap().start, Tick(0));
+}
+
+#[test]
+fn a_track_made_with_its_notes_is_one_step_and_refused_whole() {
+    // What dropping a MIDI file does: the track, its clip and every note in
+    // one command, so one undo takes it all back.
+    let mut session = Session::new();
+    let notes = vec![Note::new(60, 100, Tick(0), Tick(960)), Note::new(64, 100, Tick(960), Tick(960))];
+    let clip = Some(NewClip::Midi { length: BAR, notes });
+    session.apply(Command::AddTrack { name: "song".into(), source: Source::Clips, clip }).unwrap();
+    assert_eq!(session.depth(), 1);
+    let track = session.project().tracks().next().unwrap().id;
+    let placed = session.project().placements_on(track)[0].clip;
+    assert_eq!(notes_of(&session, placed), 2);
+
+    session.undo();
+    assert_eq!(session.project(), &project_model::Project::new());
+
+    // One note too long and none of it happens.
+    let overlong = vec![Note::new(60, 100, Tick(0), Tick(9_999))];
+    let clip = Some(NewClip::Midi { length: BAR, notes: overlong });
+    assert!(session.apply(Command::AddTrack { name: "bad".into(), source: Source::Clips, clip }).is_err());
+    assert_eq!(session.project().track_count(), 0);
 }

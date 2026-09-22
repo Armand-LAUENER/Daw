@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use project_model::{Asset, AssetId, Command, FileError, Invalid, Note, Session, Source, Tick, Window};
+use project_model::{Asset, AssetId, Command, FileError, Invalid, NewClip, Note, Session, Source, Tick, Window};
 use proptest::prelude::*;
 
 fn folder() -> PathBuf {
@@ -48,9 +48,13 @@ fn demo() -> Session {
     let mut session = Session::new();
     let kick = Asset::new(AssetId::of_bytes(b"kick"), folder().join("audio").join("kick.wav"));
     session
-        .apply(Command::AddTrack { name: "Kick".into(), source: Source::Clips, file: Some(kick) })
+        .apply(Command::AddTrack {
+            name: "Kick".into(),
+            source: Source::Clips,
+            clip: Some(NewClip::Audio { asset: kick }),
+        })
         .expect("adding works");
-    session.apply(Command::AddTrack { name: "Pad".into(), source: Source::Tone, file: None }).expect("adding works");
+    session.apply(Command::AddTrack { name: "Pad".into(), source: Source::Tone, clip: None }).expect("adding works");
     let pad = session.project().tracks().nth(1).expect("two tracks").id;
     session.apply(Command::SetGain { id: pad, gain: 0.5 }).expect("pad exists");
     session.apply(Command::SetPan { id: pad, pan: -0.3 }).expect("pad exists");
@@ -198,7 +202,7 @@ fn an_opened_project_keeps_retiring_ids() {
     session.apply(Command::RemoveTrack { id: pad }).unwrap();
 
     let mut opened = Session::from_json(&session.to_json(None), None).unwrap();
-    opened.apply(Command::AddTrack { name: "new".into(), source: Source::Silent, file: None }).unwrap();
+    opened.apply(Command::AddTrack { name: "new".into(), source: Source::Silent, clip: None }).unwrap();
     assert_ne!(opened.project().tracks().last().unwrap().id, pad, "a retired id came back after opening");
 }
 
@@ -208,7 +212,13 @@ fn a_file_outside_the_project_folder_keeps_its_full_path() {
     let elsewhere =
         if cfg!(windows) { PathBuf::from(r"D:\samples\snare.wav") } else { PathBuf::from("/samples/snare.wav") };
     let snare = Asset::new(AssetId::of_bytes(b"snare"), &elsewhere);
-    session.apply(Command::AddTrack { name: "Snare".into(), source: Source::Clips, file: Some(snare) }).unwrap();
+    session
+        .apply(Command::AddTrack {
+            name: "Snare".into(),
+            source: Source::Clips,
+            clip: Some(NewClip::Audio { asset: snare }),
+        })
+        .unwrap();
 
     let opened = Session::from_json(&session.to_json(Some(&folder())), Some(&folder())).unwrap();
     assert_eq!(opened.project().assets().next().unwrap().path, elsewhere);
@@ -253,9 +263,9 @@ fn saving_replaces_the_file_whole_and_leaves_nothing_beside_it() {
     let path = dir.join("song.daw");
 
     let mut session = Session::new();
-    session.apply(Command::AddTrack { name: "one".into(), source: Source::Tone, file: None }).unwrap();
+    session.apply(Command::AddTrack { name: "one".into(), source: Source::Tone, clip: None }).unwrap();
     session.save(&path).unwrap();
-    session.apply(Command::AddTrack { name: "two".into(), source: Source::Tone, file: None }).unwrap();
+    session.apply(Command::AddTrack { name: "two".into(), source: Source::Tone, clip: None }).unwrap();
     session.save(&path).unwrap();
 
     assert_eq!(Session::open(&path).unwrap().project(), session.project());
@@ -303,7 +313,9 @@ fn build(edits: &[Edit], folder: &Path) -> Session {
             Edit::Add(file) => Some(Command::AddTrack {
                 name: "t".into(),
                 source: Source::Clips,
-                file: file.map(|n| Asset::new(AssetId::of_bytes(&[n % 3]), folder.join(format!("{}.wav", n % 3)))),
+                clip: file.map(|n| NewClip::Audio {
+                    asset: Asset::new(AssetId::of_bytes(&[n % 3]), folder.join(format!("{}.wav", n % 3))),
+                }),
             }),
             Edit::Remove(i) => pick(*i).map(|id| Command::RemoveTrack { id }),
             Edit::Gain(i, gain) => pick(*i).map(|id| Command::SetGain { id, gain: *gain }),

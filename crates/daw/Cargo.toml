@@ -10,6 +10,7 @@ engine-core.workspace = true
 engine-dsp.workspace = true
 engine-io.workspace = true
 engine-io-file.workspace = true
+engine-midi.workspace = true
 project-engine.workspace = true
 project-model.workspace = true
 eframe = "0.36.2"

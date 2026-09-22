@@ -267,3 +267,39 @@ fn the_transport_never_allocates() {
         });
     }
 }
+
+#[test]
+fn the_sequencer_never_allocates_even_when_it_jumps() {
+    // A jump walks the whole plan to chase held notes; that walk has to stay
+    // on memory the sequencer already owns.
+    let (mut control, mut transport) = engine_core::transport_channel(SR, 16);
+    let clock = std::sync::Arc::clone(control.clock());
+    let events: Vec<engine_core::NoteEvent> = (0..64u64)
+        .flat_map(|i| {
+            [
+                engine_core::NoteEvent::on(48 + (i % 24) as u8, 0.8, i * 3_000),
+                engine_core::NoteEvent::off(48 + (i % 24) as u8, i * 3_000 + 9_000),
+            ]
+        })
+        .collect();
+    let envelope = engine_dsp::Adsr::new(0.005, 0.05, 0.7, 0.1, SR);
+    let mut sequencer = engine_core::Sequencer::new(8, engine_dsp::Waveform::Saw, &envelope, events, clock, SR);
+    let mut data = vec![0.0f32; MAX_FRAMES * CHANNELS];
+
+    for command in [
+        engine_core::TransportCommand::Play,
+        engine_core::TransportCommand::Seek(100_000),
+        engine_core::TransportCommand::Pause,
+        engine_core::TransportCommand::Play,
+        engine_core::TransportCommand::Stop,
+    ] {
+        control.send(command);
+        assert_no_alloc(|| {
+            for _ in 0..8 {
+                transport.begin();
+                sequencer.process(&mut AudioBuffer::new(&mut data, CHANNELS));
+                transport.finish(&mut data, CHANNELS);
+            }
+        });
+    }
+}

@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::history::Ids;
 use crate::{
-    Asset, AssetId, Clip, ClipId, Content, Meter, Note, NoteId, Placement, PlacementId, Project, Source, Tempo, Tick,
-    Track, TrackId, Window, time,
+    Asset, AssetId, Clip, ClipId, Content, Meter, NewClip, Note, NoteId, Placement, PlacementId, Project, Source,
+    Tempo, Tick, Track, TrackId, Window, time,
 };
 
 /// A change someone asked for.
@@ -20,13 +20,12 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
-    /// A track, and — when a file is given — an audio clip of it placed at the
-    /// start. One command, so a file dropped onto the window is one entry in
-    /// the history.
+    /// A track, and — when one is given — a clip placed at its start. One
+    /// command, so a file dropped onto the window is one entry in the history.
     AddTrack {
         name: String,
         source: Source,
-        file: Option<Asset>,
+        clip: Option<NewClip>,
     },
     /// Takes its placements with it.
     RemoveTrack {
@@ -347,14 +346,27 @@ pub(crate) fn resolve(project: &Project, ids: &mut Ids, command: Command) -> Res
     let one = |forward: Edit, backward: Edit| (vec![forward], vec![backward]);
 
     Ok(match command {
-        Command::AddTrack { name, source, file } => {
+        Command::AddTrack { name, source, clip } => {
+            // Checked before any id is taken: a refused command takes nothing.
+            if let Some(NewClip::Midi { length, notes }) = &clip {
+                if length.0 == 0 {
+                    return Err(CommandError::OutOfRange("a clip's length"));
+                }
+                notes.iter().try_for_each(|n| fits(n, *length))?;
+            }
             let mut change = Change::new(project);
             let at = project.track_count();
             let track = Track::new(ids.take_track(), name.clone(), source);
             let id = track.id;
             change.push(Edit::InsertTrack { at, track }, Edit::RemoveTrack { id });
-            if let Some(asset) = file {
-                change.place_audio(ids, id, asset, Tick(0), name);
+            match clip {
+                None => {}
+                Some(NewClip::Audio { asset }) => change.place_audio(ids, id, asset, Tick(0), name),
+                Some(NewClip::Midi { length, notes }) => {
+                    let notes = notes.into_iter().map(|n| (ids.take_note(), n)).collect();
+                    let clip = Clip { id: ids.take_clip(), name, content: Content::Midi { length, notes } };
+                    change.place(ids, clip, id, Tick(0));
+                }
             }
             change.finish()
         }

@@ -77,7 +77,7 @@ pub fn top_bar(ui: &mut Ui, theme: &Theme, themes: &[Theme], bar: &Bar<'_>, acti
 
         ui.separator();
         if ui.button("Add track").clicked() {
-            actions.commands.push(Command::AddTrack { name: "Track".into(), source: Default::default(), file: None });
+            actions.commands.push(Command::AddTrack { name: "Track".into(), source: Default::default(), clip: None });
         }
 
         ui.separator();
@@ -291,7 +291,11 @@ pub fn status(ui: &mut Ui, theme: &Theme, health: &Health<'_>) {
             ui.label(RichText::new(trouble).color(theme.warning).small());
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new("drop audio to add a track, or a .daw project to open it").color(theme.dim).small());
+            ui.label(
+                RichText::new("drop audio or a .mid to add a track, or a .daw project to open it")
+                    .color(theme.dim)
+                    .small(),
+            );
         });
     });
 }

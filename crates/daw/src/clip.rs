@@ -117,6 +117,26 @@ impl Node for Lane {
     }
 }
 
+/// Several sources on one track, heard together.
+///
+/// Every layer adds to the buffer rather than writing it, so running them one
+/// after another over the same buffer is the mix.
+pub struct Layers(pub Vec<Box<dyn Node>>);
+
+impl Node for Layers {
+    fn process(&mut self, buffer: &mut AudioBuffer<'_>) {
+        for layer in &mut self.0 {
+            layer.process(buffer);
+        }
+    }
+
+    fn reset(&mut self) {
+        for layer in &mut self.0 {
+            layer.reset();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

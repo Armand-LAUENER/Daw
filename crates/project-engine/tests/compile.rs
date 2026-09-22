@@ -32,7 +32,7 @@ fn with_tracks(n: usize) -> Session {
     let mut session = Session::new();
     for i in 0..n {
         session
-            .apply(Command::AddTrack { name: format!("track {i}"), source: Source::default(), file: None })
+            .apply(Command::AddTrack { name: format!("track {i}"), source: Source::default(), clip: None })
             .expect("adding always works");
     }
     Session::from_project(session.project().clone())
@@ -130,7 +130,7 @@ fn changing_the_shape_asks_for_a_rebuild_and_moving_a_fader_does_not() {
     let b = &compiled.bindings;
 
     assert_eq!(
-        route(b, &Command::AddTrack { name: "two".into(), source: Default::default(), file: None }),
+        route(b, &Command::AddTrack { name: "two".into(), source: Default::default(), clip: None }),
         Change::Rebuild
     );
     assert_eq!(route(b, &Command::RemoveTrack { id }), Change::Rebuild);
@@ -195,7 +195,7 @@ fn the_master_holds_a_stack_of_tracks_under_the_ceiling() {
     // clipping is the one failure that cannot be undone afterwards.
     let mut session = Session::new();
     for i in 0..20 {
-        session.apply(Command::AddTrack { name: format!("{i}"), source: Source::default(), file: None }).unwrap();
+        session.apply(Command::AddTrack { name: format!("{i}"), source: Source::default(), clip: None }).unwrap();
     }
     let mut compiled = compile(session.project(), |_| Box::new(Constant(1.0)), CHANNELS, MAX_FRAMES, SR).unwrap();
 

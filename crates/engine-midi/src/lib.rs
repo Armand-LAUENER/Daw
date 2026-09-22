@@ -36,6 +36,9 @@ pub enum MidiError {
     /// Format 2: tracks that are separate pieces rather than parts of one.
     /// Merging them onto a single timeline would stack unrelated music.
     SequentialTracks,
+    /// Timed in SMPTE frames rather than beats: it has no musical time to
+    /// place on a timeline, only seconds.
+    NotMetrical,
     /// The system's MIDI stack refused to open or enumerate.
     Backend(String),
     /// No input port, or none matching what was asked for.
@@ -50,6 +53,7 @@ impl fmt::Display for MidiError {
             Self::SequentialTracks => {
                 write!(f, "format 2 files hold independent pieces, which have no common timeline")
             }
+            Self::NotMetrical => write!(f, "timed in SMPTE frames, not in beats"),
             Self::Backend(e) => write!(f, "the system's MIDI stack refused: {e}"),
             Self::NoInput(e) => write!(f, "{e}"),
         }
@@ -134,14 +138,80 @@ pub fn decode_file(path: impl AsRef<Path>, sample_rate: u32) -> Result<MidiSeque
 
 pub fn decode_bytes(data: &[u8], sample_rate: u32) -> Result<MidiSequence, MidiError> {
     let smf = Smf::parse(data).map_err(|e| MidiError::Parse(e.to_string()))?;
+    let events = merge(&smf)?;
+
+    let timing = smf.header.timing;
+    let ticks_per_beat = match timing {
+        Timing::Metrical(tpq) => Some(f64::from(tpq.as_int())),
+        Timing::Timecode(..) => None,
+    };
+    // A timecode file measures real time directly, so no tempo applies to it.
+    let timecode_seconds_per_tick = match timing {
+        Timing::Timecode(fps, subframes) => Some(1.0 / (f64::from(fps.as_f32()) * f64::from(subframes))),
+        Timing::Metrical(_) => None,
+    };
+    let mut tempo_us = DEFAULT_TEMPO_US;
+    let mut seconds = 0.0f64;
+    let mut last_tick = 0u64;
+    let frame_of = |seconds: f64| (seconds * f64::from(sample_rate)).round() as u64;
+
+    let (notes, duration) = pair(&events, |tick, kind| {
+        let seconds_per_tick =
+            timecode_seconds_per_tick.unwrap_or_else(|| tempo_us / 1e6 / ticks_per_beat.unwrap_or(1.0).max(1.0));
+        seconds += (tick - last_tick) as f64 * seconds_per_tick;
+        last_tick = tick;
+        // Read after the time has been advanced: a change applies to what
+        // comes after it, never to the stretch already counted.
+        if let TrackEventKind::Meta(MetaMessage::Tempo(us)) = kind {
+            tempo_us = f64::from(us.as_int());
+        }
+        frame_of(seconds)
+    });
+    Ok(MidiSequence { notes, sample_rate, duration })
+}
+
+/// A file in its own musical time: notes in the file's ticks, before any tempo
+/// has turned them into seconds.
+///
+/// What a timeline wants. A project keeps notes in beats and lets its own
+/// tempo decide when they sound, so going through seconds and back would only
+/// add a rounding and tie the notes to the file's tempo.
+#[derive(Debug, Clone)]
+pub struct MidiScore {
+    /// The file's resolution: how many of its ticks make a quarter note.
+    pub ticks_per_quarter: u16,
+    /// `start` and `length` in the file's ticks, earliest first.
+    pub notes: Vec<MidiNote>,
+    /// Ticks until the last note ends.
+    pub length: u64,
+}
+
+pub fn read_score(path: impl AsRef<Path>) -> Result<MidiScore, MidiError> {
+    score_bytes(&std::fs::read(path)?)
+}
+
+pub fn score_bytes(data: &[u8]) -> Result<MidiScore, MidiError> {
+    let smf = Smf::parse(data).map_err(|e| MidiError::Parse(e.to_string()))?;
+    let Timing::Metrical(tpq) = smf.header.timing else {
+        return Err(MidiError::NotMetrical);
+    };
+    let events = merge(&smf)?;
+    let (notes, length) = pair(&events, |tick, _| tick);
+    Ok(MidiScore { ticks_per_quarter: tpq.as_int().max(1), notes, length })
+}
+
+type Merged<'a> = Vec<(u64, usize, usize, TrackEventKind<'a>)>;
+
+/// Every track's events on one timeline, in absolute ticks.
+///
+/// Tracks in a format 1 file run in parallel and the tempo usually lives in
+/// the first one, so they have to be merged before the clock can be worked out
+/// at all.
+fn merge<'a>(smf: &Smf<'a>) -> Result<Merged<'a>, MidiError> {
     if smf.header.format == Format::Sequential {
         return Err(MidiError::SequentialTracks);
     }
-
-    // Every track's events on one timeline. Tracks in a format 1 file run in
-    // parallel and the tempo usually lives in the first one, so they have to be
-    // merged before the clock can be worked out at all.
-    let mut merged: Vec<(u64, usize, usize, TrackEventKind<'_>)> = Vec::new();
+    let mut merged: Merged<'a> = Vec::new();
     for (track_index, track) in smf.tracks.iter().enumerate() {
         let mut tick = 0u64;
         for (order, event) in track.iter().enumerate() {
@@ -152,80 +222,58 @@ pub fn decode_bytes(data: &[u8], sample_rate: u32) -> Result<MidiSequence, MidiE
     // Ties broken by track then position, so a tempo change and a note on the
     // same tick resolve the same way every time the file is read.
     merged.sort_by_key(|(tick, track, order, _)| (*tick, *track, *order));
-
-    Ok(build(&merged, smf.header.timing, sample_rate))
+    Ok(merged)
 }
 
-fn build(events: &[(u64, usize, usize, TrackEventKind<'_>)], timing: Timing, sample_rate: u32) -> MidiSequence {
-    let ticks_per_beat = match timing {
-        Timing::Metrical(tpq) => Some(f64::from(tpq.as_int())),
-        Timing::Timecode(..) => None,
-    };
-    // A timecode file measures real time directly, so no tempo applies to it.
-    let timecode_seconds_per_tick = match timing {
-        Timing::Timecode(fps, subframes) => Some(1.0 / (f64::from(fps.as_f32()) * f64::from(subframes))),
-        Timing::Metrical(_) => None,
-    };
-
-    let mut tempo_us = DEFAULT_TEMPO_US;
-    let mut seconds = 0.0f64;
-    let mut last_tick = 0u64;
+/// Pairs note-ons with their note-offs, in whatever unit `now_of` measures
+/// time in. Returns the notes, earliest first, and when the last one ends.
+///
+/// `now_of` is called once per event, in order, with its tick — so a clock
+/// that follows tempo changes can keep its own state.
+fn pair(events: &Merged<'_>, mut now_of: impl FnMut(u64, &TrackEventKind<'_>) -> u64) -> (Vec<MidiNote>, u64) {
     // Keyed by channel and pitch, and ordered rather than hashed so that the
     // sweep of still-held keys at the end comes out the same way every time the
     // same file is read.
     let mut pending: BTreeMap<usize, (u64, f32)> = BTreeMap::new();
     let mut notes: Vec<MidiNote> = Vec::new();
-
-    let frame_of = |seconds: f64| (seconds * f64::from(sample_rate)).round() as u64;
+    let mut now = 0;
 
     for (tick, _, _, kind) in events {
-        let seconds_per_tick =
-            timecode_seconds_per_tick.unwrap_or_else(|| tempo_us / 1e6 / ticks_per_beat.unwrap_or(1.0).max(1.0));
-        seconds += (tick - last_tick) as f64 * seconds_per_tick;
-        last_tick = *tick;
-        let now = frame_of(seconds);
-
-        match kind {
-            // Read after the time has been advanced: a change applies to what
-            // comes after it, never to the stretch already counted.
-            TrackEventKind::Meta(MetaMessage::Tempo(us)) => tempo_us = f64::from(us.as_int()),
-            TrackEventKind::Midi { channel, message } => {
-                let channel = channel.as_int();
-                match message {
-                    // A note on with no velocity is a note off. Plenty of files
-                    // never send a real one.
-                    MidiMessage::NoteOn { key, vel } if vel.as_int() > 0 => {
-                        let slot = slot(channel, key.as_int());
-                        // The same key struck again before it was let go: end
-                        // the first rather than losing track of it.
-                        if let Some((start, velocity)) = pending.remove(&slot) {
-                            notes.push(finish(channel, key.as_int(), velocity, start, now));
-                        }
-                        pending.insert(slot, (now, f32::from(vel.as_int()) / 127.0));
+        now = now_of(*tick, kind);
+        if let TrackEventKind::Midi { channel, message } = kind {
+            let channel = channel.as_int();
+            match message {
+                // A note on with no velocity is a note off. Plenty of files
+                // never send a real one.
+                MidiMessage::NoteOn { key, vel } if vel.as_int() > 0 => {
+                    let slot = slot(channel, key.as_int());
+                    // The same key struck again before it was let go: end
+                    // the first rather than losing track of it.
+                    if let Some((start, velocity)) = pending.remove(&slot) {
+                        notes.push(finish(channel, key.as_int(), velocity, start, now));
                     }
-                    MidiMessage::NoteOff { key, .. } | MidiMessage::NoteOn { key, .. } => {
-                        let slot = slot(channel, key.as_int());
-                        if let Some((start, velocity)) = pending.remove(&slot) {
-                            notes.push(finish(channel, key.as_int(), velocity, start, now));
-                        }
-                    }
-                    _ => {}
+                    pending.insert(slot, (now, f32::from(vel.as_int()) / 127.0));
                 }
+                MidiMessage::NoteOff { key, .. } | MidiMessage::NoteOn { key, .. } => {
+                    let slot = slot(channel, key.as_int());
+                    if let Some((start, velocity)) = pending.remove(&slot) {
+                        notes.push(finish(channel, key.as_int(), velocity, start, now));
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 
     // A file that ends without letting go of a key: close it at the end rather
     // than dropping the note, which would silently lose the last chord.
-    let end = frame_of(seconds);
     for (slot, (start, velocity)) in pending {
-        notes.push(finish((slot / PITCHES) as u8, (slot % PITCHES) as u8, velocity, start, end));
+        notes.push(finish((slot / PITCHES) as u8, (slot % PITCHES) as u8, velocity, start, now));
     }
 
     notes.sort_by_key(|n| (n.start, n.channel, n.pitch));
-    let duration = notes.iter().map(|n| n.start + n.length).max().unwrap_or(0);
-    MidiSequence { notes, sample_rate, duration }
+    let end = notes.iter().map(|n| n.start + n.length).max().unwrap_or(0);
+    (notes, end)
 }
 
 fn slot(channel: u8, pitch: u8) -> usize {
@@ -376,6 +424,32 @@ mod tests {
         // before it exists, and it then sounds for ever.
         let bytes = metrical(vec![vec![note_on(0, 60, 100), note_off(0, 60), end()]]);
         assert_eq!(decode_bytes(&bytes, SR).unwrap().notes()[0].length, 1);
+    }
+
+    #[test]
+    fn a_score_keeps_the_files_ticks_whatever_its_tempo() {
+        // The same two notes as the tempo test: as a score, the tempo change
+        // moves nothing. A beat is TPQ ticks before it and after it.
+        let bytes = metrical(vec![vec![
+            note_on(0, 60, 100),
+            note_off(u32::from(TPQ), 60),
+            tempo(0, 250_000),
+            note_on(0, 64, 100),
+            note_off(u32::from(TPQ), 64),
+            end(),
+        ]]);
+        let score = score_bytes(&bytes).unwrap();
+        assert_eq!(score.ticks_per_quarter, TPQ);
+        let starts: Vec<(u8, u64, u64)> = score.notes.iter().map(|n| (n.pitch, n.start, n.length)).collect();
+        let tpq = u64::from(TPQ);
+        assert_eq!(starts, vec![(60, 0, tpq), (64, tpq, tpq)]);
+        assert_eq!(score.length, 2 * tpq);
+    }
+
+    #[test]
+    fn a_timecode_file_has_no_score() {
+        let bytes = write(Format::Parallel, Timing::Timecode(midly::Fps::Fps25, 40), vec![vec![end()]]);
+        assert!(matches!(score_bytes(&bytes), Err(MidiError::NotMetrical)));
     }
 
     #[test]

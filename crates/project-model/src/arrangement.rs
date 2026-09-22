@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AssetId, Tick, TrackId};
+use crate::{Asset, AssetId, Tick, TrackId};
 
 /// Identifies a clip for the life of a project. Never reused (decision D2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -133,4 +133,21 @@ pub struct Placement {
     /// `None` plays the whole clip. Only a MIDI clip can be windowed: an audio
     /// clip has no length in ticks to window.
     pub window: Option<Window>,
+}
+
+/// A clip made together with the track it goes on, placed at the start.
+///
+/// What a file dropped onto the window becomes: one command, so one undo takes
+/// the track and its material back together.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NewClip {
+    Audio {
+        asset: Asset,
+    },
+    /// Notes from the clip's start; each must fit inside `length`.
+    Midi {
+        length: Tick,
+        notes: Vec<Note>,
+    },
 }

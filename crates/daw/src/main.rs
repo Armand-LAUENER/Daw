@@ -7,6 +7,7 @@
 //! of the split: the engine is the part that has to stay still.
 
 mod clip;
+mod import;
 mod layout;
 mod studio;
 mod theme;
@@ -17,15 +18,15 @@ use std::sync::Arc;
 
 use eframe::egui;
 use engine_core::{
-    AutomationSender, Clock, Graph, GraphSwapper, Node, ParamId, TransportCommand, TransportControl,
-    automation_channel, graph_channel, transport_channel,
+    AutomationSender, Clock, Graph, GraphSwapper, Node, NoteAction, NoteEvent, ParamId, Sequencer, TransportCommand,
+    TransportControl, automation_channel, graph_channel, transport_channel,
 };
-use engine_dsp::SineOsc;
+use engine_dsp::{Adsr, SineOsc, Waveform};
 use engine_io::{AudioEngine, EngineOptions, Stats, default_output_config, map_frames};
-use project_engine::{Position, Timing, audio_starts};
-use project_model::{Asset, Command, Project, Session, Source, Track};
+use project_engine::{Position, Timing, audio_starts, note_plan};
+use project_model::{Asset, Command, NewClip, Project, Session, Source, Track};
 
-use clip::{Lane, Library, Silence};
+use clip::{Lane, Layers, Library, Silence};
 use layout::Layout;
 use studio::{Engine, Sources, Studio};
 use theme::Theme;
@@ -97,13 +98,18 @@ impl Sources for FileSources {
                     .filter_map(|(asset, start)| Some((*start, self.library.get(&project.asset(*asset)?.path)?)))
                     .collect();
                 // Clips the library could not read: the tone says so audibly.
-                // MIDI clips are not played yet, so a track holding only those
-                // is silent rather than toned.
                 if clips.len() < starts.len() {
-                    tone_for(track, self.sample_rate)
-                } else {
-                    Box::new(Lane::new(clips, Arc::clone(&self.clock)))
+                    return tone_for(track, self.sample_rate);
                 }
+                let mut layers: Vec<Box<dyn Node>> = Vec::new();
+                if !clips.is_empty() {
+                    layers.push(Box::new(Lane::new(clips, Arc::clone(&self.clock))));
+                }
+                let notes = note_plan(project, track.id, timing);
+                if !notes.is_empty() {
+                    layers.push(instrument(notes, Arc::clone(&self.clock), self.sample_rate));
+                }
+                Box::new(Layers(layers))
             }
             Source::Tone => tone_for(track, self.sample_rate),
             Source::Silent => Box::new(Silence),
@@ -117,6 +123,26 @@ fn tone_for(track: &Track, sample_rate: f32) -> Box<dyn Node> {
     let step = track.id.0 as usize;
     let octave = 2f32.powi((step / SCALE.len()) as i32);
     Box::new(Tone { osc: SineOsc::new(sample_rate), frequency: SCALE[step % SCALE.len()] * octave })
+}
+
+/// How many notes a MIDI track can hold at once before it steals a voice.
+const INSTRUMENT_VOICES: usize = 12;
+/// Each note's share of full scale at the highest velocity, so a full chord
+/// of voices stays near the top rather than far past it.
+const INSTRUMENT_LEVEL: f32 = 0.2;
+
+/// What a MIDI track plays through until tracks can choose an instrument: a
+/// band-limited saw with a short attack and a soft release.
+fn instrument(events: Vec<NoteEvent>, clock: Arc<Clock>, sample_rate: f32) -> Box<dyn Node> {
+    let scaled = events
+        .into_iter()
+        .map(|e| match e.action {
+            NoteAction::On { velocity } => NoteEvent::on(e.pitch, velocity * INSTRUMENT_LEVEL, e.frame),
+            NoteAction::Off => e,
+        })
+        .collect();
+    let envelope = Adsr::new(0.005, 0.15, 0.6, 0.25, sample_rate);
+    Box::new(Sequencer::new(INSTRUMENT_VOICES, Waveform::Saw, &envelope, scaled, clock, sample_rate))
 }
 
 /// The real engine: a queue for parameters and a hand-over for graphs.
@@ -245,6 +271,10 @@ impl App {
             self.open(&path);
             return;
         }
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mid") || e.eq_ignore_ascii_case("midi")) {
+            self.load_midi(&path);
+            return;
+        }
         // Bound before the match rather than inside it, so reading the file is
         // finished with before the graph is rebuilt from it. Holding the two at
         // once is what the borrow checker is here to refuse.
@@ -265,10 +295,31 @@ impl App {
                 let seconds = audio.duration().as_secs_f64();
                 self.trouble = None;
                 println!("loaded {} ({:.1}s, {} ch)", path.display(), seconds, audio.channels);
-                let command = Command::AddTrack { name, source: Source::Clips, file: Some(asset) };
+                let command = Command::AddTrack { name, source: Source::Clips, clip: Some(NewClip::Audio { asset }) };
                 let _ = self.studio.apply(command, &mut self.sources);
             }
             Err(e) => self.report(format!("{}: {e}", path.display())),
+        }
+    }
+
+    /// Reads a MIDI file into a new track holding one clip of its notes.
+    ///
+    /// One command, so one undo. The file's tempo is not taken: the notes are
+    /// in beats, and the project's tempo plays them.
+    fn load_midi(&mut self, path: &Path) {
+        let score = match engine_midi::read_score(path) {
+            Ok(score) => score,
+            Err(e) => return self.report(format!("{}: {e}", path.display())),
+        };
+        let Some(clip) = import::midi_clip(&score, self.studio.project().meter()) else {
+            return self.report(format!("{}: no notes in it", path.display()));
+        };
+        let name = path.file_stem().map_or_else(|| "MIDI".into(), |n| n.to_string_lossy().into_owned());
+        println!("loaded {} ({} notes)", path.display(), score.notes.len());
+        self.trouble = None;
+        let command = Command::AddTrack { name, source: Source::Clips, clip: Some(clip) };
+        if let Err(e) = self.studio.apply(command, &mut self.sources) {
+            self.report(format!("{}: {e}", path.display()));
         }
     }
 

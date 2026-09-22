@@ -10,7 +10,7 @@
 //! a new chance to write the reverse wrongly. That risk is paid for here, once,
 //! rather than discovered later as quietly corrupted work.
 
-use project_model::{Asset, AssetId, Command, Meter, Note, Project, Session, Source, Tempo, Tick, Window};
+use project_model::{Asset, AssetId, Command, Meter, NewClip, Note, Project, Session, Source, Tempo, Tick, Window};
 use proptest::prelude::*;
 
 /// An edit aimed at a track by position, since the ids are not known until the
@@ -111,7 +111,7 @@ fn to_command(project: &Project, action: &Action) -> Option<Command> {
         (!notes.is_empty()).then(|| *notes.keys().nth(usize::from(i) % notes.len()).expect("in range"))
     };
     Some(match action {
-        Action::Add => Command::AddTrack { name: "track".into(), source: Default::default(), file: None },
+        Action::Add => Command::AddTrack { name: "track".into(), source: Default::default(), clip: None },
         Action::Remove(i) => Command::RemoveTrack { id: pick(*i)? },
         Action::Rename(i, name) => Command::RenameTrack { id: pick(*i)?, name: name.clone() },
         Action::Gain(i, gain) => Command::SetGain { id: pick(*i)?, gain: *gain },
@@ -156,9 +156,11 @@ fn to_command(project: &Project, action: &Action) -> Option<Command> {
             let meter: Meter = serde_json::from_value(serde_json::json!({ "beats": beats, "unit": unit })).ok()?;
             Command::SetMeter { meter }
         }
-        Action::AddWithFile(n) => {
-            Command::AddTrack { name: "file".into(), source: Source::Clips, file: Some(asset(*n)) }
-        }
+        Action::AddWithFile(n) => Command::AddTrack {
+            name: "file".into(),
+            source: Source::Clips,
+            clip: Some(NewClip::Audio { asset: asset(*n) }),
+        },
     })
 }
 

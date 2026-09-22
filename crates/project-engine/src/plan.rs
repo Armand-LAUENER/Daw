@@ -72,7 +72,7 @@ mod tests {
 
     fn session_with_clip(notes: &[Note]) -> (Session, TrackId) {
         let mut session = Session::new();
-        session.apply(Command::AddTrack { name: "t".into(), source: Source::Clips, file: None }).unwrap();
+        session.apply(Command::AddTrack { name: "t".into(), source: Source::Clips, clip: None }).unwrap();
         let track = session.project().tracks().next().unwrap().id;
         session.apply(Command::AddMidiClip { track, name: "m".into(), start: BAR, length: BAR }).unwrap();
         let clip = session.project().placements_on(track)[0].clip;
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn audio_starts_follow_the_tempo() {
         let mut session = Session::new();
-        session.apply(Command::AddTrack { name: "t".into(), source: Source::Clips, file: None }).unwrap();
+        session.apply(Command::AddTrack { name: "t".into(), source: Source::Clips, clip: None }).unwrap();
         let track = session.project().tracks().next().unwrap().id;
         let asset = project_model::Asset::new(AssetId::of_bytes(b"a"), "/a.wav");
         session.apply(Command::AddAudioClip { track, asset, start: BAR }).unwrap();

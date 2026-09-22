@@ -28,31 +28,91 @@ struct Voice {
 /// It adds to whatever reaches it instead of overwriting, so it can sit on a
 /// bus with something else.
 pub struct Synth {
-    voices: Vec<Voice>,
-    shape: Waveform,
+    voices: Voices,
     notes: NoteQueue,
     /// Where the next block starts on the engine's timeline.
     frame: u64,
-    /// Counts note starts, which is all "oldest" has to mean here.
-    age: u64,
 }
 
 impl Synth {
     /// `envelope` is the shape every voice takes; `voices` is the polyphony.
     pub fn new(voices: usize, shape: Waveform, envelope: &Adsr, notes: NoteQueue, sample_rate: f32) -> Self {
-        let voices = (0..voices.max(1))
-            .map(|_| Voice { osc: Osc::new(sample_rate), env: envelope.clone(), pitch: 0, velocity: 0.0, started: 0 })
-            .collect();
-        Self { voices, shape, notes, frame: 0, age: 0 }
+        Self { voices: Voices::new(voices, shape, envelope, sample_rate), notes, frame: 0 }
     }
 
     /// How many voices are sounding, for metering and for tests.
     pub fn active_voices(&self) -> usize {
-        self.voices.iter().filter(|v| v.env.is_active()).count()
+        self.voices.active()
     }
 
     pub fn polyphony(&self) -> usize {
+        self.voices.polyphony()
+    }
+}
+
+/// A fixed pool of voices and the rules for sharing them.
+///
+/// Shared by everything that turns notes into sound — the live [`Synth`] and
+/// the timeline's [`Sequencer`](crate::Sequencer) — so stealing, retriggering
+/// and release behave the same whichever one is playing.
+pub(crate) struct Voices {
+    voices: Vec<Voice>,
+    shape: Waveform,
+    /// Counts note starts, which is all "oldest" has to mean here.
+    age: u64,
+}
+
+impl Voices {
+    pub(crate) fn new(voices: usize, shape: Waveform, envelope: &Adsr, sample_rate: f32) -> Self {
+        let voices = (0..voices.max(1))
+            .map(|_| Voice { osc: Osc::new(sample_rate), env: envelope.clone(), pitch: 0, velocity: 0.0, started: 0 })
+            .collect();
+        Self { voices, shape, age: 0 }
+    }
+
+    pub(crate) fn active(&self) -> usize {
+        self.voices.iter().filter(|v| v.env.is_active()).count()
+    }
+
+    pub(crate) fn polyphony(&self) -> usize {
         self.voices.len()
+    }
+
+    pub(crate) fn play(&mut self, pitch: u8, action: NoteAction) {
+        match action {
+            NoteAction::On { velocity } => self.start(pitch, velocity),
+            NoteAction::Off => self.stop(pitch),
+        }
+    }
+
+    /// The next sample of every sounding voice, summed.
+    pub(crate) fn next_sample(&mut self) -> f32 {
+        let mut mixed = 0.0;
+        for voice in &mut self.voices {
+            if !voice.env.is_active() {
+                continue;
+            }
+            let level = voice.env.next_value() * voice.velocity;
+            mixed += voice.osc.next_sample(pitch_to_hz(voice.pitch), self.shape) * level;
+        }
+        mixed
+    }
+
+    /// Lets every held note go, through its release rather than cut dead.
+    pub(crate) fn release_all(&mut self) {
+        for voice in &mut self.voices {
+            if voice.env.is_active() && !voice.env.is_releasing() {
+                voice.env.note_off();
+            }
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        for voice in &mut self.voices {
+            voice.env.reset();
+            voice.osc.reset();
+        }
+        self.age = 0;
     }
 
     fn start(&mut self, pitch: u8, velocity: f32) {
@@ -112,20 +172,10 @@ impl Node for Synth {
         for frame in 0..frames {
             let at = self.frame + frame as u64;
             while let Some(event) = self.notes.take_due(at) {
-                match event.action {
-                    NoteAction::On { velocity } => self.start(event.pitch, velocity),
-                    NoteAction::Off => self.stop(event.pitch),
-                }
+                self.voices.play(event.pitch, event.action);
             }
 
-            let mut mixed = 0.0;
-            for voice in &mut self.voices {
-                if !voice.env.is_active() {
-                    continue;
-                }
-                let level = voice.env.next_value() * voice.velocity;
-                mixed += voice.osc.next_sample(pitch_to_hz(voice.pitch), self.shape) * level;
-            }
+            let mixed = self.voices.next_sample();
             for channel in 0..channels {
                 buffer.channel_mut(channel)[frame] += mixed;
             }
@@ -142,14 +192,10 @@ impl Node for Synth {
     }
 
     fn reset(&mut self) {
-        for voice in &mut self.voices {
-            voice.env.reset();
-            voice.osc.reset();
-        }
+        self.voices.reset();
         // Notes queued for wherever playback was no longer mean anything.
         self.notes.clear();
         self.frame = 0;
-        self.age = 0;
     }
 }
 

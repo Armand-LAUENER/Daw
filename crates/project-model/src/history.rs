@@ -230,7 +230,7 @@ mod tests {
         let mut session = Session::new();
         for i in 0..n {
             session
-                .apply(Command::AddTrack { name: format!("track {i}"), source: Source::default(), file: None })
+                .apply(Command::AddTrack { name: format!("track {i}"), source: Source::default(), clip: None })
                 .expect("adding always works");
         }
         Session::from_project(session.project().clone())
@@ -282,7 +282,7 @@ mod tests {
         // Replaying the command instead of the resolved edit would mint a new
         // id, and every later step naming the old one would miss.
         let mut session = Session::new();
-        session.apply(Command::AddTrack { name: "one".into(), source: Default::default(), file: None }).unwrap();
+        session.apply(Command::AddTrack { name: "one".into(), source: Default::default(), clip: None }).unwrap();
         let id = first(&session);
 
         assert!(session.undo());
@@ -296,17 +296,17 @@ mod tests {
         // one's number: a saved file, or a reference taken in between, would
         // mistake the stranger for it (decision D2).
         let mut session = Session::new();
-        session.apply(Command::AddTrack { name: "one".into(), source: Default::default(), file: None }).unwrap();
+        session.apply(Command::AddTrack { name: "one".into(), source: Default::default(), clip: None }).unwrap();
         let undone = first(&session);
         assert!(session.undo());
-        session.apply(Command::AddTrack { name: "two".into(), source: Default::default(), file: None }).unwrap();
+        session.apply(Command::AddTrack { name: "two".into(), source: Default::default(), clip: None }).unwrap();
         assert_ne!(first(&session), undone, "an undone track's id was handed out again");
 
         // Nor after the highest track is removed, which is where deriving the
         // next id from what exists would reuse it.
         let last = first(&session);
         session.apply(Command::RemoveTrack { id: last }).unwrap();
-        session.apply(Command::AddTrack { name: "three".into(), source: Default::default(), file: None }).unwrap();
+        session.apply(Command::AddTrack { name: "three".into(), source: Default::default(), clip: None }).unwrap();
         assert_ne!(first(&session), last);
     }
 

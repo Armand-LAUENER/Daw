@@ -930,6 +930,7 @@ dependencies = [
  "engine-dsp",
  "engine-io",
  "engine-io-file",
+ "engine-midi",
  "project-engine",
  "project-model",
 ]
