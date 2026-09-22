@@ -186,3 +186,25 @@ fn a_track_made_with_its_notes_is_one_step_and_refused_whole() {
     assert!(session.apply(Command::AddTrack { name: "bad".into(), source: Source::Clips, clip }).is_err());
     assert_eq!(session.project().track_count(), 0);
 }
+
+#[test]
+fn trimming_the_front_keeps_the_notes_where_they_were_in_time() {
+    let (mut session, track) = with_track();
+    let (clip, placement) = midi_clip(&mut session, track);
+    session.apply(Command::AddNote { clip, note: Note::new(60, 100, Tick(1_920), Tick(960)) }).unwrap();
+    let window = Some(project_model::Window { offset: Tick(960), length: Tick(2_880) });
+    session.apply(Command::TrimPlacement { id: placement, start: Tick(960), window }).unwrap();
+    let p = *session.project().placement(placement).unwrap();
+    // The note is 1 920 into the clip; the window starts 960 in, placed at 960:
+    // it still sounds at 960 + (1 920 - 960) = 1 920 on the timeline.
+    assert_eq!(p.start.0 + 1_920 - p.window.unwrap().offset.0, 1_920);
+
+    // A trim and then a trim again is one gesture.
+    let depth = session.depth();
+    let window = Some(project_model::Window { offset: Tick(0), length: Tick(1_920) });
+    session.apply(Command::TrimPlacement { id: placement, start: Tick(0), window }).unwrap();
+    assert_eq!(session.depth(), depth, "a trim continuing the same gesture took a new step");
+
+    let outside = Some(project_model::Window { offset: Tick(3_000), length: Tick(960) });
+    assert!(session.apply(Command::TrimPlacement { id: placement, start: Tick(0), window: outside }).is_err());
+}

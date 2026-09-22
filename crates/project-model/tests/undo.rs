@@ -33,6 +33,7 @@ enum Action {
     /// On a placement: to a track, at a start.
     Move(u8, u8, u8),
     Window(u8, u8, u8),
+    Trim(u8, u8, u8, u8),
     Duplicate(u8, u8, u8, bool),
     Unique(u8),
     RemovePlacement(u8),
@@ -72,6 +73,7 @@ fn action() -> impl Strategy<Value = Action> {
         1 => any::<u8>().prop_map(Action::Clear),
         2 => any::<(u8, u8, u8)>().prop_map(|(p, t, s)| Action::Move(p, t, s)),
         1 => any::<(u8, u8, u8)>().prop_map(|(p, o, l)| Action::Window(p, o, l)),
+        1 => any::<(u8, u8, u8, u8)>().prop_map(|(p, s, o, l)| Action::Trim(p, s, o, l)),
         2 => any::<(u8, u8, u8, bool)>().prop_map(|(p, t, s, l)| Action::Duplicate(p, t, s, l)),
         1 => any::<u8>().prop_map(Action::Unique),
         1 => any::<u8>().prop_map(Action::RemovePlacement),
@@ -128,6 +130,10 @@ fn to_command(project: &Project, action: &Action) -> Option<Command> {
         Action::Window(p, o, l) => {
             let window = (*l != 0).then(|| Window { offset: quarters(*o), length: quarters(*l) });
             Command::SetWindow { id: placement(*p)?, window }
+        }
+        Action::Trim(p, s, o, l) => {
+            let window = (*l != 0).then(|| Window { offset: quarters(*o), length: quarters(*l) });
+            Command::TrimPlacement { id: placement(*p)?, start: beats(*s), window }
         }
         Action::Duplicate(p, t, s, linked) => {
             Command::DuplicatePlacement { id: placement(*p)?, track: pick(*t)?, start: beats(*s), linked: *linked }

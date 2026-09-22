@@ -32,6 +32,9 @@ pub struct Actions {
     /// timeline (false). Keys go there, so Delete removes the note being
     /// edited rather than the clip around it.
     pub keys_to_editor: Option<bool>,
+    /// A note to hear, as pitch and velocity: one just placed, picked up, or
+    /// moved to another pitch in the editor.
+    pub preview: Option<(u8, u8)>,
     /// The project is to be written to disk.
     pub save: bool,
     /// Play, pause, stop or seek. Not a [`Command`]: where the playhead is

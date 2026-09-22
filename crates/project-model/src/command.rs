@@ -100,6 +100,14 @@ pub enum Command {
         id: PlacementId,
         window: Option<Window>,
     },
+    /// Trims a placement from either end in one gesture: a new start and a new
+    /// window together, so trimming the front moves the start and the offset
+    /// by the same amount and the notes stay where they were in time.
+    TrimPlacement {
+        id: PlacementId,
+        start: Tick,
+        window: Option<Window>,
+    },
     /// Puts a placement's clip somewhere else too. Linked, the new placement
     /// plays the same clip and follows its edits; not linked, it gets a copy of
     /// its own.
@@ -163,7 +171,7 @@ impl Command {
             Self::SetMasterGain { .. } => Some(Target(2, PROJECT)),
             Self::SetTempo { .. } => Some(Target(3, PROJECT)),
             Self::MovePlacement { id, .. } => Some(Target(4, id.0)),
-            Self::SetWindow { id, .. } => Some(Target(5, id.0)),
+            Self::SetWindow { id, .. } | Self::TrimPlacement { id, .. } => Some(Target(5, id.0)),
             Self::SetNote { id, .. } => Some(Target(6, id.0)),
             Self::AddTrack { .. }
             | Self::RemoveTrack { .. }
@@ -461,14 +469,14 @@ pub(crate) fn resolve(project: &Project, ids: &mut Ids, command: Command) -> Res
         }
         Command::SetWindow { id, window } => {
             let was = placement(id)?;
-            if let Some(window) = window {
-                let length = clip(was.clip)?.length();
-                let fits = length.is_some_and(|l| window.length.0 > 0 && window.offset.0 + window.length.0 <= l.0);
-                if !fits {
-                    return Err(CommandError::OutOfRange("a window"));
-                }
-            }
+            window_fits(clip(was.clip)?, window)?;
             let now = Placement { window, ..was };
+            one(Edit::SetPlacement { placement: now }, Edit::SetPlacement { placement: was })
+        }
+        Command::TrimPlacement { id, start, window } => {
+            let was = placement(id)?;
+            window_fits(clip(was.clip)?, window)?;
+            let now = Placement { start, window, ..was };
             one(Edit::SetPlacement { placement: now }, Edit::SetPlacement { placement: was })
         }
         Command::DuplicatePlacement { id, track: to, start, linked } => {
@@ -553,6 +561,13 @@ fn copy_of(clip: &Clip, ids: &mut Ids) -> Clip {
         }
     };
     Clip { id: ids.take_clip(), name: clip.name.clone(), content }
+}
+
+/// A window must be inside its clip, and only a MIDI clip has one.
+fn window_fits(clip: &Clip, window: Option<Window>) -> Result<(), CommandError> {
+    let Some(window) = window else { return Ok(()) };
+    let fits = clip.length().is_some_and(|l| window.length.0 > 0 && window.offset.0 + window.length.0 <= l.0);
+    if fits { Ok(()) } else { Err(CommandError::OutOfRange("a window")) }
 }
 
 fn fits(note: &Note, length: Tick) -> Result<(), CommandError> {

@@ -161,6 +161,7 @@ pub fn route(bindings: &Bindings, command: &Command) -> Change {
         | Command::AddMidiClip { .. }
         | Command::MovePlacement { .. }
         | Command::SetWindow { .. }
+        | Command::TrimPlacement { .. }
         | Command::DuplicatePlacement { .. }
         | Command::MakeUnique { .. }
         | Command::RemovePlacement { .. }

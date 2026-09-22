@@ -21,8 +21,9 @@ use std::sync::Arc;
 
 use eframe::egui;
 use engine_core::{
-    AutomationSender, Clock, Graph, GraphSwapper, Node, NoteAction, NoteEvent, ParamId, Sequencer, TransportCommand,
-    TransportControl, automation_channel, graph_channel, transport_channel,
+    AudioBuffer, AutomationSender, Clock, Graph, GraphSwapper, Node, NoteAction, NoteEvent, NoteSender, ParamId,
+    Sequencer, Synth, TransportCommand, TransportControl, automation_channel, graph_channel, note_channel,
+    transport_channel,
 };
 use engine_dsp::{Adsr, SineOsc, Waveform};
 use engine_io::{AudioEngine, EngineOptions, Stats, default_output_config, map_frames};
@@ -144,9 +145,24 @@ fn instrument(events: Vec<NoteEvent>, clock: Arc<Clock>, sample_rate: f32) -> Bo
             NoteAction::Off => e,
         })
         .collect();
-    let envelope = Adsr::new(0.005, 0.15, 0.6, 0.25, sample_rate);
-    Box::new(Sequencer::new(INSTRUMENT_VOICES, Waveform::Saw, &envelope, scaled, clock, sample_rate))
+    Box::new(Sequencer::new(
+        INSTRUMENT_VOICES,
+        INSTRUMENT_SHAPE,
+        &instrument_envelope(sample_rate),
+        scaled,
+        clock,
+        sample_rate,
+    ))
 }
+
+const INSTRUMENT_SHAPE: Waveform = Waveform::Saw;
+
+fn instrument_envelope(sample_rate: f32) -> Adsr {
+    Adsr::new(0.005, 0.15, 0.6, 0.25, sample_rate)
+}
+
+/// How long a note being placed or moved in the editor is heard for.
+const PREVIEW: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The real engine: a queue for parameters and a hand-over for graphs.
 struct LiveEngine {
@@ -190,6 +206,10 @@ struct App {
     sources: FileSources,
     /// Play, pause, stop, and where the timeline is.
     transport: TransportControl,
+    /// Notes heard while editing.
+    preview: NoteSender,
+    /// When each note being heard is let go.
+    releases: Vec<(std::time::Instant, u8)>,
     /// The last thing that went wrong, for the strip along the bottom.
     trouble: Option<String>,
     /// Where the project was last saved or opened from. `None` until then,
@@ -226,6 +246,13 @@ impl App {
         // Everything the callback needs is built here and moved in: allocating
         // inside it would trip the no-allocation check the engine wraps it in.
         let mut mix = vec![0.0f32; MAX_GRAPH_FRAMES * GRAPH_CHANNELS];
+        // Notes heard while editing, whatever the transport is doing. Outside
+        // the graph, so a rebuild never cuts one off, and with the tracks'
+        // instrument, so a note sounds as it will when played.
+        let (preview, preview_notes) = note_channel(64);
+        let mut auditioner =
+            Synth::new(4, INSTRUMENT_SHAPE, &instrument_envelope(sample_rate), preview_notes, sample_rate);
+        let mut auditioned = vec![0.0f32; MAX_GRAPH_FRAMES * GRAPH_CHANNELS];
         let mut frame = 0u64;
         let (transport, mut timeline) = transport_channel(sample_rate, 64);
 
@@ -241,6 +268,15 @@ impl App {
                 timeline.begin();
                 player.process_automated(stereo, &mut queue, frame);
                 timeline.finish(stereo, GRAPH_CHANNELS);
+                // Added after the transport's fade, so it sounds when stopped.
+                let heard = &mut auditioned[..span * GRAPH_CHANNELS];
+                heard.fill(0.0);
+                auditioner.set_frame(frame);
+                auditioner.process(&mut AudioBuffer::new(heard, GRAPH_CHANNELS));
+                for (at, sample) in stereo.iter_mut().enumerate() {
+                    // `heard` is planar, one channel after the other.
+                    *sample += heard[(at % GRAPH_CHANNELS) * span + at / GRAPH_CHANNELS];
+                }
                 map_frames(stereo, GRAPH_CHANNELS, &mut out[done * channels..(done + span) * channels], channels);
                 frame += span as u64;
                 done += span;
@@ -279,6 +315,8 @@ impl App {
             editor_keys: false,
             sources,
             transport,
+            preview,
+            releases: Vec::new(),
             trouble: None,
             project_path: None,
             stats,
@@ -440,6 +478,19 @@ impl App {
         if actions.save {
             self.save();
         }
+        if let Some((pitch, velocity)) = actions.preview {
+            let level = f32::from(velocity) / 127.0 * INSTRUMENT_LEVEL;
+            // Frame zero is always due: the note plays at the next block.
+            if self.preview.send(NoteEvent::on(pitch, level, 0)).is_ok() {
+                self.releases.push((std::time::Instant::now() + PREVIEW, pitch));
+            }
+        }
+        let now = std::time::Instant::now();
+        let preview = &mut self.preview;
+        self.releases.retain(|(at, pitch)| {
+            // Kept for another frame if the queue had no room.
+            *at > now || preview.send(NoteEvent::off(*pitch, 0)).is_err()
+        });
         if let Some(command) = actions.transport {
             // A full queue means the audio thread has stalled; the button
             // simply does nothing this time rather than freezing the window.
@@ -631,7 +682,8 @@ impl eframe::App for App {
         // The status strip reads counters the audio thread keeps moving, so the
         // window has to come back even when nobody touches it.
         // Faster while playing, so the counter moves smoothly.
-        let every = if self.transport.clock().is_running() { 30 } else { 200 };
+        let busy = self.transport.clock().is_running() || !self.releases.is_empty();
+        let every = if busy { 30 } else { 200 };
         ctx.request_repaint_after(std::time::Duration::from_millis(every));
     }
 }

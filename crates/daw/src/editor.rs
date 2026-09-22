@@ -186,6 +186,7 @@ pub fn show(ui: &mut Ui, project: &Project, editor: &mut Editor, cx: &Context<'_
         let (pointer, pitch) = (editor.tick_at(pos.x - grid_rect.left()), editor.pitch_at(pos.y - grid_rect.top()));
         if let Some(note) = drawn(pointer, pitch, editor.length, grid, length) {
             actions.commands.push(Command::AddNote { clip: clip.id, note });
+            actions.preview = Some((note.pitch, note.velocity));
         }
     }
 
@@ -315,6 +316,7 @@ fn handle_note(
     }
     if response.clicked() || response.drag_started() {
         editor.selected = Some(id);
+        actions.preview = Some((note.pitch, note.velocity));
     }
     if response.drag_started()
         && let Some(pos) = response.interact_pointer_pos()
@@ -336,6 +338,10 @@ fn handle_note(
             Some(Drag::Stretch { note: n }) if n == id => stretched(note, pointer, grid, length),
             _ => note,
         };
+        if changed.pitch != note.pitch {
+            // Heard at each new pitch, so a note is placed by ear.
+            actions.preview = Some((changed.pitch, changed.velocity));
+        }
         if changed != note {
             // Every frame the note moves; the history folds them into one
             // step per note, closed when the mouse is let go.

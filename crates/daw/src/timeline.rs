@@ -17,7 +17,7 @@ use std::sync::Arc;
 use eframe::egui::{self, Align2, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
 use engine_core::TransportCommand;
 use project_engine::Timing;
-use project_model::{AssetId, Command, Content, Meter, PPQ, Placement, PlacementId, Project, Tick, TrackId};
+use project_model::{AssetId, Command, Content, Meter, PPQ, Placement, PlacementId, Project, Tick, TrackId, Window};
 
 use crate::peaks::Peaks;
 use crate::theme::Theme;
@@ -33,6 +33,26 @@ const MIN_ZOOM: f32 = 4.0;
 const MAX_ZOOM: f32 = 400.0;
 /// Above this zoom the grid is sixteenths rather than beats.
 const FINE_GRID_ZOOM: f32 = 80.0;
+/// How close to a MIDI clip's end the pointer must be to trim it rather than
+/// move it.
+const EDGE: f32 = 6.0;
+
+/// What a drag on a clip is doing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Drag {
+    /// Picked up this many ticks after its start, so it moves with the
+    /// pointer instead of jumping its start to it.
+    Move {
+        id: PlacementId,
+        grab: f64,
+    },
+    TrimStart {
+        id: PlacementId,
+    },
+    TrimEnd {
+        id: PlacementId,
+    },
+}
 
 /// How the timeline is being looked at. Not part of the project.
 #[derive(Debug, Clone)]
@@ -46,9 +66,7 @@ pub struct View {
     pub selected: Option<PlacementId>,
     /// A MIDI clip double-clicked, for the note editor to open on.
     pub open: Option<PlacementId>,
-    /// A clip being dragged, and how far into it it was picked up, in ticks,
-    /// so it moves with the pointer instead of jumping its start to it.
-    drag: Option<(PlacementId, f64)>,
+    drag: Option<Drag>,
 }
 
 impl Default for View {
@@ -110,6 +128,42 @@ pub fn drop_at(view: &View, x: f32, grab: f64, grid: Option<u64>) -> Tick {
 pub fn row_at(view: &View, y: f32, rows: usize) -> Option<usize> {
     let row = ((y + view.scroll_y) / ROW_HEIGHT).floor();
     (rows > 0).then(|| (row.max(0.0) as usize).min(rows - 1))
+}
+
+/// The window a placement plays: `None` when it covers the whole clip, so a
+/// clip trimmed back out to its full length is exactly what it was.
+fn window(offset: u64, length: u64, clip: u64) -> Option<Window> {
+    (offset != 0 || length != clip).then_some(Window { offset: Tick(offset), length: Tick(length) })
+}
+
+/// The end of a MIDI placement dragged to `pointer`: at least a grid step
+/// long, and never past the end of its clip.
+pub fn trim_end(start: Tick, offset: u64, clip: u64, pointer: f64, grid: Option<u64>) -> Option<Window> {
+    let room = clip.saturating_sub(offset).max(1);
+    let step = grid.unwrap_or(1).clamp(1, room);
+    let length = snap(pointer, grid).0.saturating_sub(start.0).clamp(step, room);
+    window(offset, length, clip)
+}
+
+/// The start of a MIDI placement dragged to `pointer`, its end staying where
+/// it is in time. The window's offset moves by the same amount as the start,
+/// so every note keeps its place on the timeline; it cannot move before the
+/// clip's own beginning, nor closer than a grid step to the end.
+pub fn trim_start(
+    start: Tick,
+    offset: u64,
+    length: u64,
+    clip: u64,
+    pointer: f64,
+    grid: Option<u64>,
+) -> (Tick, Option<Window>) {
+    let end = start.0 + length;
+    let step = grid.unwrap_or(1).clamp(1, length.max(1));
+    let earliest = start.0.saturating_sub(offset);
+    let latest = end.saturating_sub(step).max(earliest);
+    let new_start = snap(pointer, grid).0.clamp(earliest, latest);
+    let new_offset = offset + new_start - earliest - (start.0 - earliest);
+    (Tick(new_start), window(new_offset, end - new_start, clip))
 }
 
 /// How long a placement is on the timeline, in ticks.
@@ -385,24 +439,62 @@ fn handle_clip(
     if response.double_clicked() && project.clip(placement.clip).is_some_and(|c| c.length().is_some()) {
         view.open = Some(placement.id);
     }
+    // A MIDI clip's ends trim it; audio clips have no window to trim yet.
+    let clip_length = project.clip(placement.clip).and_then(|c| c.length()).map(|l| l.0);
+    let edge = |pos: Pos2| {
+        let body = response.rect;
+        clip_length.and_then(|_| {
+            if pos.x <= body.left() + EDGE {
+                Some(Drag::TrimStart { id: placement.id })
+            } else if pos.x >= body.right() - EDGE {
+                Some(Drag::TrimEnd { id: placement.id })
+            } else {
+                None
+            }
+        })
+    };
+    if let Some(pos) = response.hover_pos()
+        && edge(pos).is_some()
+    {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
     if response.drag_started()
         && let Some(pos) = response.interact_pointer_pos()
     {
-        view.drag = Some((placement.id, view.tick_at(pos.x - lanes.left()) - placement.start.0 as f64));
+        let grab = view.tick_at(pos.x - lanes.left()) - placement.start.0 as f64;
+        view.drag = Some(edge(pos).unwrap_or(Drag::Move { id: placement.id, grab }));
     }
     if response.dragged()
-        && let Some((id, grab)) = view.drag
-        && id == placement.id
         && let Some(pos) = response.interact_pointer_pos()
     {
         // Alt lets go of the grid, for placing by ear.
         let grid = (!ui.input(|i| i.modifiers.alt)).then(|| view.grid(meter));
-        let start = drop_at(view, pos.x - lanes.left(), grab, grid);
-        let track = row_at(view, pos.y - lanes.top(), tracks.len()).map_or(placement.track, |row| tracks[row]);
-        if start != placement.start || track != placement.track {
-            // Sent on every frame the clip moves; the history folds them into
-            // one step, closed when the mouse is let go.
-            actions.commands.push(Command::MovePlacement { id: placement.id, track, start });
+        let pointer = view.tick_at(pos.x - lanes.left());
+        let (offset, played) = placement.window.map_or((0, length), |w| (w.offset.0, w.length.0));
+        // Sent on every frame the clip changes; the history folds them into
+        // one step, closed when the mouse is let go.
+        match view.drag {
+            Some(Drag::Move { id, grab }) if id == placement.id => {
+                let start = drop_at(view, pos.x - lanes.left(), grab, grid);
+                let track = row_at(view, pos.y - lanes.top(), tracks.len()).map_or(placement.track, |row| tracks[row]);
+                if start != placement.start || track != placement.track {
+                    actions.commands.push(Command::MovePlacement { id, track, start });
+                }
+            }
+            Some(Drag::TrimEnd { id }) if id == placement.id => {
+                let window = trim_end(placement.start, offset, clip_length.unwrap_or(length), pointer, grid);
+                if window != placement.window {
+                    actions.commands.push(Command::TrimPlacement { id, start: placement.start, window });
+                }
+            }
+            Some(Drag::TrimStart { id }) if id == placement.id => {
+                let clip = clip_length.unwrap_or(length);
+                let (start, window) = trim_start(placement.start, offset, played, clip, pointer, grid);
+                if start != placement.start || window != placement.window {
+                    actions.commands.push(Command::TrimPlacement { id, start, window });
+                }
+            }
+            _ => {}
         }
     }
     if response.drag_stopped() {
@@ -605,6 +697,35 @@ mod tests {
         assert!((v.tick_at(200.0) - before).abs() < 1e-6, "the timeline slid under the pointer");
         v.zoom(1_000.0, 0.0);
         assert_eq!(v.pixels_per_beat, MAX_ZOOM);
+    }
+
+    #[test]
+    fn trimming_the_end_stays_between_a_step_and_the_clips_end() {
+        // A one-bar clip placed at bar 2, played whole.
+        let start = Tick(3_840);
+        assert_eq!(
+            trim_end(start, 0, 3_840, 3_840.0 + 1_920.0, Some(960)),
+            Some(Window { offset: Tick(0), length: Tick(1_920) })
+        );
+        assert_eq!(trim_end(start, 0, 3_840, 99_999.0, Some(960)), None, "stretched back to the whole clip");
+        assert_eq!(trim_end(start, 0, 3_840, 0.0, Some(960)).map(|w| w.length), Some(Tick(960)), "trimmed to nothing");
+    }
+
+    #[test]
+    fn trimming_the_front_moves_start_and_offset_together() {
+        // A one-bar clip at bar 2; the front dragged a beat later.
+        let (start, window) = trim_start(Tick(3_840), 0, 3_840, 3_840, 3_840.0 + 960.0, Some(960));
+        assert_eq!(start, Tick(4_800));
+        assert_eq!(window, Some(Window { offset: Tick(960), length: Tick(2_880) }));
+        // Anything the clip held at 1 920 still sounds at 3 840 + 1 920.
+        let w = window.unwrap();
+        assert_eq!(start.0 + 1_920 - w.offset.0, 3_840 + 1_920);
+
+        // Pulled back past the clip's own start: it stops there, whole again.
+        assert_eq!(trim_start(Tick(4_800), 960, 2_880, 3_840, 0.0, Some(960)), (Tick(3_840), None));
+        // Pushed up to the end: a grid step is left.
+        let (late, w) = trim_start(Tick(3_840), 0, 3_840, 3_840, 99_999.0, Some(960));
+        assert_eq!((late, w.map(|w| w.length)), (Tick(6_720), Some(Tick(960))));
     }
 
     #[test]
