@@ -203,7 +203,8 @@ Chaque effet a une réponse mesurée (fréquentielle ou temporelle selon le type
 - [ ] Sérialisation `serde` de l'état `project-model` complet (pistes, clips, automation, routing).
 - [ ] Stratégie de versioning du format dès le premier commit (numéro de version dans le fichier, migration explicite si le format change).
 - [ ] Test de round-trip : sauvegarde → rechargement → comparaison bit-à-bit de l'état projet.
-- [ ] Gestion des chemins de fichiers audio relatifs vs absolus (portabilité d'un projet entre machines).
+- [ ] Gestion des chemins de fichiers audio relatifs vs absolus (portabilité d'un projet entre machines) — tranchée par D6 : audio identifié par hash, chemin comme simple indice.
+- [ ] Avant le premier fichier : identifiants monotones (D2), tables par identifiant (D4), sortie déterministe (D7). Voir « Décisions de modèle ».
 
 ### Critère de sortie
 Sauvegarde/rechargement d'un projet complexe (16 pistes, automation, effets) sans perte de données, y compris après un changement mineur de version du format (migration testée).
@@ -256,15 +257,79 @@ Les phases 0 à 3 sont faites et validées sur matériel ; la 4 est entamée et 
 
 | ordre | ce que c'est | phase d'origine | taille |
 |---|---|---|---|
-| 1 | Sauvegarde et chargement de projet | 6 | petite |
-| 2 | Transport (play/pause/stop, position) | 4 | petite |
-| 3 | EQ paramétrique | 5 | moyenne |
-| 4 | Waveform (peak files) et timeline avec clips | 4 | **la plus grosse du projet** |
-| 5 | Compresseur, reverb, delay | 5 | moyenne |
-| 6 | MIDI externe validé sur matériel | 3 | en attente d'un clavier |
-| 7 | Hébergement CLAP | 7 | optionnelle |
+| 1 | Sauvegarde et chargement de projet — avec D2, D4, D6, D7 ci-dessous, qui doivent précéder le premier fichier écrit | 6 | petite → moyenne |
+| 2 | Transport (play/pause/stop, position) — avec une tempo map minimale (D1) pour afficher mesures et temps | 4 | petite |
+| 3 | **Modèle temporel** : ticks, tempo map complète, `Clip` / `Placement`, lié ou copie (D1, D3), format v2 et sa migration. Rust pur, aucune UI | — | moyenne |
+| 4 | EQ paramétrique | 5 | moyenne |
+| 5 | Waveform (peak files) et timeline avec clips, construite sur l'étape 3 et la règle D5 | 4 | **la plus grosse du projet** |
+| 6 | Compresseur, reverb, delay (le delay synchronisé lit la tempo map de D1) | 5 | moyenne |
+| 7 | MIDI externe validé sur matériel | 3 | en attente d'un clavier |
+| 8 | Hébergement CLAP | 7 | optionnelle |
 
 Chaque étape ajoute sa fonctionnalité à l'UI au passage, plutôt que d'attendre une phase « interface » séparée : c'est l'usage qui trouve les défauts, et trois l'ont déjà prouvé (voir le journal).
+
+---
+
+## Décisions de modèle (2026-09-22)
+
+Prises sur ce qu'elles vaudront **à la fin du projet**, pas seulement sur le besoin du moment. Certaines ne serviront pleinement que dans plusieurs étapes ; elles sont fixées maintenant parce que les changer après qu'un fichier existe coûte une migration, et après qu'une vue est construite dessus coûte une réécriture. Chacune dit ce qu'elle apporte au final et quand elle entre dans le code.
+
+Le constat qui les motive : le modèle actuel n'a **aucune dimension temporelle**. `Project` ne connaît que des pistes et un gain master ; `MidiSequence` convertit ticks → secondes → frames à la lecture du `.mid` et jette la tempo map. C'est juste pour rejouer un fichier, faux pour un projet qu'on édite : changer le tempo laisserait chaque note à sa frame.
+
+### D1 — Temps musical en ticks entiers, converti par le moteur
+- **Décision** : le modèle stocke `Tick(u64)` à **960 PPQ** (960 = 2⁶·3·5 : doubles, triolets et quintolets tombent sur des entiers). Une `TempoMap` triée (changements de tempo et de signature, positionnés en ticks) fait partie du `Project`. La conversion ticks → frames vit dans `project-engine`, jamais dans le modèle. Aucun flottant de temps dans le modèle.
+- **Force à la fin** : changer le tempo déplace toute la musique d'un bloc sans rien réécrire ; quantification exacte ; affichage en mesures/temps ; delay et LFO synchronisés au tempo ; diffs sans bruit d'arrondi.
+- **Garde-fou** : chaque frame se calcule depuis le début du segment de tempo, pas en accumulant des durées — même leçon que `LinearSmoother` (journal, 2026-09-19).
+- **Quand** : tempo unique + signature à l'étape 2 (transport) ; tempo map complète à l'étape 3.
+
+### D2 — Identifiants uniques, jamais réutilisés
+- **Décision** : un compteur **monotone** par type d'entité (`TrackId`, `ClipId`, `PlacementId`, `NoteId`), stocké dans le projet et sauvegardé avec lui. Il ne redescend jamais, même à l'undo : un trou dans la numérotation ne coûte rien. Remplace `next_id() = max + 1`, qui redonne l'id d'une piste supprimée à la suivante.
+- **Pourquoi pas des UUID/ULID** : 16 octets par référence et des diffs illisibles, pour un besoin (plusieurs auteurs) qui n'existe pas. Le jour où il existe, l'identifiant devient `(auteur, compteur)` — la forme qu'utilisent les CRDT — et les ids existants se migrent en `(0, n)`.
+- **Force à la fin** : une référence (placement → piste, placement → clip) ne peut jamais se rattacher silencieusement à un autre objet ; diff et fusion par identifiant ; porte ouverte à la collaboration sans refonte.
+- **Quand** : **avant le premier fichier écrit** (étape 1). Après, les fichiers existants figeraient la réutilisation.
+
+### D3 — Unité de base : le clip placé sur une timeline, lié ou copie au niveau de l'objet
+- **Décision** : le contenu (`Clip` : notes en ticks, ou référence audio) est séparé de son placement (`Placement { clip, track, start, length, offset }`). Plusieurs placements pointant vers le même clip = **clip lié** ; « rendre unique » = copier le clip. Le choix se fait objet par objet (comme les alias de Logic), jamais par un mode global.
+- **Force à la fin** : une seule structure couvre la région (Logic, Pro Tools), le pattern (FL Studio : c'est un clip lié) et plus tard la grille de lancement (Ableton), qui ne sera qu'une vue de plus sur les mêmes `Clip`. Aucun mode à tester en 2ⁿ combinaisons.
+- **Ce qu'on ne fait pas en v1** : la grille de lancement, les patterns comme objet distinct, la modulation généralisée. Le modèle les permet ; on ne les construit pas.
+- **Quand** : étape 3. `Track.source` / `Track.file` sont des places réservées qui migreront vers un clip audio placé.
+
+### D4 — Entités en tables par identifiant, ordre explicite
+- **Décision** : chaque type d'entité vit dans une `BTreeMap<Id, _>`. Là où l'ordre a un sens (les pistes dans le mixer), il est porté par une liste d'identifiants séparée (`track_order: Vec<TrackId>`), pas par la position dans la table.
+- **Force à la fin** : déplacer une piste change une ligne du fichier au lieu de réécrire le bloc ; sortie déterministe par construction (`BTreeMap` trie) ; diff et fusion naturels ; références explicites.
+- **Quand** : étape 1, en même temps que la sérialisation — c'est un changement interne à `project-model`, invisible pour `Command`.
+
+### D5 — Une source de vérité par aspect, une vue par tâche
+- **Décision** : chaque vue n'écrit que dans un aspect du modèle. Arrangement → placements ; éditeur de notes → contenu des clips ; mixer → pistes et routing ; transport → rien dans le modèle (la position est un état du moteur, lu par l'UI). Là où deux vues se croisent, la règle de priorité est écrite ici avant d'être codée. Mix, routing et automation sont des panneaux transversaux, pas un niveau de la hiérarchie.
+- **Force à la fin** : c'est la leçon du projet elle-même — tous les bugs sérieux étaient deux dépositaires de la même vérité (voir « Ce que le projet a appris »). Des vues parallèles sur un modèle commun permettent de revenir esquisser en plein mix sans mode ni conversion.
+- **Quand** : dès la timeline (étape 5), et pour chaque vue ajoutée ensuite.
+
+### D6 — Audio référencé par hash, dans un pool de médias
+- **Décision** : un fichier audio importé devient un `Asset { hash, path, name }` : le **hash du contenu** est l'identité, le chemin (relatif au projet quand c'est possible) n'est qu'un indice pour le retrouver. Les clips audio référencent l'asset, pas le chemin. Le hachage se fait à l'import, hors du thread audio.
+- **Force à la fin** : un projet déplacé ou ouvert sur une autre machine se re-relie en retrouvant le hash (règle la question relatif/absolu de la phase 6) ; même fichier importé deux fois = un seul asset ; les peak files de la waveform se mettent en cache par hash ; le projet texte reste petit et versionnable dans Git avec l'audio à part ; distribution de l'audio résolue d'avance si la collaboration arrive.
+- **Dépendance** : un hash rapide (`blake3` ou `sha2`) — à valider au moment de l'ajouter.
+- **Quand** : étape 1.
+
+### D7 — Sauvegarde en texte déterministe
+- **Décision** : `serde` + **JSON indenté**. Déterminisme garanti par D4 (tables triées) ; les `f32` passent en représentation la plus courte qui se relit à l'identique. Un seul fichier par projet pour commencer ; un fichier par clip seulement si les diffs deviennent bruyants.
+- **Pourquoi JSON plutôt que RON** : RON est plus lisible pour les enums, mais JSON se lit avec `jq`, depuis n'importe quel langage et n'importe quel outil de diff — ce qui compte pour la gestion de versions et un éventuel import/export DAWproject. Le format se change plus tard sans douleur ; le modèle, non.
+- **Tests** : round-trip `proptest` (sauver puis relire = même projet), fichiers de référence (même projet → exactement le même fichier), migration v1 → v2 testée.
+- **Quand** : étape 1 ; `serde` est une dépendance nouvelle, à valider.
+
+### D8 — Les commandes restent sérialisables et les invariants sont vérifiés globalement
+- **Décision** : `Command` dérive `Serialize`/`Deserialize` dès l'étape 1, sans qu'on écrive de journal. `Project::check()` vérifie les invariants globaux (toute référence existe, une note ne dépasse pas son clip, la tempo map est triée, les ids sont sous leur compteur), avec une propriété `proptest` : aucune suite de commandes valides ne la viole.
+- **Force à la fin** : un journal de commandes sur disque donne la **récupération après crash** (rejouer les commandes depuis la dernière sauvegarde) et c'est la base de toute collaboration. `check()` est le filet qui rend les références de D3 sûres.
+- **Quand** : dérivation à l'étape 1 ; `check()` grossit avec chaque entité ; journal d'autosave après la timeline.
+
+### Écartés ou repoussés, avec la raison
+| sujet | décision | raison |
+|---|---|---|
+| CRDT (`automerge`, `yrs`) | repoussé tant que la collaboration n'est pas un objectif | D2 et D8 gardent la porte ouverte ; un CRDT impose son propre format et son coût à chaque édition |
+| Diff sémantique et fusion à trois voies | après la timeline | facile sur un modèle normalisé (D4) ; inutile sans clips à comparer |
+| `arc-swap`, `basedrop` | non | `GraphSwapper` fait déjà l'échange atomique et renvoie les graphes retirés au thread de contrôle |
+| Remplacer tout le projet compilé à chaque modification | non | `route()` envoie les paramètres en événements ; reconstruire à chaque mouvement de fader coûterait un fondu croisé par image |
+| Multicœur | non | 16 pistes = 1,2 % d'un buffer de 10 ms, mesuré |
+| Isolation des plugins | inchangé, phase 7 | un processus par plugin, avec CLAP |
 
 ---
 
