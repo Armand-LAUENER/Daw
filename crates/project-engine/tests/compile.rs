@@ -49,7 +49,7 @@ fn settled(compiled: &mut Compiled, blocks: usize) -> (f32, f32) {
 }
 
 fn ids(session: &Session) -> Vec<TrackId> {
-    session.project().tracks.iter().map(|t| t.id).collect()
+    session.project().tracks().map(|t| t.id).collect()
 }
 
 #[test]

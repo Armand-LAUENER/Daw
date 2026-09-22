@@ -86,10 +86,10 @@ pub fn compile(
     let mut builder = GraphBuilder::new();
     // One bus per graph, shared by this graph's solo nodes and no others.
     let bus = SoloBus::new();
-    let master = builder.add(Box::new(Gain::new(project.master_gain, sample_rate)));
-    let mut tracks = Vec::with_capacity(project.tracks.len());
+    let master = builder.add(Box::new(Gain::new(project.master_gain(), sample_rate)));
+    let mut tracks = Vec::with_capacity(project.track_count());
 
-    for track in &project.tracks {
+    for track in project.tracks() {
         let source = builder.add(source_for(track));
         // Built at the values the project already holds, so a compiled graph
         // starts where the model is rather than ramping towards it.

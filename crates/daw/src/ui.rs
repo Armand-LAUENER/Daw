@@ -24,6 +24,8 @@ pub struct Actions {
     pub theme: Option<usize>,
     /// The layout controls were asked for, or dismissed.
     pub toggle_layout: bool,
+    /// The project is to be written to disk.
+    pub save: bool,
 }
 
 /// How the engine is getting on, for the strip along the bottom.
@@ -37,10 +39,24 @@ pub struct Health<'a> {
     pub trouble: Option<&'a str>,
 }
 
-pub fn top_bar(ui: &mut Ui, theme: &Theme, themes: &[Theme], can_undo: bool, can_redo: bool, actions: &mut Actions) {
+/// What the top bar shows besides its buttons.
+pub struct Bar<'a> {
+    pub can_undo: bool,
+    pub can_redo: bool,
+    /// The project's file name, or `None` before it is first saved.
+    pub project: Option<&'a str>,
+}
+
+pub fn top_bar(ui: &mut Ui, theme: &Theme, themes: &[Theme], bar: &Bar<'_>, actions: &mut Actions) {
+    let Bar { can_undo, can_redo, project } = *bar;
     ui.horizontal(|ui| {
         ui.label(RichText::new("Daw").color(theme.accent).strong());
+        ui.label(RichText::new(project.unwrap_or("unsaved")).color(theme.dim));
         ui.separator();
+
+        if ui.button("Save").clicked() {
+            actions.save = true;
+        }
 
         if ui.add_enabled(can_undo, egui::Button::new("Undo")).clicked() {
             actions.undo = true;
@@ -71,7 +87,7 @@ pub fn top_bar(ui: &mut Ui, theme: &Theme, themes: &[Theme], can_undo: bool, can
 }
 
 pub fn mixer(ui: &mut Ui, project: &Project, theme: &Theme, layout: &Layout, actions: &mut Actions) {
-    if project.tracks.is_empty() {
+    if project.track_count() == 0 {
         ui.add_space(24.0);
         ui.vertical_centered(|ui| {
             ui.label(RichText::new("No tracks yet.").color(theme.dim));
@@ -80,16 +96,15 @@ pub fn mixer(ui: &mut Ui, project: &Project, theme: &Theme, layout: &Layout, act
         return;
     }
 
-    for track in &project.tracks {
-        let audible = project.is_audible(track.id);
-        strip(ui, track, audible, theme, layout, actions);
+    for track in project.tracks() {
+        strip(ui, project, track, theme, layout, actions);
         ui.add_space(layout.strip_spacing);
     }
 
     ui.separator();
     ui.horizontal(|ui| {
         ui.label(RichText::new("Master").color(theme.dim).strong());
-        let mut gain = project.master_gain;
+        let mut gain = project.master_gain();
         ui.spacing_mut().slider_width = layout.gain_width;
         let slider = ui.add(egui::Slider::new(&mut gain, 0.0..=2.0).show_value(false));
         if slider.changed() {
@@ -98,19 +113,20 @@ pub fn mixer(ui: &mut Ui, project: &Project, theme: &Theme, layout: &Layout, act
         if slider.drag_stopped() {
             actions.seal = true;
         }
-        ui.label(RichText::new(format!("{:.2}", project.master_gain)).color(theme.dim).monospace());
+        ui.label(RichText::new(format!("{:.2}", project.master_gain())).color(theme.dim).monospace());
     });
 }
 
 fn strip(
     ui: &mut Ui,
+    project: &Project,
     track: &project_model::Track,
-    audible: bool,
     theme: &Theme,
     layout: &Layout,
     actions: &mut Actions,
 ) {
     let id: TrackId = track.id;
+    let audible = project.is_audible(id);
     egui::Frame::group(ui.style()).fill(theme.panel).show(ui, |ui| {
         ui.horizontal(|ui| {
             let mut name = track.name.clone();
@@ -188,7 +204,7 @@ fn strip(
                     actions.commands.push(Command::SetSource { id, source: Source::Silent });
                 }
                 let colour = if track.source == Source::File { theme.accent } else { theme.dim };
-                ui.label(RichText::new(track.playing()).color(colour).small());
+                ui.label(RichText::new(project.playing(track)).color(colour).small());
             });
         });
     });
@@ -212,7 +228,7 @@ pub fn status(ui: &mut Ui, theme: &Theme, health: &Health<'_>) {
             ui.label(RichText::new(trouble).color(theme.warning).small());
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new("drop audio files here to add a track").color(theme.dim).small());
+            ui.label(RichText::new("drop audio to add a track, or a .daw project to open it").color(theme.dim).small());
         });
     });
 }

@@ -10,7 +10,7 @@
 //! a new chance to write the reverse wrongly. That risk is paid for here, once,
 //! rather than discovered later as quietly corrupted work.
 
-use project_model::{Command, Project, Session};
+use project_model::{Asset, AssetId, Command, Project, Session, Source};
 use proptest::prelude::*;
 
 /// An edit aimed at a track by position, since the ids are not known until the
@@ -25,6 +25,17 @@ enum Action {
     Mute(u8, bool),
     Solo(u8, bool),
     Master(f32),
+    /// Gives a track one of a handful of files, or takes its file away, so
+    /// sequences share files between tracks and drop the last user of one.
+    File(u8, Option<u8>),
+    AddWithFile(u8),
+}
+
+/// One of four files, by content. Few enough that tracks keep landing on the
+/// same one, which is the case the pool has to get right.
+fn asset(n: u8) -> Asset {
+    let n = n % 4;
+    Asset::new(AssetId::of_bytes(&[n]), format!("/audio/{n}.wav"))
 }
 
 fn action() -> impl Strategy<Value = Action> {
@@ -39,6 +50,8 @@ fn action() -> impl Strategy<Value = Action> {
         1 => (any::<u8>(), any::<bool>()).prop_map(|(i, m)| Action::Mute(i, m)),
         1 => (any::<u8>(), any::<bool>()).prop_map(|(i, s)| Action::Solo(i, s)),
         1 => (-4.0f32..4.0).prop_map(Action::Master),
+        2 => (any::<u8>(), proptest::option::of(any::<u8>())).prop_map(|(i, f)| Action::File(i, f)),
+        2 => any::<u8>().prop_map(Action::AddWithFile),
     ]
 }
 
@@ -48,8 +61,8 @@ fn action() -> impl Strategy<Value = Action> {
 /// project is a state the sequence is allowed to reach.
 fn to_command(project: &Project, action: &Action) -> Option<Command> {
     let pick = |i: u8| {
-        let tracks = &project.tracks;
-        (!tracks.is_empty()).then(|| tracks[usize::from(i) % tracks.len()].id)
+        let count = project.track_count();
+        (count > 0).then(|| project.tracks().nth(usize::from(i) % count).expect("in range").id)
     };
     Some(match action {
         Action::Add => Command::AddTrack { name: "track".into(), source: Default::default(), file: None },
@@ -60,6 +73,10 @@ fn to_command(project: &Project, action: &Action) -> Option<Command> {
         Action::Mute(i, muted) => Command::SetMuted { id: pick(*i)?, muted: *muted },
         Action::Solo(i, soloed) => Command::SetSoloed { id: pick(*i)?, soloed: *soloed },
         Action::Master(gain) => Command::SetMasterGain { gain: *gain },
+        Action::File(i, file) => Command::SetFile { id: pick(*i)?, file: file.map(asset) },
+        Action::AddWithFile(n) => {
+            Command::AddTrack { name: "file".into(), source: Source::File, file: Some(asset(*n)) }
+        }
     })
 }
 
@@ -132,8 +149,8 @@ proptest! {
                 let _ = session.apply(command);
             }
             let project = session.project();
-            prop_assert!(project.master_gain.is_finite());
-            for track in &project.tracks {
+            prop_assert!(project.master_gain().is_finite());
+            for track in project.tracks() {
                 prop_assert!(track.gain.is_finite(), "a track ended up with gain {}", track.gain);
                 prop_assert!((-1.0..=1.0).contains(&track.pan), "pan {} left the range", track.pan);
             }
@@ -142,14 +159,14 @@ proptest! {
 
     #[test]
     fn identifiers_stay_unique_however_tracks_come_and_go(actions in prop::collection::vec(action(), 0..40)) {
-        // Ids are derived from what exists rather than counted, so this is the
-        // property that has to hold for that shortcut to be safe.
+        // Ids come from a counter that undo never walks back, so they cannot
+        // collide however the history is travelled.
         let mut session = Session::new();
         for action in &actions {
             if let Some(command) = to_command(session.project(), action) {
                 let _ = session.apply(command);
             }
-            let mut ids: Vec<_> = session.project().tracks.iter().map(|t| t.id).collect();
+            let mut ids: Vec<_> = session.project().tracks().map(|t| t.id).collect();
             let total = ids.len();
             ids.sort_unstable();
             ids.dedup();
@@ -160,10 +177,32 @@ proptest! {
         // forth, which is where a reused id would actually collide.
         while session.undo() {}
         while session.redo() {}
-        let mut ids: Vec<_> = session.project().tracks.iter().map(|t| t.id).collect();
+        let mut ids: Vec<_> = session.project().tracks().map(|t| t.id).collect();
         let total = ids.len();
         ids.sort_unstable();
         ids.dedup();
         prop_assert_eq!(ids.len(), total);
+    }
+}
+
+proptest! {
+    #[test]
+    fn no_sequence_of_commands_breaks_a_promise(actions in prop::collection::vec(action(), 0..60)) {
+        // The whole-project check, after every change and at every point of
+        // the history: an order out of step with the tracks, a file a track
+        // names but the pool lost, or one the pool kept for nobody.
+        let mut session = Session::new();
+        for action in &actions {
+            if let Some(command) = to_command(session.project(), action) {
+                let _ = session.apply(command);
+            }
+            prop_assert_eq!(session.check(), Ok(()));
+        }
+        while session.undo() {
+            prop_assert_eq!(session.check(), Ok(()));
+        }
+        while session.redo() {
+            prop_assert_eq!(session.check(), Ok(()));
+        }
     }
 }

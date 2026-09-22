@@ -12,7 +12,7 @@ mod studio;
 mod theme;
 mod ui;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -20,13 +20,17 @@ use eframe::egui;
 use engine_core::{AutomationSender, Graph, GraphSwapper, Node, ParamId, automation_channel, graph_channel};
 use engine_dsp::SineOsc;
 use engine_io::{AudioEngine, EngineOptions, Stats, default_output_config, map_frames};
-use project_model::{Command, Source, Track};
+use project_model::{Asset, Command, Project, Session, Source, Track};
 
 use clip::{Clip, Library, Silence};
 use layout::Layout;
 use studio::{Engine, Sources, Studio};
 use theme::Theme;
-use ui::{Actions, Health};
+use ui::{Actions, Bar, Health};
+
+/// What a project file is called. Anything else dropped on the window is
+/// taken for audio.
+const PROJECT_EXTENSION: &str = "daw";
 
 /// The graph is stereo whatever the device is: panning needs a pair, and the
 /// device's own layout is reached by mapping afterwards.
@@ -75,12 +79,12 @@ impl Sources for FileSources {
     /// A file the project names but the library has not read falls back to the
     /// tone rather than to silence: a track that vanished without a word would
     /// be harder to notice than one that is obviously not what was asked for.
-    fn node_for(&mut self, track: &Track) -> Box<dyn Node> {
+    fn node_for(&mut self, project: &Project, track: &Track) -> Box<dyn Node> {
         match track.source {
             // Asked for a file but holding none, or holding one the library
             // has not read: the tone says so audibly, where silence would look
             // like a track that had quietly gone missing.
-            Source::File => match track.file.as_ref().and_then(|path| self.library.get(path)) {
+            Source::File => match project.file_of(track).and_then(|asset| self.library.get(&asset.path)) {
                 Some(audio) => Box::new(Clip::new(audio)),
                 None => tone_for(track, self.sample_rate),
             },
@@ -131,6 +135,9 @@ struct App {
     sources: FileSources,
     /// The last thing that went wrong, for the strip along the bottom.
     trouble: Option<String>,
+    /// Where the project was last saved or opened from. `None` until then,
+    /// and the first save picks a name.
+    project_path: Option<PathBuf>,
     /// Pushed into egui only when it changes, rather than every frame.
     theme_applied: Option<usize>,
     stats: Arc<Stats>,
@@ -199,6 +206,7 @@ impl App {
             show_layout: false,
             sources,
             trouble: None,
+            project_path: None,
             stats,
             _engine: engine,
         })
@@ -209,6 +217,10 @@ impl App {
     /// One command, so one entry in the history: a file dropped by mistake is
     /// taken back with a single undo.
     fn load(&mut self, path: PathBuf) {
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION)) {
+            self.open(&path);
+            return;
+        }
         // Bound before the match rather than inside it, so reading the file is
         // finished with before the graph is rebuilt from it. Holding the two at
         // once is what the borrow checker is here to refuse.
@@ -216,18 +228,82 @@ impl App {
         let loaded = self.sources.library.load(&path, rate);
         match loaded {
             Ok(audio) => {
+                // Hashed after decoding rather than before: a file that will
+                // not decode is refused without reading it twice.
+                let asset = match Asset::from_file(&path) {
+                    Ok(asset) => asset,
+                    Err(e) => {
+                        self.report(format!("{}: {e}", path.display()));
+                        return;
+                    }
+                };
                 let name = path.file_stem().map_or_else(|| "Track".into(), |n| n.to_string_lossy().into_owned());
                 let seconds = audio.duration().as_secs_f64();
                 self.trouble = None;
                 println!("loaded {} ({:.1}s, {} ch)", path.display(), seconds, audio.channels);
-                let command = Command::AddTrack { name, source: Source::File, file: Some(path) };
+                let command = Command::AddTrack { name, source: Source::File, file: Some(asset) };
                 let _ = self.studio.apply(command, &mut self.sources);
             }
-            Err(e) => {
-                let message = format!("{}: {e}", path.display());
-                println!("{message}");
-                self.trouble = Some(message);
+            Err(e) => self.report(format!("{}: {e}", path.display())),
+        }
+    }
+
+    /// Shown along the bottom and printed, so a run watched from a terminal
+    /// sees it too.
+    fn report(&mut self, message: String) {
+        println!("{message}");
+        self.trouble = Some(message);
+    }
+
+    /// Opens a project and plays it, reading every file it uses.
+    ///
+    /// A file that is missing, or that no longer holds what the project
+    /// recorded, does not stop the project opening: the track plays the tone
+    /// and the strip along the bottom says which file it was. Refusing the
+    /// whole project over one sample would lose the rest of the work.
+    fn open(&mut self, path: &Path) {
+        let session = match Session::open(path) {
+            Ok(session) => session,
+            Err(e) => return self.report(format!("{}: {e}", path.display())),
+        };
+        let rate = self.sources.rate;
+        let mut problems = Vec::new();
+        for asset in session.project().assets() {
+            match asset.matches_file() {
+                Ok(true) => {
+                    if let Err(e) = self.sources.library.load(&asset.path, rate) {
+                        problems.push(format!("{}: {e}", asset.name()));
+                    }
+                }
+                Ok(false) => problems.push(format!("{} has changed since it was added", asset.name())),
+                Err(e) => problems.push(format!("{}: {e}", asset.path.display())),
             }
+        }
+        println!("opened {} ({} tracks)", path.display(), session.project().track_count());
+        self.studio.replace(session, &mut self.sources);
+        self.project_path = Some(path.to_path_buf());
+        self.trouble = None;
+        if !problems.is_empty() {
+            self.report(problems.join("; "));
+        }
+    }
+
+    /// Writes the project where it came from, or somewhere new the first time.
+    fn save(&mut self) {
+        let path = match self.project_path.clone() {
+            Some(path) => path,
+            None => match untitled() {
+                Ok(path) => path,
+                Err(e) => return self.report(format!("cannot choose where to save: {e}")),
+            },
+        };
+        match self.studio.session().save(&path) {
+            Ok(()) => {
+                println!("saved {}", path.display());
+                self.project_path = Some(path);
+                self.trouble = None;
+            }
+            Err(e) => self.report(format!("{}: {e}", path.display())),
         }
     }
 
@@ -253,6 +329,9 @@ impl App {
         }
         if actions.toggle_layout {
             self.show_layout = !self.show_layout;
+        }
+        if actions.save {
+            self.save();
         }
     }
 }
@@ -301,10 +380,16 @@ impl eframe::App for App {
             if input.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z) {
                 actions.redo = true;
             }
+            if input.consume_key(egui::Modifiers::COMMAND, egui::Key::S) {
+                actions.save = true;
+            }
         });
 
         egui::Panel::top("bar").show(root, |ui| {
-            ui::top_bar(ui, &theme, &self.themes, self.studio.can_undo(), self.studio.can_redo(), &mut actions);
+            let name = self.project_path.as_deref().and_then(Path::file_name).map(|n| n.to_string_lossy());
+            let bar =
+                Bar { can_undo: self.studio.can_undo(), can_redo: self.studio.can_redo(), project: name.as_deref() };
+            ui::top_bar(ui, &theme, &self.themes, &bar, &mut actions);
         });
         if self.show_layout {
             egui::Panel::top("layout").show(root, |ui| {
@@ -341,10 +426,46 @@ impl eframe::App for App {
     }
 }
 
+/// A name for a project saved for the first time: `untitled.daw` in a `Daw`
+/// folder in the home directory, numbered so an earlier one is never
+/// overwritten.
+///
+/// Chosen rather than asked for because asking needs a file dialog, and a
+/// dialog is a dependency; the name shows in the top bar, and the file can be
+/// moved and dropped back on the window.
+fn untitled() -> std::io::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| std::io::Error::other("no home directory"))?;
+    let folder = PathBuf::from(home).join("Daw");
+    std::fs::create_dir_all(&folder)?;
+    let path = (1..)
+        .map(|n| {
+            let name = if n == 1 { "untitled".into() } else { format!("untitled-{n}") };
+            folder.join(format!("{name}.{PROJECT_EXTENSION}"))
+        })
+        .find(|path| !path.exists())
+        .expect("some number is free");
+    Ok(path)
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 640.0]).with_title("Daw"),
         ..Default::default()
     };
-    eframe::run_native("Daw", options, Box::new(|cc| Ok(Box::new(App::new(cc)?))))
+    // A project named on the command line is opened at start, which is also
+    // how a file manager opens one.
+    let project = std::env::args_os().nth(1).map(PathBuf::from);
+    eframe::run_native(
+        "Daw",
+        options,
+        Box::new(|cc| {
+            let mut app = App::new(cc)?;
+            if let Some(path) = project {
+                app.open(&path);
+            }
+            Ok(Box::new(app))
+        }),
+    )
 }

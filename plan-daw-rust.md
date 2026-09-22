@@ -200,11 +200,11 @@ Chaque effet a une réponse mesurée (fréquentielle ou temporelle selon le type
 **But** : sauvegarder et recharger un projet complet sans perte de données.
 
 ### Tâches
-- [ ] Sérialisation `serde` de l'état `project-model` complet (pistes, clips, automation, routing).
-- [ ] Stratégie de versioning du format dès le premier commit (numéro de version dans le fichier, migration explicite si le format change).
-- [ ] Test de round-trip : sauvegarde → rechargement → comparaison bit-à-bit de l'état projet.
-- [ ] Gestion des chemins de fichiers audio relatifs vs absolus (portabilité d'un projet entre machines) — tranchée par D6 : audio identifié par hash, chemin comme simple indice.
-- [ ] Avant le premier fichier : identifiants monotones (D2), tables par identifiant (D4), sortie déterministe (D7). Voir « Décisions de modèle ».
+- [x] Sérialisation `serde` de l'état `project-model` complet (pistes, clips, automation, routing). *Fait pour ce que le modèle contient aujourd'hui (pistes, mix, pool de fichiers) ; clips et automation suivront leur entrée dans le modèle.*
+- [x] Stratégie de versioning du format dès le premier commit (numéro de version dans le fichier, migration explicite si le format change). *En-tête `format` + `version` lu en premier ; un fichier plus récent est refusé nommément. La première migration réelle sera v1 → v2 (étape 3).*
+- [x] Test de round-trip : sauvegarde → rechargement → comparaison bit-à-bit de l'état projet. *proptest sur des `f32` finis arbitraires, plus relecture → réécriture à l'octet près, plus fichier de référence figé.*
+- [x] Gestion des chemins de fichiers audio relatifs vs absolus (portabilité d'un projet entre machines) — tranchée par D6 : audio identifié par hash, chemin comme simple indice. *Relatif avec `/` quand le fichier est dans le dossier du projet, absolu sinon ; un fichier modifié depuis l'import est signalé à l'ouverture. Reste : re-lier un fichier déplacé en le retrouvant par son hash.*
+- [x] Avant le premier fichier : identifiants monotones (D2), tables par identifiant (D4), sortie déterministe (D7). Voir « Décisions de modèle ».
 
 ### Critère de sortie
 Sauvegarde/rechargement d'un projet complexe (16 pistes, automation, effets) sans perte de données, y compris après un changement mineur de version du format (migration testée).
@@ -385,3 +385,4 @@ Section à compléter au fil du projet : décisions d'architecture prises, bugs 
 | 2026-09-22 | 4 | **Défaut de conception trouvé à l'usage** : `eject` remettait le sinus de secours, et une piste neuve bourdonnait. Une piste vide est silencieuse ; le sinus se demande. | Le sinus servait à rendre une piste audible *avant* que les fichiers marchent. Il a survécu à son utilité. Exception gardée : un fichier nommé mais non lu joue le sinus, parce qu'une piste discrètement disparue serait plus difficile à remarquer. |
 | 2026-09-22 | 4 | **Second défaut à l'usage** : basculer sur le sinus jetait le chemin du fichier. Ce qu'une piste *contient* et ce qu'elle *joue* sont deux champs. | C'était le même champ, donc changer l'un perdait l'autre. Trois états choisis (silent / tone / file), aucun ne perd rien ; `eject` retire le fichier pour de bon. |
 | 2026-09-22 | 4 | Le script de lancement **demande** la fermeture de la fenêtre précédente au lieu de la tuer. | Windows verrouille l'exécutable d'un processus en cours. Une terminaison forcée n'exécute pas le `Drop`, donc jette le rapport de fin : le commit qui ajoutait le confort supprimait l'observabilité que le commit précédent venait d'ajouter. |
+| 2026-09-22 | 6 | **Sauvegarde et ouverture de projet** (étape 1 de l'ordre révisé) avec D2, D4, D6, D7, D8 : compteur d'ids dans `Session` et jamais ramené par l'undo, pistes en `BTreeMap` + `track_order`, pool de fichiers par hash BLAKE3, JSON déterministe avec en-tête versionné, écriture atomique, `Project::check()` au chargement et après chaque commande en proptest. Dans l'app : Ctrl+S / Save, ouverture par glisser-déposer d'un `.daw` ou en argument. | Le compteur hors du `Project` garde l'égalité de deux projets pour la musique seule, sans que l'undo puisse rendre un id déjà vu. Une commande produit désormais une liste d'éditions (fichier ajouté au pool + piste), ce que la timeline demandera aussi. Coût : 18 crates pour `project-model`, surtout la machinerie `serde_derive`. |

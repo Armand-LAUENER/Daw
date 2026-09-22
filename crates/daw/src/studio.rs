@@ -32,7 +32,9 @@ pub trait Engine {
 /// Called on the control side when a graph is built, so it may read files and
 /// take its time; what crosses to the audio thread is the node it returns.
 pub trait Sources {
-    fn node_for(&mut self, track: &Track) -> Box<dyn Node>;
+    /// `project` is there to look up what the track names — its file lives in
+    /// the project's pool, not on the track.
+    fn node_for(&mut self, project: &Project, track: &Track) -> Box<dyn Node>;
 }
 
 /// The project, the history, and the engine playing it, kept in step.
@@ -67,6 +69,20 @@ impl<E: Engine> Studio<E> {
 
     pub fn project(&self) -> &Project {
         self.session.project()
+    }
+
+    /// The project with its history, for saving.
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
+    /// Swaps in another project — one just opened — and plays it.
+    ///
+    /// Its history starts empty: undoing past an open would land on a project
+    /// that is no longer on screen or on disk.
+    pub fn replace(&mut self, session: Session, sources: &mut impl Sources) {
+        self.session = session;
+        self.rebuild(sources);
     }
 
     pub fn can_undo(&self) -> bool {
@@ -147,8 +163,8 @@ impl<E: Engine> Studio<E> {
 
     fn rebuild(&mut self, sources: &mut impl Sources) {
         let Self { session, channels, max_frames, sample_rate, .. } = self;
-        let compiled =
-            compile(session.project(), |track| sources.node_for(track), *channels, *max_frames, *sample_rate);
+        let project = session.project();
+        let compiled = compile(project, |track| sources.node_for(project, track), *channels, *max_frames, *sample_rate);
         let Ok(compiled) = compiled else {
             // A graph the builder refuses means the project describes routing
             // that cannot run. Keeping the old graph is better than silence.
@@ -214,7 +230,7 @@ mod tests {
     }
 
     impl Sources for Quiet {
-        fn node_for(&mut self, _track: &Track) -> Box<dyn Node> {
+        fn node_for(&mut self, _project: &Project, _track: &Track) -> Box<dyn Node> {
             self.asked += 1;
             Box::new(Silence)
         }
@@ -239,7 +255,7 @@ mod tests {
         fn add_track(&mut self) -> TrackId {
             self.apply(Command::AddTrack { name: "track".into(), source: Default::default(), file: None })
                 .expect("adding always works");
-            self.studio.project().tracks.last().expect("it was just added").id
+            self.studio.project().tracks().last().expect("it was just added").id
         }
 
         fn swaps(&self) -> usize {
@@ -360,5 +376,22 @@ mod tests {
         let mut f = Fixture::new();
         assert!(!f.studio.can_undo() && !f.studio.can_redo());
         assert!(!f.studio.undo(&mut f.sources));
+    }
+
+    #[test]
+    fn opening_a_project_plays_it_and_starts_a_fresh_history() {
+        let mut f = Fixture::new();
+        f.add_track();
+        let mut other = Session::new();
+        for name in ["a", "b", "c"] {
+            other.apply(Command::AddTrack { name: name.into(), source: Default::default(), file: None }).unwrap();
+        }
+        let other = Session::from_project(other.project().clone());
+        let swaps = f.swaps();
+
+        f.studio.replace(other.clone(), &mut f.sources);
+        assert_eq!(f.studio.project(), other.project());
+        assert_eq!(f.swaps(), swaps + 1, "the opened project was not handed to the engine");
+        assert!(!f.studio.can_undo(), "undo could reach back past the open");
     }
 }

@@ -1,21 +1,27 @@
 use std::fmt;
 
-use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
 
-use crate::{Project, Source, Track, TrackId};
+use crate::history::Ids;
+use crate::{Asset, AssetId, Project, Source, Track, TrackId};
 
 /// A change someone asked for.
 ///
 /// The whole editing surface. A feature added later is a variant here plus the
 /// arm that resolves it — which is also what makes it undoable, for free.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Serializable although nothing writes a journal of them yet (decision D8):
+/// commands replayed from disk are what recovery after a crash, and any later
+/// collaboration, would be built from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
     /// The source and the file are given up front rather than set afterwards,
     /// so a file dropped onto the window is one entry in the history.
     AddTrack {
         name: String,
         source: Source,
-        file: Option<PathBuf>,
+        file: Option<Asset>,
     },
     RemoveTrack {
         id: TrackId,
@@ -57,7 +63,7 @@ pub enum Command {
     /// which is what lets someone listen to the tone and come back.
     SetFile {
         id: TrackId,
-        file: Option<PathBuf>,
+        file: Option<Asset>,
     },
 }
 
@@ -110,94 +116,222 @@ impl fmt::Display for CommandError {
 
 impl std::error::Error for CommandError {}
 
-/// A change with everything already decided.
+/// One elementary change with everything already decided.
 ///
-/// A [`Command`] says what to do; this says exactly what was done, and can be
-/// read backwards. Resolving once and storing the result is what keeps a redo
-/// identical to the original: an `AddTrack` replayed from the command would
-/// mint a fresh id, and every later step naming the old one would miss.
+/// A [`Command`] says what to do; a list of these says exactly what was done,
+/// and can be read backwards. Resolving once and storing the result is what
+/// keeps a redo identical to the original: an `AddTrack` replayed from the
+/// command would mint a fresh id, and every later step naming the old one
+/// would miss.
+///
+/// A command may take several: a track given a file the pool has never seen
+/// also adds that file to the pool, and both come back out with one undo.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Edit {
-    InsertTrack { index: usize, track: Track },
-    RemoveTrack { index: usize },
-    SetName { id: TrackId, name: String },
-    SetGain { id: TrackId, gain: f32 },
-    SetPan { id: TrackId, pan: f32 },
-    SetMuted { id: TrackId, muted: bool },
-    SetSoloed { id: TrackId, soloed: bool },
-    SetMasterGain { gain: f32 },
-    SetSource { id: TrackId, source: Source },
-    SetFile { id: TrackId, file: Option<PathBuf> },
+    /// `at` is the position in the mixer's order.
+    InsertTrack {
+        at: usize,
+        track: Track,
+    },
+    RemoveTrack {
+        id: TrackId,
+    },
+    InsertAsset {
+        asset: Asset,
+    },
+    RemoveAsset {
+        id: AssetId,
+    },
+    SetName {
+        id: TrackId,
+        name: String,
+    },
+    SetGain {
+        id: TrackId,
+        gain: f32,
+    },
+    SetPan {
+        id: TrackId,
+        pan: f32,
+    },
+    SetMuted {
+        id: TrackId,
+        muted: bool,
+    },
+    SetSoloed {
+        id: TrackId,
+        soloed: bool,
+    },
+    SetMasterGain {
+        gain: f32,
+    },
+    SetSource {
+        id: TrackId,
+        source: Source,
+    },
+    SetFile {
+        id: TrackId,
+        file: Option<AssetId>,
+    },
 }
+
+/// What a command does, and what undoes it — each in the order it is applied.
+pub(crate) type Resolved = (Vec<Edit>, Vec<Edit>);
 
 /// Works out what a command does, and what would undo it.
 ///
 /// Reads the project without touching it, so a command that cannot be carried
-/// out leaves nothing half done.
-pub(crate) fn resolve(project: &Project, command: Command) -> Result<(Edit, Edit), CommandError> {
+/// out leaves nothing half done. `ids` is only moved on by a command that
+/// cannot fail after taking one.
+pub(crate) fn resolve(project: &Project, ids: &mut Ids, command: Command) -> Result<Resolved, CommandError> {
     let found = |id: TrackId| project.track(id).ok_or(CommandError::NoSuchTrack(id));
+    let one = |forward: Edit, backward: Edit| (vec![forward], vec![backward]);
 
     Ok(match command {
         Command::AddTrack { name, source, file } => {
-            let index = project.tracks.len();
-            let track = Track::new(project.next_id(), name, source, file);
-            (Edit::InsertTrack { index, track }, Edit::RemoveTrack { index })
+            let at = project.track_count();
+            let track = Track::new(ids.take_track(), name, source, file.as_ref().map(|a| a.id));
+            let id = track.id;
+            let mut change = Change::default();
+            if let Some(asset) = file {
+                change.bring_in(project, asset);
+            }
+            change.push(Edit::InsertTrack { at, track }, Edit::RemoveTrack { id });
+            change.finish()
         }
         Command::RemoveTrack { id } => {
-            let index = project.index_of(id).ok_or(CommandError::NoSuchTrack(id))?;
-            (Edit::RemoveTrack { index }, Edit::InsertTrack { index, track: project.tracks[index].clone() })
+            let track = found(id)?.clone();
+            let at = project.position_of(id).ok_or(CommandError::NoSuchTrack(id))?;
+            let file = track.file;
+            let mut change = Change::default();
+            change.push(Edit::RemoveTrack { id }, Edit::InsertTrack { at, track });
+            if let Some(file) = file {
+                change.let_go(project, file);
+            }
+            change.finish()
         }
         Command::RenameTrack { id, name } => {
             let was = found(id)?.name.clone();
-            (Edit::SetName { id, name }, Edit::SetName { id, name: was })
+            one(Edit::SetName { id, name }, Edit::SetName { id, name: was })
         }
         Command::SetGain { id, gain } => {
             let was = found(id)?.gain;
             finite(gain, "a track's gain")?;
-            (Edit::SetGain { id, gain }, Edit::SetGain { id, gain: was })
+            one(Edit::SetGain { id, gain }, Edit::SetGain { id, gain: was })
         }
         Command::SetPan { id, pan } => {
             let was = found(id)?.pan;
             finite(pan, "a pan position")?;
             // Clamped here, so what is stored is what took effect and a redo
             // lands on the same value.
-            (Edit::SetPan { id, pan: pan.clamp(-1.0, 1.0) }, Edit::SetPan { id, pan: was })
+            one(Edit::SetPan { id, pan: pan.clamp(-1.0, 1.0) }, Edit::SetPan { id, pan: was })
         }
         Command::SetMuted { id, muted } => {
             let was = found(id)?.muted;
-            (Edit::SetMuted { id, muted }, Edit::SetMuted { id, muted: was })
+            one(Edit::SetMuted { id, muted }, Edit::SetMuted { id, muted: was })
         }
         Command::SetSoloed { id, soloed } => {
             let was = found(id)?.soloed;
-            (Edit::SetSoloed { id, soloed }, Edit::SetSoloed { id, soloed: was })
+            one(Edit::SetSoloed { id, soloed }, Edit::SetSoloed { id, soloed: was })
         }
         Command::SetMasterGain { gain } => {
             finite(gain, "the master gain")?;
-            (Edit::SetMasterGain { gain }, Edit::SetMasterGain { gain: project.master_gain })
+            one(Edit::SetMasterGain { gain }, Edit::SetMasterGain { gain: project.master_gain() })
         }
         Command::SetSource { id, source } => {
             let was = found(id)?.source;
-            (Edit::SetSource { id, source }, Edit::SetSource { id, source: was })
+            one(Edit::SetSource { id, source }, Edit::SetSource { id, source: was })
         }
         Command::SetFile { id, file } => {
-            let was = found(id)?.file.clone();
-            (Edit::SetFile { id, file }, Edit::SetFile { id, file: was })
+            let was = found(id)?.file;
+            let now = file.as_ref().map(|a| a.id);
+            let mut change = Change::default();
+            if let Some(asset) = file {
+                change.bring_in(project, asset);
+            }
+            change.push(Edit::SetFile { id, file: now }, Edit::SetFile { id, file: was });
+            // Let go only once the track has moved off it, and only if it was
+            // really a different file: setting the same one again keeps it.
+            if let Some(was) = was
+                && now != Some(was)
+            {
+                change.let_go(project, was);
+            }
+            change.finish()
         }
     })
 }
 
-/// Carries out an edit. Every one of these is reversible by another.
-pub(crate) fn apply(project: &mut Project, edit: &Edit) {
+/// A command's edits being put together, each paired with its inverse.
+#[derive(Default)]
+struct Change {
+    forward: Vec<Edit>,
+    backward: Vec<Edit>,
+}
+
+impl Change {
+    fn push(&mut self, forward: Edit, backward: Edit) {
+        self.forward.push(forward);
+        self.backward.push(backward);
+    }
+
+    /// Adds a file to the pool unless it is already there.
+    ///
+    /// Already there means the same content, wherever it was found: the entry
+    /// the pool has keeps its path, since other tracks are playing from it.
+    fn bring_in(&mut self, project: &Project, asset: Asset) {
+        if project.asset(asset.id).is_none() {
+            let id = asset.id;
+            self.push(Edit::InsertAsset { asset }, Edit::RemoveAsset { id });
+        }
+    }
+
+    /// Removes a file from the pool when the track about to leave it was its
+    /// last user.
+    fn let_go(&mut self, project: &Project, id: AssetId) {
+        if project.uses_of(id) == 1
+            && let Some(asset) = project.asset(id)
+        {
+            self.push(Edit::RemoveAsset { id }, Edit::InsertAsset { asset: asset.clone() });
+        }
+    }
+
+    /// Undoing runs the inverses last-first, so each one finds the project the
+    /// way its forward edit left it.
+    fn finish(mut self) -> Resolved {
+        self.backward.reverse();
+        (self.forward, self.backward)
+    }
+}
+
+/// Carries out edits in order. Every one of these is reversible by another.
+pub(crate) fn apply(project: &mut Project, edits: &[Edit]) {
+    for edit in edits {
+        apply_one(project, edit);
+    }
+}
+
+fn apply_one(project: &mut Project, edit: &Edit) {
     let mut on = |id: TrackId, f: &mut dyn FnMut(&mut Track)| {
-        if let Some(track) = project.tracks.iter_mut().find(|t| t.id == id) {
+        if let Some(track) = project.tracks.get_mut(&id) {
             f(track);
         }
     };
 
     match edit {
-        Edit::InsertTrack { index, track } => project.tracks.insert(*index, track.clone()),
-        Edit::RemoveTrack { index } => {
-            project.tracks.remove(*index);
+        Edit::InsertTrack { at, track } => {
+            project.track_order.insert(*at, track.id);
+            project.tracks.insert(track.id, track.clone());
+        }
+        Edit::RemoveTrack { id } => {
+            project.track_order.retain(|t| t != id);
+            project.tracks.remove(id);
+        }
+        Edit::InsertAsset { asset } => {
+            project.assets.insert(asset.id, asset.clone());
+        }
+        Edit::RemoveAsset { id } => {
+            project.assets.remove(id);
         }
         Edit::SetName { id, name } => on(*id, &mut |t| t.name = name.clone()),
         Edit::SetGain { id, gain } => on(*id, &mut |t| t.gain = *gain),
@@ -206,7 +340,7 @@ pub(crate) fn apply(project: &mut Project, edit: &Edit) {
         Edit::SetSoloed { id, soloed } => on(*id, &mut |t| t.soloed = *soloed),
         Edit::SetMasterGain { gain } => project.master_gain = *gain,
         Edit::SetSource { id, source } => on(*id, &mut |t| t.source = *source),
-        Edit::SetFile { id, file } => on(*id, &mut |t| t.file.clone_from(file)),
+        Edit::SetFile { id, file } => on(*id, &mut |t| t.file = *file),
     }
 }
 

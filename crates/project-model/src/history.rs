@@ -1,11 +1,53 @@
-use crate::Project;
+use serde::{Deserialize, Serialize};
+
 use crate::command::{Command, CommandError, Edit, Target, apply, resolve};
+use crate::{Invalid, Project, TrackId};
+
+/// The next identifier of each kind, handed out once and never again.
+///
+/// Kept beside the project rather than in it, and never walked back by undo
+/// (decision D2). Undoing an added track and adding another must not give the
+/// second the first one's id: a saved file, or anything else that saw the
+/// first, would take the stranger for it. Out of the project, it also stays out
+/// of every comparison of two projects — a gap in the numbering is not a
+/// difference in the music.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub(crate) struct Ids {
+    track: u32,
+}
+
+impl Ids {
+    /// The smallest counter that cannot collide with what a project holds.
+    pub(crate) fn clearing(project: &Project) -> Self {
+        Self { track: project.tracks().map(|t| t.id.0 + 1).max().unwrap_or(0) }
+    }
+
+    /// Whichever is further on, so a counter from a file that was edited by
+    /// hand can never hand out an id the project already uses.
+    pub(crate) fn max(self, other: Self) -> Self {
+        Self { track: self.track.max(other.track) }
+    }
+
+    pub(crate) fn take_track(&mut self) -> TrackId {
+        let id = TrackId(self.track);
+        self.track += 1;
+        id
+    }
+
+    /// Whether every id the project holds is one this counter has handed out.
+    pub(crate) fn check(&self, project: &Project) -> Result<(), Invalid> {
+        match project.tracks().find(|t| t.id.0 >= self.track) {
+            Some(track) => Err(Invalid::IdAhead(track.id)),
+            None => Ok(()),
+        }
+    }
+}
 
 /// One entry in the history: what was done, and what puts it back.
 #[derive(Debug, Clone)]
 struct Step {
-    forward: Edit,
-    backward: Edit,
+    forward: Vec<Edit>,
+    backward: Vec<Edit>,
     /// The control it moved, when a following change could continue it.
     target: Option<Target>,
 }
@@ -18,6 +60,7 @@ struct Step {
 #[derive(Debug, Clone, Default)]
 pub struct Session {
     project: Project,
+    ids: Ids,
     steps: Vec<Step>,
     /// How many steps are currently in effect. The rest are redoable.
     applied: usize,
@@ -37,11 +80,30 @@ impl Session {
 
     /// Starts from a project that already exists, with nothing to undo.
     pub fn from_project(project: Project) -> Self {
-        Self { project, steps: Vec::new(), applied: 0, open: false }
+        let ids = Ids::clearing(&project);
+        Self { project, ids, steps: Vec::new(), applied: 0, open: false }
     }
 
     pub fn project(&self) -> &Project {
         &self.project
+    }
+
+    /// Checks the project's promises, and that the id counter is ahead of
+    /// every id in it.
+    pub fn check(&self) -> Result<(), Invalid> {
+        self.project.check()?;
+        self.ids.check(&self.project)
+    }
+
+    pub(crate) fn ids(&self) -> Ids {
+        self.ids
+    }
+
+    /// A session opened from a file: its project, and the counter the file
+    /// kept, so ids retired before it was saved stay retired.
+    pub(crate) fn restored(project: Project, ids: Ids) -> Self {
+        let ids = ids.max(Ids::clearing(&project));
+        Self { project, ids, steps: Vec::new(), applied: 0, open: false }
     }
 
     /// Carries out a command, and remembers how to take it back.
@@ -50,7 +112,7 @@ impl Session {
     /// nothing, so it never leaves an undo that undoes nothing.
     pub fn apply(&mut self, command: Command) -> Result<(), CommandError> {
         let target = command.target();
-        let (forward, backward) = resolve(&self.project, command)?;
+        let (forward, backward) = resolve(&self.project, &mut self.ids, command)?;
 
         // A change continuing the gesture already in progress replaces its
         // forward edit and keeps its backward one — which is where the gesture
@@ -138,7 +200,7 @@ mod tests {
     }
 
     fn first(session: &Session) -> TrackId {
-        session.project().tracks[0].id
+        session.project().tracks().next().unwrap().id
     }
 
     #[test]
@@ -167,15 +229,15 @@ mod tests {
         // Not at the end: a track restored in the wrong place would look
         // undone while quietly reordering the mixer.
         let mut session = with_tracks(3);
-        let middle = session.project().tracks[1].id;
+        let middle = session.project().tracks().nth(1).unwrap().id;
         let before = session.project().clone();
 
         session.apply(Command::RemoveTrack { id: middle }).unwrap();
-        assert_eq!(session.project().tracks.len(), 2);
+        assert_eq!(session.project().track_count(), 2);
 
         assert!(session.undo());
         assert_eq!(session.project(), &before);
-        assert_eq!(session.project().tracks[1].id, middle, "it came back in the wrong place");
+        assert_eq!(session.project().tracks().nth(1).unwrap().id, middle, "it came back in the wrong place");
     }
 
     #[test]
@@ -189,6 +251,26 @@ mod tests {
         assert!(session.undo());
         assert!(session.redo());
         assert_eq!(first(&session), id, "the track came back as a different track");
+    }
+
+    #[test]
+    fn an_id_is_never_handed_out_twice() {
+        // Undoing an add and adding again must not give the new track the old
+        // one's number: a saved file, or a reference taken in between, would
+        // mistake the stranger for it (decision D2).
+        let mut session = Session::new();
+        session.apply(Command::AddTrack { name: "one".into(), source: Default::default(), file: None }).unwrap();
+        let undone = first(&session);
+        assert!(session.undo());
+        session.apply(Command::AddTrack { name: "two".into(), source: Default::default(), file: None }).unwrap();
+        assert_ne!(first(&session), undone, "an undone track's id was handed out again");
+
+        // Nor after the highest track is removed, which is where deriving the
+        // next id from what exists would reuse it.
+        let last = first(&session);
+        session.apply(Command::RemoveTrack { id: last }).unwrap();
+        session.apply(Command::AddTrack { name: "three".into(), source: Default::default(), file: None }).unwrap();
+        assert_ne!(first(&session), last);
     }
 
     #[test]
@@ -242,7 +324,7 @@ mod tests {
         // A track cannot answer "am I heard" alone; that is the whole reason
         // the graph has a solo bus.
         let mut session = with_tracks(2);
-        let (a, b) = (session.project().tracks[0].id, session.project().tracks[1].id);
+        let (a, b) = (first(&session), session.project().tracks().nth(1).unwrap().id);
         assert!(session.project().is_audible(a) && session.project().is_audible(b));
 
         session.apply(Command::SetSoloed { id: a, soloed: true }).unwrap();
@@ -287,7 +369,7 @@ mod tests {
     #[test]
     fn two_faders_never_fold_together() {
         let mut session = with_tracks(2);
-        let (a, b) = (session.project().tracks[0].id, session.project().tracks[1].id);
+        let (a, b) = (first(&session), session.project().tracks().nth(1).unwrap().id);
         session.apply(Command::SetGain { id: a, gain: 0.5 }).unwrap();
         session.apply(Command::SetGain { id: b, gain: 0.5 }).unwrap();
         assert_eq!(session.depth(), 2);
