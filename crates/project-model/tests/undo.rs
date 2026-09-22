@@ -10,7 +10,7 @@
 //! a new chance to write the reverse wrongly. That risk is paid for here, once,
 //! rather than discovered later as quietly corrupted work.
 
-use project_model::{Asset, AssetId, Command, Project, Session, Source};
+use project_model::{Asset, AssetId, Command, Meter, Project, Session, Source, Tempo};
 use proptest::prelude::*;
 
 /// An edit aimed at a track by position, since the ids are not known until the
@@ -29,6 +29,10 @@ enum Action {
     /// sequences share files between tracks and drop the last user of one.
     File(u8, Option<u8>),
     AddWithFile(u8),
+    /// Thousandths of a BPM, over a range wider than the valid one so refused
+    /// tempos are exercised too.
+    Tempo(u32),
+    Meter(u8, u8),
 }
 
 /// One of four files, by content. Few enough that tracks keep landing on the
@@ -52,6 +56,8 @@ fn action() -> impl Strategy<Value = Action> {
         1 => (-4.0f32..4.0).prop_map(Action::Master),
         2 => (any::<u8>(), proptest::option::of(any::<u8>())).prop_map(|(i, f)| Action::File(i, f)),
         2 => any::<u8>().prop_map(Action::AddWithFile),
+        1 => (0u32..1_200_000).prop_map(Action::Tempo),
+        1 => (0u8..40, 0u8..40).prop_map(|(b, u)| Action::Meter(b, u)),
     ]
 }
 
@@ -74,6 +80,16 @@ fn to_command(project: &Project, action: &Action) -> Option<Command> {
         Action::Solo(i, soloed) => Command::SetSoloed { id: pick(*i)?, soloed: *soloed },
         Action::Master(gain) => Command::SetMasterGain { gain: *gain },
         Action::File(i, file) => Command::SetFile { id: pick(*i)?, file: file.map(asset) },
+        // Built without the checked constructors, through serde, so an
+        // out-of-range value reaches the command and has to be refused there.
+        Action::Tempo(millis) => {
+            let tempo: Tempo = serde_json::from_value(serde_json::json!(millis)).ok()?;
+            Command::SetTempo { tempo }
+        }
+        Action::Meter(beats, unit) => {
+            let meter: Meter = serde_json::from_value(serde_json::json!({ "beats": beats, "unit": unit })).ok()?;
+            Command::SetMeter { meter }
+        }
         Action::AddWithFile(n) => {
             Command::AddTrack { name: "file".into(), source: Source::File, file: Some(asset(*n)) }
         }

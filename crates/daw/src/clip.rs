@@ -6,14 +6,15 @@
 //! seconds of work and tens of megabytes. One decode, one copy, however many
 //! graphs.
 //!
-//! It loops. A file that stopped would leave the mixer silent a minute after it
-//! was loaded, which is the opposite of useful while faders are being tried.
-//! A transport that starts, stops and seeks belongs with the timeline.
+//! It plays from the start of the timeline, once, following the transport's
+//! clock rather than a cursor of its own. That is what lets a graph be rebuilt
+//! mid-song — a track added, a source switched — without every file jumping
+//! back to its first sample: the new node asks the clock where it is.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use engine_core::{AudioBuffer, Node};
+use engine_core::{AudioBuffer, Clock, Node};
 use engine_io_file::{DecodedAudio, FileError, decode_file};
 
 /// A file, decoded once at the device's rate and shared by every graph that
@@ -64,16 +65,16 @@ impl Node for Silence {
     fn process(&mut self, _buffer: &mut AudioBuffer<'_>) {}
 }
 
-/// Plays shared audio into the graph, round and round.
+/// Plays shared audio into the graph, from the timeline's start.
 pub struct Clip {
     audio: Shared,
-    /// Where the next frame comes from, in frames.
-    cursor: usize,
+    /// Where the timeline is. Read once per block, lock-free.
+    clock: Arc<Clock>,
 }
 
 impl Clip {
-    pub fn new(audio: Shared) -> Self {
-        Self { audio, cursor: 0 }
+    pub fn new(audio: Shared, clock: Arc<Clock>) -> Self {
+        Self { audio, clock }
     }
 }
 
@@ -83,15 +84,17 @@ impl Node for Clip {
         let source_channels = usize::from(self.audio.channels);
         let total = self.audio.frames();
 
-        if total == 0 || source_channels == 0 {
-            for channel in buffer.channels_mut() {
-                channel.fill(0.0);
-            }
+        // Past the end, or a stopped timeline: the buffer arrives silenced, so
+        // there is nothing to write. A stopped clock still has a position, and
+        // the transport's fade is what keeps it quiet — this only has to be
+        // right about where the file is.
+        let start = usize::try_from(self.clock.position()).unwrap_or(usize::MAX);
+        if source_channels == 0 || start >= total {
             return;
         }
 
-        for frame in 0..frames {
-            let position = self.cursor % total;
+        for frame in 0..frames.min(total - start) {
+            let position = start + frame;
             for channel in 0..channels {
                 // A mono file feeds both sides; a file with more channels than
                 // the graph has keeps the ones that fit. Neither is a mix, but
@@ -99,21 +102,26 @@ impl Node for Clip {
                 let taken = channel.min(source_channels - 1);
                 buffer.channel_mut(channel)[frame] = self.audio.samples[position * source_channels + taken];
             }
-            self.cursor += 1;
         }
-    }
-
-    fn reset(&mut self) {
-        self.cursor = 0;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine_core::{Transport, TransportCommand, transport_channel};
 
     fn audio(samples: Vec<f32>, channels: u16) -> Shared {
         Arc::new(DecodedAudio { samples, channels, sample_rate: 48_000 })
+    }
+
+    /// A clock standing at `frame`, and the transport that owns it — kept so
+    /// the clock can be moved on.
+    fn clock_at(frame: u64) -> (Arc<Clock>, Transport) {
+        let (mut control, mut transport) = transport_channel(48_000.0, 4);
+        control.send(TransportCommand::Seek(frame));
+        transport.begin();
+        (Arc::clone(control.clock()), transport)
     }
 
     fn render(clip: &mut Clip, frames: usize, channels: usize) -> Vec<f32> {
@@ -124,7 +132,8 @@ mod tests {
 
     #[test]
     fn a_stereo_file_keeps_its_sides_apart() {
-        let mut clip = Clip::new(audio(vec![1.0, -1.0, 1.0, -1.0], 2));
+        let (clock, _t) = clock_at(0);
+        let mut clip = Clip::new(audio(vec![1.0, -1.0, 1.0, -1.0], 2), clock);
         let out = render(&mut clip, 2, 2);
         // Planar: the first half is the left channel, the second the right.
         assert_eq!(out, vec![1.0, 1.0, -1.0, -1.0]);
@@ -132,39 +141,36 @@ mod tests {
 
     #[test]
     fn a_mono_file_reaches_both_sides() {
-        let mut clip = Clip::new(audio(vec![0.5, 0.25], 1));
+        let (clock, _t) = clock_at(0);
+        let mut clip = Clip::new(audio(vec![0.5, 0.25], 1), clock);
         let out = render(&mut clip, 2, 2);
         assert_eq!(out, vec![0.5, 0.25, 0.5, 0.25]);
     }
 
     #[test]
-    fn it_comes_back_round_rather_than_stopping() {
-        // A file that ran out would leave the mixer silent a minute after it
-        // was loaded, while the faders are still being tried.
-        let mut clip = Clip::new(audio(vec![1.0, 2.0, 3.0], 1));
-        let out = render(&mut clip, 7, 1);
-        assert_eq!(out, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0]);
-    }
-
-    #[test]
-    fn it_carries_on_where_the_last_block_left_off() {
-        let mut clip = Clip::new(audio(vec![1.0, 2.0, 3.0, 4.0], 1));
-        assert_eq!(render(&mut clip, 2, 1), vec![1.0, 2.0]);
+    fn it_plays_from_where_the_timeline_is() {
+        // A graph rebuilt mid-song makes a new clip; it must pick up at the
+        // playhead, not at the file's first sample.
+        let (clock, _t) = clock_at(2);
+        let mut clip = Clip::new(audio(vec![1.0, 2.0, 3.0, 4.0], 1), clock);
         assert_eq!(render(&mut clip, 2, 1), vec![3.0, 4.0]);
     }
 
     #[test]
-    fn an_empty_file_plays_silence_rather_than_panicking() {
-        let mut clip = Clip::new(audio(Vec::new(), 2));
-        assert!(render(&mut clip, 4, 2).iter().all(|s| *s == 0.0));
+    fn it_stops_at_the_end_of_the_file() {
+        let (clock, _t) = clock_at(1);
+        let mut clip = Clip::new(audio(vec![1.0, 2.0, 3.0], 1), clock);
+        assert_eq!(render(&mut clip, 4, 1), vec![2.0, 3.0, 0.0, 0.0]);
+        let (clock, _t) = clock_at(10);
+        let mut clip = Clip::new(audio(vec![1.0, 2.0, 3.0], 1), clock);
+        assert!(render(&mut clip, 4, 1).iter().all(|s| *s == 0.0), "a file played past its end");
     }
 
     #[test]
-    fn a_reset_sends_it_back_to_the_beginning() {
-        let mut clip = Clip::new(audio(vec![1.0, 2.0], 1));
-        render(&mut clip, 1, 1);
-        clip.reset();
-        assert_eq!(render(&mut clip, 1, 1), vec![1.0]);
+    fn an_empty_file_plays_silence_rather_than_panicking() {
+        let (clock, _t) = clock_at(0);
+        let mut clip = Clip::new(audio(Vec::new(), 2), clock);
+        assert!(render(&mut clip, 4, 2).iter().all(|s| *s == 0.0));
     }
 
     #[test]

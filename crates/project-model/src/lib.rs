@@ -23,6 +23,7 @@ mod asset;
 mod command;
 mod file;
 mod history;
+mod time;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -33,6 +34,7 @@ pub use asset::{Asset, AssetId};
 pub use command::{Command, CommandError};
 pub use file::FileError;
 pub use history::Session;
+pub use time::{Meter, PPQ, Tempo, Tick};
 
 /// Which version of the file format this build writes.
 ///
@@ -40,7 +42,7 @@ pub use history::Session;
 /// written. Adding a version to a format that already has files in the wild
 /// means guessing what the unversioned ones were, and that guess is always
 /// wrong for somebody.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Identifies a track for the life of a project.
 ///
@@ -98,6 +100,8 @@ impl Track {
 /// tables and the order that indexes them cannot drift apart.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
+    tempo: Tempo,
+    meter: Meter,
     master_gain: f32,
     /// The mixer's order. Every entry names a track in `tracks`, and every
     /// track appears here once.
@@ -110,13 +114,30 @@ pub struct Project {
 
 impl Default for Project {
     fn default() -> Self {
-        Self { master_gain: 1.0, track_order: Vec::new(), tracks: BTreeMap::new(), assets: BTreeMap::new() }
+        Self {
+            tempo: Tempo::default(),
+            meter: Meter::default(),
+            master_gain: 1.0,
+            track_order: Vec::new(),
+            tracks: BTreeMap::new(),
+            assets: BTreeMap::new(),
+        }
     }
 }
 
 impl Project {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// One tempo for the whole project. A map of changes comes with the
+    /// timeline; until then there is nothing to place a change on.
+    pub fn tempo(&self) -> Tempo {
+        self.tempo
+    }
+
+    pub fn meter(&self) -> Meter {
+        self.meter
     }
 
     pub fn master_gain(&self) -> f32 {
@@ -193,6 +214,9 @@ impl Project {
     /// edited — and for the tests that prove no sequence of commands breaks
     /// them.
     pub fn check(&self) -> Result<(), Invalid> {
+        if !time::valid(self.tempo, self.meter) {
+            return Err(Invalid::OutOfRange("the tempo or time signature"));
+        }
         if !self.master_gain.is_finite() {
             return Err(Invalid::OutOfRange("the master gain"));
         }

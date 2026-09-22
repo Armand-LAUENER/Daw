@@ -9,5 +9,8 @@ license.workspace = true
 engine-core.workspace = true
 project-model.workspace = true
 
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true

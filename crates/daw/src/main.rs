@@ -14,12 +14,15 @@ mod ui;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use eframe::egui;
-use engine_core::{AutomationSender, Graph, GraphSwapper, Node, ParamId, automation_channel, graph_channel};
+use engine_core::{
+    AutomationSender, Clock, Graph, GraphSwapper, Node, ParamId, TransportCommand, TransportControl,
+    automation_channel, graph_channel, transport_channel,
+};
 use engine_dsp::SineOsc;
 use engine_io::{AudioEngine, EngineOptions, Stats, default_output_config, map_frames};
+use project_engine::{Position, Timing};
 use project_model::{Asset, Command, Project, Session, Source, Track};
 
 use clip::{Clip, Library, Silence};
@@ -71,6 +74,8 @@ struct FileSources {
     /// the callback is work nobody has budgeted for.
     rate: u32,
     sample_rate: f32,
+    /// The timeline, which every file plays from.
+    clock: Arc<Clock>,
 }
 
 impl Sources for FileSources {
@@ -85,7 +90,7 @@ impl Sources for FileSources {
             // has not read: the tone says so audibly, where silence would look
             // like a track that had quietly gone missing.
             Source::File => match project.file_of(track).and_then(|asset| self.library.get(&asset.path)) {
-                Some(audio) => Box::new(Clip::new(audio)),
+                Some(audio) => Box::new(Clip::new(audio, Arc::clone(&self.clock))),
                 None => tone_for(track, self.sample_rate),
             },
             Source::Tone => tone_for(track, self.sample_rate),
@@ -133,6 +138,8 @@ struct App {
     /// Files already read, so a rebuild reuses what was decoded rather than
     /// reading it again.
     sources: FileSources,
+    /// Play, pause, stop, and where the timeline is.
+    transport: TransportControl,
     /// The last thing that went wrong, for the strip along the bottom.
     trouble: Option<String>,
     /// Where the project was last saved or opened from. `None` until then,
@@ -162,8 +169,7 @@ impl App {
         // inside it would trip the no-allocation check the engine wraps it in.
         let mut mix = vec![0.0f32; MAX_GRAPH_FRAMES * GRAPH_CHANNELS];
         let mut frame = 0u64;
-        let position = Arc::new(AtomicU64::new(0));
-        let callback_position = Arc::clone(&position);
+        let (transport, mut timeline) = transport_channel(sample_rate, 64);
 
         let (engine, _commands) = AudioEngine::start_with(&options, move |out, channels| {
             let frames = out.len() / channels.max(1);
@@ -171,16 +177,21 @@ impl App {
             while done < frames {
                 let span = (frames - done).min(MAX_GRAPH_FRAMES);
                 let stereo = &mut mix[..span * GRAPH_CHANNELS];
+                // The timeline position is published before the graph renders,
+                // so every clip in it reads the same one; the fade after it is
+                // what makes a stopped transport silent.
+                timeline.begin();
                 player.process_automated(stereo, &mut queue, frame);
+                timeline.finish(stereo, GRAPH_CHANNELS);
                 map_frames(stereo, GRAPH_CHANNELS, &mut out[done * channels..(done + span) * channels], channels);
                 frame += span as u64;
                 done += span;
             }
-            callback_position.store(frame, Ordering::Relaxed);
         })?;
 
         let stats = Arc::clone(&engine.stats);
-        let mut sources = FileSources { library: Library::new(), rate, sample_rate };
+        let mut sources =
+            FileSources { library: Library::new(), rate, sample_rate, clock: Arc::clone(transport.clock()) };
         let studio =
             Studio::new(LiveEngine { params, swapper }, &mut sources, GRAPH_CHANNELS, MAX_GRAPH_FRAMES, sample_rate);
 
@@ -205,6 +216,7 @@ impl App {
             layout: Layout::default(),
             show_layout: false,
             sources,
+            transport,
             trouble: None,
             project_path: None,
             stats,
@@ -333,6 +345,11 @@ impl App {
         if actions.save {
             self.save();
         }
+        if let Some(command) = actions.transport {
+            // A full queue means the audio thread has stalled; the button
+            // simply does nothing this time rather than freezing the window.
+            self.transport.send(command);
+        }
     }
 }
 
@@ -384,11 +401,27 @@ impl eframe::App for App {
                 actions.save = true;
             }
         });
+        // Space plays and pauses, unless someone is typing a track name.
+        if !ctx.egui_wants_keyboard_input() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space))
+        {
+            let playing = self.transport.is_playing();
+            actions.transport = Some(if playing { TransportCommand::Pause } else { TransportCommand::Play });
+        }
 
         egui::Panel::top("bar").show(root, |ui| {
             let name = self.project_path.as_deref().and_then(Path::file_name).map(|n| n.to_string_lossy());
-            let bar =
-                Bar { can_undo: self.studio.can_undo(), can_redo: self.studio.can_redo(), project: name.as_deref() };
+            let project = self.studio.project();
+            let timing = Timing::new(project.tempo(), self.sources.rate);
+            let position = Position::of(self.transport.clock().position(), timing, project.meter());
+            let bar = Bar {
+                can_undo: self.studio.can_undo(),
+                can_redo: self.studio.can_redo(),
+                project: name.as_deref(),
+                playing: self.transport.is_playing(),
+                position,
+                tempo: project.tempo(),
+                meter: project.meter(),
+            };
             ui::top_bar(ui, &theme, &self.themes, &bar, &mut actions);
         });
         if self.show_layout {
@@ -422,7 +455,9 @@ impl eframe::App for App {
 
         // The status strip reads counters the audio thread keeps moving, so the
         // window has to come back even when nobody touches it.
-        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        // Faster while playing, so the counter moves smoothly.
+        let every = if self.transport.clock().is_running() { 30 } else { 200 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(every));
     }
 }
 

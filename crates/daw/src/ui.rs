@@ -6,7 +6,9 @@
 //! touching anything that matters.
 
 use eframe::egui::{self, RichText, Ui};
-use project_model::{Command, Project, Source, TrackId};
+use engine_core::TransportCommand;
+use project_engine::Position;
+use project_model::{Command, Meter, Project, Source, Tempo, TrackId};
 
 use crate::layout::Layout;
 use crate::theme::Theme;
@@ -26,6 +28,9 @@ pub struct Actions {
     pub toggle_layout: bool,
     /// The project is to be written to disk.
     pub save: bool,
+    /// Play, pause, stop or seek. Not a [`Command`]: where the playhead is
+    /// belongs to the engine, not to the project, and never enters the history.
+    pub transport: Option<TransportCommand>,
 }
 
 /// How the engine is getting on, for the strip along the bottom.
@@ -45,10 +50,15 @@ pub struct Bar<'a> {
     pub can_redo: bool,
     /// The project's file name, or `None` before it is first saved.
     pub project: Option<&'a str>,
+    /// Whether play was the last thing asked of the transport.
+    pub playing: bool,
+    pub position: Position,
+    pub tempo: Tempo,
+    pub meter: Meter,
 }
 
 pub fn top_bar(ui: &mut Ui, theme: &Theme, themes: &[Theme], bar: &Bar<'_>, actions: &mut Actions) {
-    let Bar { can_undo, can_redo, project } = *bar;
+    let Bar { can_undo, can_redo, project, .. } = *bar;
     ui.horizontal(|ui| {
         ui.label(RichText::new("Daw").color(theme.accent).strong());
         ui.label(RichText::new(project.unwrap_or("unsaved")).color(theme.dim));
@@ -71,6 +81,9 @@ pub fn top_bar(ui: &mut Ui, theme: &Theme, themes: &[Theme], bar: &Bar<'_>, acti
         }
 
         ui.separator();
+        transport(ui, theme, bar, actions);
+
+        ui.separator();
         if ui.button("Layout").clicked() {
             actions.toggle_layout = true;
         }
@@ -84,6 +97,54 @@ pub fn top_bar(ui: &mut Ui, theme: &Theme, themes: &[Theme], bar: &Bar<'_>, acti
             }
         });
     });
+}
+
+/// Play/pause, stop, where the playhead is, and the tempo and time signature.
+fn transport(ui: &mut Ui, theme: &Theme, bar: &Bar<'_>, actions: &mut Actions) {
+    let (label, command) =
+        if bar.playing { ("❚❚", TransportCommand::Pause) } else { ("▶", TransportCommand::Play) };
+    if ui.button(label).on_hover_text("play / pause (space)").clicked() {
+        actions.transport = Some(command);
+    }
+    if ui.button("■").on_hover_text("stop and go back to the start").clicked() {
+        actions.transport = Some(TransportCommand::Stop);
+    }
+    ui.label(RichText::new(bar.position.musical()).color(theme.accent).monospace());
+    ui.label(RichText::new(bar.position.clock()).color(theme.dim).monospace().small());
+
+    // Dragged like a fader: one gesture, one step in the history.
+    let mut bpm = bar.tempo.bpm();
+    let range = Tempo::MIN.bpm()..=Tempo::MAX.bpm();
+    let tempo = ui.add(egui::DragValue::new(&mut bpm).range(range).speed(0.1).max_decimals(3).suffix(" bpm"));
+    if tempo.changed()
+        && let Some(tempo) = Tempo::from_bpm(bpm)
+    {
+        actions.commands.push(Command::SetTempo { tempo });
+    }
+    if tempo.drag_stopped() || tempo.lost_focus() {
+        actions.seal = true;
+    }
+
+    let mut beats = bar.meter.beats();
+    if ui.add(egui::DragValue::new(&mut beats).range(1..=32)).changed()
+        && let Some(meter) = Meter::new(beats, bar.meter.unit())
+    {
+        actions.commands.push(Command::SetMeter { meter });
+    }
+    ui.label("/");
+    egui::ComboBox::from_id_salt("meter-unit").width(36.0).selected_text(bar.meter.unit().to_string()).show_ui(
+        ui,
+        |ui| {
+            for unit in [2u8, 4, 8, 16] {
+                if ui.selectable_label(unit == bar.meter.unit(), unit.to_string()).clicked()
+                    && unit != bar.meter.unit()
+                    && let Some(meter) = Meter::new(bar.meter.beats(), unit)
+                {
+                    actions.commands.push(Command::SetMeter { meter });
+                }
+            }
+        },
+    );
 }
 
 pub fn mixer(ui: &mut Ui, project: &Project, theme: &Theme, layout: &Layout, actions: &mut Actions) {

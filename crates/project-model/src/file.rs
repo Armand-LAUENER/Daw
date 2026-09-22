@@ -18,7 +18,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::history::Ids;
-use crate::{FORMAT_VERSION, Invalid, Project, Session};
+use crate::{FORMAT_VERSION, Invalid, Meter, Project, Session, Tempo};
 
 /// What the first field of every project file says, so a JSON file that
 /// happens to parse is not taken for a project.
@@ -118,10 +118,9 @@ impl Session {
         if header.version > FORMAT_VERSION {
             return Err(FileError::Newer(header.version));
         }
-        // Every version so far is this one. A migration from an older one
-        // goes here, as a function from its shape to the next.
-
-        let Read { next_ids, mut project } = serde_json::from_str(text)?;
+        let mut value: serde_json::Value = serde_json::from_str(text)?;
+        migrate(&mut value, header.version)?;
+        let Read { next_ids, mut project } = serde_json::from_value(value)?;
         if let Some(folder) = folder {
             for asset in project.assets.values_mut() {
                 if asset.path.is_relative() {
@@ -162,6 +161,31 @@ impl Session {
         let text = fs::read_to_string(path)?;
         Self::from_json(&text, path.parent())
     }
+}
+
+/// Brings a file written in an older format up to this one, one version at a
+/// time.
+///
+/// Works on the JSON rather than on old Rust types: an old shape then needs
+/// no struct kept alive for it, only the few lines that say what changed.
+fn migrate(value: &mut serde_json::Value, from: u32) -> Result<(), FileError> {
+    let mut version = from;
+    while version < FORMAT_VERSION {
+        let project =
+            value.get_mut("project").and_then(serde_json::Value::as_object_mut).ok_or(FileError::NotAProject)?;
+        match version {
+            // Version 2 gave the project a tempo and a time signature. A
+            // project from before had neither, and played at the default.
+            1 => {
+                project.insert("tempo".into(), serde_json::json!(Tempo::default()));
+                project.insert("meter".into(), serde_json::json!(Meter::default()));
+            }
+            // Version 0 never existed: no file was written before the header.
+            _ => return Err(FileError::NotAProject),
+        }
+        version += 1;
+    }
+    Ok(())
 }
 
 /// A path as written in a project in `folder`: relative with forward slashes

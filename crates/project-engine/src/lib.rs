@@ -18,6 +18,10 @@
 //! movement of a fader would mean a ten-millisecond crossfade per mouse frame.
 //! [`route`] is where that distinction is made, once.
 
+mod time;
+
+pub use time::{Position, Timing};
+
 use engine_core::{Gain, Graph, GraphBuilder, GraphError, Limiter, Mute, Node, Pan, ParamId, Solo, SoloBus};
 use project_model::{Command, Project, Track, TrackId};
 
@@ -151,7 +155,9 @@ pub fn route(bindings: &Bindings, command: &Command) -> Change {
         | Command::RemoveTrack { .. }
         | Command::SetSource { .. }
         | Command::SetFile { .. } => Change::Rebuild,
-        Command::RenameTrack { .. } => Change::Nothing,
+        // Nothing plays from the tempo yet: it is read by the transport's
+        // display, and by the timeline when there is one.
+        Command::RenameTrack { .. } | Command::SetTempo { .. } | Command::SetMeter { .. } => Change::Nothing,
         Command::SetGain { id, gain } => aimed(*id, |b| b.gain, *gain),
         Command::SetPan { id, pan } => aimed(*id, |b| b.pan, pan.clamp(-1.0, 1.0)),
         Command::SetMuted { id, muted } => aimed(*id, |b| b.muted, flag(*muted)),

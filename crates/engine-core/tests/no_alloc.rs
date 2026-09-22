@@ -244,3 +244,26 @@ fn a_synth_does_not_allocate_while_it_plays() {
     assert!(sounded, "the synth produced silence throughout, so it proved nothing");
     assert!(finite, "the synth went non-finite");
 }
+
+#[test]
+fn the_transport_never_allocates() {
+    // Commands, fades and seeks all happen inside the callback; any of them
+    // reaching for the allocator would abort here.
+    let (mut control, mut transport) = engine_core::transport_channel(SR, 16);
+    let mut data = vec![0.5f32; MAX_FRAMES * CHANNELS];
+    for command in [
+        engine_core::TransportCommand::Play,
+        engine_core::TransportCommand::Seek(48_000),
+        engine_core::TransportCommand::Pause,
+        engine_core::TransportCommand::Play,
+        engine_core::TransportCommand::Stop,
+    ] {
+        control.send(command);
+        assert_no_alloc(|| {
+            for _ in 0..4 {
+                transport.begin();
+                transport.finish(&mut data, CHANNELS);
+            }
+        });
+    }
+}

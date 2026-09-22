@@ -34,6 +34,58 @@ fn demo() -> Session {
 /// purpose, bump `FORMAT_VERSION`, write the migration, and update this.
 const REFERENCE: &str = r#"{
   "format": "daw-project",
+  "version": 2,
+  "next_ids": {
+    "track": 2
+  },
+  "project": {
+    "tempo": 120000,
+    "meter": {
+      "beats": 4,
+      "unit": 4
+    },
+    "master_gain": 1.0,
+    "track_order": [
+      0,
+      1
+    ],
+    "tracks": {
+      "0": {
+        "id": 0,
+        "name": "Kick",
+        "gain": 1.0,
+        "pan": 0.0,
+        "muted": false,
+        "soloed": false,
+        "source": "file",
+        "file": "f09b2136a68a271423955b63129a24cc00b1d326f31f481e965f786315000a26"
+      },
+      "1": {
+        "id": 1,
+        "name": "Pad",
+        "gain": 0.5,
+        "pan": -0.3,
+        "muted": false,
+        "soloed": false,
+        "source": "tone",
+        "file": null
+      }
+    },
+    "assets": {
+      "f09b2136a68a271423955b63129a24cc00b1d326f31f481e965f786315000a26": {
+        "id": "f09b2136a68a271423955b63129a24cc00b1d326f31f481e965f786315000a26",
+        "path": "audio/kick.wav"
+      }
+    }
+  }
+}
+"#;
+
+/// A project as version 1 wrote it, before the project had a tempo. Kept
+/// byte for byte: it is what a person's first saved files look like, and they
+/// have to keep opening.
+const VERSION_1: &str = r#"{
+  "format": "daw-project",
   "version": 1,
   "next_ids": {
     "track": 2
@@ -89,6 +141,15 @@ fn the_reference_reads_back_as_the_project_it_came_from() {
 }
 
 #[test]
+fn a_version_1_file_opens_at_the_default_tempo() {
+    let session = Session::from_json(VERSION_1, Some(&folder())).unwrap();
+    assert_eq!(session.project(), demo().project(), "the migration changed more than it added");
+    assert_eq!(session.project().tempo(), project_model::Tempo::default());
+    // And it is written back in the current format, not the one it came in.
+    assert_eq!(session.to_json(Some(&folder())), REFERENCE);
+}
+
+#[test]
 fn an_opened_project_keeps_retiring_ids() {
     // The counter is saved, so a track removed before saving keeps its id
     // retired afterwards: the next track must not take it.
@@ -115,7 +176,7 @@ fn a_file_outside_the_project_folder_keeps_its_full_path() {
 
 #[test]
 fn a_file_from_a_newer_version_is_refused_by_name() {
-    let newer = REFERENCE.replace("\"version\": 1", "\"version\": 99");
+    let newer = REFERENCE.replace("\"version\": 2", "\"version\": 99");
     assert!(matches!(Session::from_json(&newer, None), Err(FileError::Newer(99))));
 }
 

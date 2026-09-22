@@ -3,7 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::history::Ids;
-use crate::{Asset, AssetId, Project, Source, Track, TrackId};
+use crate::{Asset, AssetId, Meter, Project, Source, Tempo, Track, TrackId, time};
 
 /// A change someone asked for.
 ///
@@ -52,6 +52,13 @@ pub enum Command {
     SetMasterGain {
         gain: f32,
     },
+    /// The project's tempo. Dragged like a fader, so a sweep is one step.
+    SetTempo {
+        tempo: Tempo,
+    },
+    SetMeter {
+        meter: Meter,
+    },
     /// What the track plays. A change of material, not of setting, so it never
     /// folds into a neighbouring gesture.
     SetSource {
@@ -83,13 +90,15 @@ impl Command {
             Self::SetPan { id, .. } => Some(Target(1, *id)),
             // The master has no track of its own to be named by.
             Self::SetMasterGain { .. } => Some(Target(2, TrackId(u32::MAX))),
+            Self::SetTempo { .. } => Some(Target(3, TrackId(u32::MAX))),
             Self::AddTrack { .. }
             | Self::RemoveTrack { .. }
             | Self::RenameTrack { .. }
             | Self::SetMuted { .. }
             | Self::SetSoloed { .. }
             | Self::SetSource { .. }
-            | Self::SetFile { .. } => None,
+            | Self::SetFile { .. }
+            | Self::SetMeter { .. } => None,
         }
     }
 }
@@ -103,6 +112,10 @@ pub enum CommandError {
     /// A gain that is NaN or infinite would silence or destroy the output, and
     /// would survive into a saved file to do it again tomorrow.
     NotFinite(&'static str),
+    /// A value outside what the project accepts — a tempo of 2 BPM, a bar of
+    /// thirds. Only reachable from a command built by hand or read from disk:
+    /// [`Tempo`] and [`Meter`] refuse them when made.
+    OutOfRange(&'static str),
 }
 
 impl fmt::Display for CommandError {
@@ -110,6 +123,7 @@ impl fmt::Display for CommandError {
         match self {
             Self::NoSuchTrack(TrackId(id)) => write!(f, "there is no track {id}"),
             Self::NotFinite(what) => write!(f, "{what} must be a finite number"),
+            Self::OutOfRange(what) => write!(f, "{what} is out of range"),
         }
     }
 }
@@ -164,6 +178,12 @@ pub(crate) enum Edit {
     },
     SetMasterGain {
         gain: f32,
+    },
+    SetTempo {
+        tempo: Tempo,
+    },
+    SetMeter {
+        meter: Meter,
     },
     SetSource {
         id: TrackId,
@@ -237,6 +257,18 @@ pub(crate) fn resolve(project: &Project, ids: &mut Ids, command: Command) -> Res
         Command::SetMasterGain { gain } => {
             finite(gain, "the master gain")?;
             one(Edit::SetMasterGain { gain }, Edit::SetMasterGain { gain: project.master_gain() })
+        }
+        Command::SetTempo { tempo } => {
+            if !time::valid(tempo, project.meter()) {
+                return Err(CommandError::OutOfRange("a tempo"));
+            }
+            one(Edit::SetTempo { tempo }, Edit::SetTempo { tempo: project.tempo() })
+        }
+        Command::SetMeter { meter } => {
+            if !time::valid(project.tempo(), meter) {
+                return Err(CommandError::OutOfRange("a time signature"));
+            }
+            one(Edit::SetMeter { meter }, Edit::SetMeter { meter: project.meter() })
         }
         Command::SetSource { id, source } => {
             let was = found(id)?.source;
@@ -339,6 +371,8 @@ fn apply_one(project: &mut Project, edit: &Edit) {
         Edit::SetMuted { id, muted } => on(*id, &mut |t| t.muted = *muted),
         Edit::SetSoloed { id, soloed } => on(*id, &mut |t| t.soloed = *soloed),
         Edit::SetMasterGain { gain } => project.master_gain = *gain,
+        Edit::SetTempo { tempo } => project.tempo = *tempo,
+        Edit::SetMeter { meter } => project.meter = *meter,
         Edit::SetSource { id, source } => on(*id, &mut |t| t.source = *source),
         Edit::SetFile { id, file } => on(*id, &mut |t| t.file = *file),
     }

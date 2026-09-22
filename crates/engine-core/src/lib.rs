@@ -18,6 +18,7 @@ mod node;
 mod note;
 mod swap;
 mod synth;
+mod transport;
 
 pub use automation::{AutomationQueue, AutomationSender, ParamEvent, ParamId, automation_channel};
 pub use buffer::AudioBuffer;
@@ -28,3 +29,4 @@ pub use node::{Gain, Mute, Node, PARAM_RAMP_MS, Pan, Solo, SoloBus};
 pub use note::{Note, NoteAction, NoteEvent, NoteQueue, NoteSender, PianoRoll, note_channel, pitch_to_hz};
 pub use swap::{GraphPlayer, GraphSwapper, SWAP_FADE_MS, graph_channel};
 pub use synth::Synth;
+pub use transport::{Clock, TRANSPORT_FADE_MS, Transport, TransportCommand, TransportControl, transport_channel};

@@ -3038,6 +3038,7 @@ version = "0.1.0"
 dependencies = [
  "engine-core",
  "project-model",
+ "proptest",
 ]
 
 [[package]]
