@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::command::{Command, CommandError, Edit, Target, apply, resolve};
-use crate::{Invalid, Project, TrackId};
+use crate::{Clip, ClipId, Invalid, NoteId, PlacementId, Project, TrackId};
 
 /// The next identifier of each kind, handed out once and never again.
 ///
@@ -14,33 +14,70 @@ use crate::{Invalid, Project, TrackId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub(crate) struct Ids {
     track: u32,
+    clip: u32,
+    placement: u32,
+    note: u32,
 }
 
 impl Ids {
-    /// The smallest counter that cannot collide with what a project holds.
+    /// The smallest counters that cannot collide with what a project holds.
     pub(crate) fn clearing(project: &Project) -> Self {
-        Self { track: project.tracks().map(|t| t.id.0 + 1).max().unwrap_or(0) }
+        let next = |ids: &mut dyn Iterator<Item = u32>| ids.map(|id| id + 1).max().unwrap_or(0);
+        Self {
+            track: next(&mut project.tracks().map(|t| t.id.0)),
+            clip: next(&mut project.clips().map(|c| c.id.0)),
+            placement: next(&mut project.placements().map(|p| p.id.0)),
+            note: next(&mut project.clips().filter_map(Clip::notes).flat_map(|n| n.keys().map(|id| id.0))),
+        }
     }
 
-    /// Whichever is further on, so a counter from a file that was edited by
-    /// hand can never hand out an id the project already uses.
+    /// Whichever is further on, counter by counter, so a counter from a file
+    /// edited by hand can never hand out an id the project already uses.
     pub(crate) fn max(self, other: Self) -> Self {
-        Self { track: self.track.max(other.track) }
+        Self {
+            track: self.track.max(other.track),
+            clip: self.clip.max(other.clip),
+            placement: self.placement.max(other.placement),
+            note: self.note.max(other.note),
+        }
     }
 
     pub(crate) fn take_track(&mut self) -> TrackId {
-        let id = TrackId(self.track);
-        self.track += 1;
-        id
+        TrackId(take(&mut self.track))
     }
 
-    /// Whether every id the project holds is one this counter has handed out.
+    pub(crate) fn take_clip(&mut self) -> ClipId {
+        ClipId(take(&mut self.clip))
+    }
+
+    pub(crate) fn take_placement(&mut self) -> PlacementId {
+        PlacementId(take(&mut self.placement))
+    }
+
+    pub(crate) fn take_note(&mut self) -> NoteId {
+        NoteId(take(&mut self.note))
+    }
+
+    /// Whether every id the project holds is one these counters handed out.
     pub(crate) fn check(&self, project: &Project) -> Result<(), Invalid> {
-        match project.tracks().find(|t| t.id.0 >= self.track) {
-            Some(track) => Err(Invalid::IdAhead(track.id)),
+        let clearing = Self::clearing(project);
+        let ahead = [
+            ("track", clearing.track, self.track),
+            ("clip", clearing.clip, self.clip),
+            ("placement", clearing.placement, self.placement),
+            ("note", clearing.note, self.note),
+        ];
+        match ahead.into_iter().find(|(_, needed, have)| needed > have) {
+            Some((what, needed, _)) => Err(Invalid::IdAhead(what, needed - 1)),
             None => Ok(()),
         }
     }
+}
+
+fn take(counter: &mut u32) -> u32 {
+    let id = *counter;
+    *counter += 1;
+    id
 }
 
 /// One entry in the history: what was done, and what puts it back.

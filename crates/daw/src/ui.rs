@@ -245,10 +245,12 @@ fn strip(
                 // Three states, chosen rather than cycled, and none of them
                 // throws the file away: switching to the tone and back is how
                 // a person hears what a setting is doing.
-                let has_file = track.file.is_some();
-                for (label, source, enabled) in
-                    [("silent", Source::Silent, true), ("tone", Source::Tone, true), ("file", Source::File, has_file)]
-                {
+                let has_clips = !project.placements_on(id).is_empty();
+                for (label, source, enabled) in [
+                    ("silent", Source::Silent, true),
+                    ("tone", Source::Tone, true),
+                    ("clips", Source::Clips, has_clips),
+                ] {
                     let chosen = track.source == source;
                     let colour = if chosen { theme.accent } else { theme.dim };
                     // Selection is carried by colour rather than by a frame:
@@ -258,13 +260,13 @@ fn strip(
                         actions.commands.push(Command::SetSource { id, source });
                     }
                 }
-                if has_file && ui.button(RichText::new("eject").color(theme.warning).small()).clicked() {
-                    // Takes the file off the track for good; the tone button is
-                    // how you stop listening to it without losing it.
-                    actions.commands.push(Command::SetFile { id, file: None });
+                if has_clips && ui.button(RichText::new("eject").color(theme.warning).small()).clicked() {
+                    // Takes the clips off the track for good; the tone button
+                    // is how you stop listening to them without losing them.
+                    actions.commands.push(Command::ClearTrack { id });
                     actions.commands.push(Command::SetSource { id, source: Source::Silent });
                 }
-                let colour = if track.source == Source::File { theme.accent } else { theme.dim };
+                let colour = if track.source == Source::Clips { theme.accent } else { theme.dim };
                 ui.label(RichText::new(project.playing(track)).color(colour).small());
             });
         });

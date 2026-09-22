@@ -305,7 +305,7 @@ mod tests {
         let id = f.add_track();
         let (swaps, asked) = (f.swaps(), f.sources.asked);
 
-        f.apply(Command::SetSource { id, source: project_model::Source::File }).unwrap();
+        f.apply(Command::SetSource { id, source: project_model::Source::Clips }).unwrap();
         assert_eq!(f.swaps(), swaps + 1);
         assert!(f.sources.asked > asked, "the graph was rebuilt without asking what to play");
     }

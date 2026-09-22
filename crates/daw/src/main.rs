@@ -22,10 +22,10 @@ use engine_core::{
 };
 use engine_dsp::SineOsc;
 use engine_io::{AudioEngine, EngineOptions, Stats, default_output_config, map_frames};
-use project_engine::{Position, Timing};
+use project_engine::{Position, Timing, audio_starts};
 use project_model::{Asset, Command, Project, Session, Source, Track};
 
-use clip::{Clip, Library, Silence};
+use clip::{Lane, Library, Silence};
 use layout::Layout;
 use studio::{Engine, Sources, Studio};
 use theme::Theme;
@@ -89,10 +89,22 @@ impl Sources for FileSources {
             // Asked for a file but holding none, or holding one the library
             // has not read: the tone says so audibly, where silence would look
             // like a track that had quietly gone missing.
-            Source::File => match project.file_of(track).and_then(|asset| self.library.get(&asset.path)) {
-                Some(audio) => Box::new(Clip::new(audio, Arc::clone(&self.clock))),
-                None => tone_for(track, self.sample_rate),
-            },
+            Source::Clips => {
+                let timing = Timing::new(project.tempo(), self.rate);
+                let starts = audio_starts(project, track.id, timing);
+                let clips: Vec<_> = starts
+                    .iter()
+                    .filter_map(|(asset, start)| Some((*start, self.library.get(&project.asset(*asset)?.path)?)))
+                    .collect();
+                // Clips the library could not read: the tone says so audibly.
+                // MIDI clips are not played yet, so a track holding only those
+                // is silent rather than toned.
+                if clips.len() < starts.len() {
+                    tone_for(track, self.sample_rate)
+                } else {
+                    Box::new(Lane::new(clips, Arc::clone(&self.clock)))
+                }
+            }
             Source::Tone => tone_for(track, self.sample_rate),
             Source::Silent => Box::new(Silence),
         }
@@ -253,7 +265,7 @@ impl App {
                 let seconds = audio.duration().as_secs_f64();
                 self.trouble = None;
                 println!("loaded {} ({:.1}s, {} ch)", path.display(), seconds, audio.channels);
-                let command = Command::AddTrack { name, source: Source::File, file: Some(asset) };
+                let command = Command::AddTrack { name, source: Source::Clips, file: Some(asset) };
                 let _ = self.studio.apply(command, &mut self.sources);
             }
             Err(e) => self.report(format!("{}: {e}", path.display())),

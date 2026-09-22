@@ -19,10 +19,12 @@
 //! Moving a track is then one line of a saved file rather than a rewritten
 //! block, and a reference is always by name, never by position.
 
+mod arrangement;
 mod asset;
 mod command;
 mod file;
 mod history;
+mod id;
 mod time;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,6 +32,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub use arrangement::{Clip, ClipId, Content, Note, NoteId, Placement, PlacementId, Window};
 pub use asset::{Asset, AssetId};
 pub use command::{Command, CommandError};
 pub use file::FileError;
@@ -42,15 +45,17 @@ pub use time::{Meter, PPQ, Tempo, Tick};
 /// written. Adding a version to a format that already has files in the wild
 /// means guessing what the unversioned ones were, and that guess is always
 /// wrong for somebody.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Identifies a track for the life of a project.
 ///
 /// Never reused, even after the track is gone (decision D2): a reference that
 /// outlived its track must find nothing, not a stranger that took its number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct TrackId(pub u32);
+
+id::deserialize_as_key!(TrackId);
 
 /// Where a track's audio comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -62,8 +67,8 @@ pub enum Source {
     /// A test tone, asked for on purpose. Useful for hearing what a fader or a
     /// pan does without loading anything.
     Tone,
-    /// The track's file, which it keeps whether or not it is playing it.
-    File,
+    /// The clips placed on it.
+    Clips,
 }
 
 /// One track's settings. What the mixer shows, and what a graph is built from.
@@ -77,20 +82,15 @@ pub struct Track {
     pub pan: f32,
     pub muted: bool,
     pub soloed: bool,
-    /// What the track plays.
+    /// What the track plays. Switching to the tone and back leaves its clips
+    /// where they are, which is what lets a person hear what a setting does
+    /// and come back to their material.
     pub source: Source,
-    /// The file the track holds, kept whether or not it is the thing being
-    /// played. Separating the two is what lets a person listen to the test tone
-    /// and come back to their audio instead of having lost it.
-    ///
-    /// Named by content rather than by path: the path lives in the project's
-    /// pool, where it can be corrected once for every track that uses it.
-    pub file: Option<AssetId>,
 }
 
 impl Track {
-    pub fn new(id: TrackId, name: impl Into<String>, source: Source, file: Option<AssetId>) -> Self {
-        Self { id, name: name.into(), gain: 1.0, pan: 0.0, muted: false, soloed: false, source, file }
+    pub fn new(id: TrackId, name: impl Into<String>, source: Source) -> Self {
+        Self { id, name: name.into(), gain: 1.0, pan: 0.0, muted: false, soloed: false, source }
     }
 }
 
@@ -107,8 +107,12 @@ pub struct Project {
     /// track appears here once.
     track_order: Vec<TrackId>,
     tracks: BTreeMap<TrackId, Track>,
-    /// Every file a track holds, and nothing else: an asset no track uses is
-    /// removed with the last track that did.
+    /// Every clip that is placed somewhere, and nothing else: a clip is removed
+    /// with its last placement.
+    clips: BTreeMap<ClipId, Clip>,
+    placements: BTreeMap<PlacementId, Placement>,
+    /// Every file an audio clip plays, and nothing else: an asset is removed
+    /// with the last clip that used it.
     assets: BTreeMap<AssetId, Asset>,
 }
 
@@ -120,6 +124,8 @@ impl Default for Project {
             master_gain: 1.0,
             track_order: Vec::new(),
             tracks: BTreeMap::new(),
+            clips: BTreeMap::new(),
+            placements: BTreeMap::new(),
             assets: BTreeMap::new(),
         }
     }
@@ -171,9 +177,33 @@ impl Project {
         self.assets.get(&id)
     }
 
-    /// The file a track holds, if it holds one.
-    pub fn file_of(&self, track: &Track) -> Option<&Asset> {
-        self.asset(track.file?)
+    pub fn clips(&self) -> impl ExactSizeIterator<Item = &Clip> {
+        self.clips.values()
+    }
+
+    pub fn clip(&self, id: ClipId) -> Option<&Clip> {
+        self.clips.get(&id)
+    }
+
+    pub fn placements(&self) -> impl ExactSizeIterator<Item = &Placement> {
+        self.placements.values()
+    }
+
+    pub fn placement(&self, id: PlacementId) -> Option<&Placement> {
+        self.placements.get(&id)
+    }
+
+    /// A track's placements, earliest first; ties by id, so the order is the
+    /// same every time it is asked.
+    pub fn placements_on(&self, track: TrackId) -> Vec<&Placement> {
+        let mut on: Vec<_> = self.placements.values().filter(|p| p.track == track).collect();
+        on.sort_by_key(|p| (p.start, p.id));
+        on
+    }
+
+    /// How many placements play a clip: more than one is a linked clip.
+    pub fn uses_of_clip(&self, clip: ClipId) -> usize {
+        self.placements.values().filter(|p| p.clip == clip).count()
     }
 
     /// A short description of what a track is playing, for the mixer.
@@ -181,7 +211,14 @@ impl Project {
         match track.source {
             Source::Silent => "silent".into(),
             Source::Tone => "tone".into(),
-            Source::File => self.file_of(track).map_or_else(|| "no file".into(), Asset::name),
+            Source::Clips => {
+                let on = self.placements_on(track.id);
+                match on.as_slice() {
+                    [] => "empty".into(),
+                    [one] => self.clip(one.clip).map_or_else(|| "clip".into(), |c| c.name.clone()),
+                    many => format!("{} clips", many.len()),
+                }
+            }
         }
     }
 
@@ -202,9 +239,9 @@ impl Project {
         !track.muted && (track.soloed || !self.any_soloed())
     }
 
-    /// How many tracks hold a given file.
-    fn uses_of(&self, asset: AssetId) -> usize {
-        self.tracks.values().filter(|t| t.file == Some(asset)).count()
+    /// How many clips play a given file.
+    pub(crate) fn uses_of_asset(&self, asset: AssetId) -> usize {
+        self.clips.values().filter(|c| c.asset() == Some(asset)).count()
     }
 
     /// Checks everything a project promises about itself.
@@ -239,17 +276,53 @@ impl Project {
             if !(-1.0..=1.0).contains(&track.pan) {
                 return Err(Invalid::OutOfRange("a pan position"));
             }
-            if let Some(file) = track.file
-                && !self.assets.contains_key(&file)
-            {
-                return Err(Invalid::MissingAsset(file));
+        }
+        for (key, clip) in &self.clips {
+            if clip.id != *key {
+                return Err(Invalid::Misfiled("clip", key.0));
+            }
+            if self.uses_of_clip(*key) == 0 {
+                return Err(Invalid::Unused("clip", key.0));
+            }
+            match &clip.content {
+                Content::Audio { asset } => {
+                    if !self.assets.contains_key(asset) {
+                        return Err(Invalid::MissingAsset(*asset));
+                    }
+                }
+                Content::Midi { length, notes } => {
+                    if length.0 == 0 {
+                        return Err(Invalid::OutOfRange("a clip's length"));
+                    }
+                    if notes.values().any(|n| !n.is_valid() || n.end() > *length) {
+                        return Err(Invalid::NoteOutside(*key));
+                    }
+                }
+            }
+        }
+        for (key, placement) in &self.placements {
+            if placement.id != *key {
+                return Err(Invalid::Misfiled("placement", key.0));
+            }
+            if !self.tracks.contains_key(&placement.track) {
+                return Err(Invalid::Dangling("track", placement.track.0));
+            }
+            let Some(clip) = self.clips.get(&placement.clip) else {
+                return Err(Invalid::Dangling("clip", placement.clip.0));
+            };
+            if let Some(window) = placement.window {
+                let fits =
+                    clip.length().is_some_and(|l| window.length.0 > 0 && window.offset.0 + window.length.0 <= l.0);
+                if !fits {
+                    return Err(Invalid::WindowOutside(*key));
+                }
             }
         }
         for (key, asset) in &self.assets {
             if asset.id != *key {
                 return Err(Invalid::MisfiledAsset(*key));
             }
-            if self.uses_of(*key) == 0 {
+            if self.uses_of_asset(*key) == 0 {
                 return Err(Invalid::UnusedAsset(*key));
             }
         }
@@ -264,17 +337,27 @@ pub enum Invalid {
     Order,
     /// A track is filed under an id that is not its own.
     MisfiledTrack(TrackId),
-    /// A track holds a file the pool does not have.
+    /// An audio clip plays a file the pool does not have.
     MissingAsset(AssetId),
-    /// The pool holds a file no track uses.
+    /// The pool holds a file no clip uses.
     UnusedAsset(AssetId),
+    /// A clip or placement is filed under an id that is not its own.
+    Misfiled(&'static str, u32),
+    /// A clip no placement plays.
+    Unused(&'static str, u32),
+    /// A placement names a track or a clip that does not exist.
+    Dangling(&'static str, u32),
+    /// A note that is invalid, or runs past the end of its clip.
+    NoteOutside(ClipId),
+    /// A placement's window reaches outside its clip, or windows an audio clip.
+    WindowOutside(PlacementId),
     /// A file is filed under a hash that is not its own.
     MisfiledAsset(AssetId),
     /// A value that must be a finite number in range is not.
     OutOfRange(&'static str),
-    /// A track's id is not below the counter that hands them out, so a later
-    /// track would be given the same one.
-    IdAhead(TrackId),
+    /// An id is not below the counter that hands them out, so a later object
+    /// would be given the same one.
+    IdAhead(&'static str, u32),
 }
 
 impl fmt::Display for Invalid {
@@ -282,11 +365,16 @@ impl fmt::Display for Invalid {
         match self {
             Self::Order => write!(f, "the track order does not match the tracks"),
             Self::MisfiledTrack(TrackId(id)) => write!(f, "track {id} is filed under another id"),
-            Self::MissingAsset(id) => write!(f, "a track uses file {id}, which the project does not list"),
-            Self::UnusedAsset(id) => write!(f, "file {id} is listed but no track uses it"),
+            Self::MissingAsset(id) => write!(f, "a clip uses file {id}, which the project does not list"),
+            Self::UnusedAsset(id) => write!(f, "file {id} is listed but no clip uses it"),
+            Self::Misfiled(what, id) => write!(f, "{what} {id} is filed under another id"),
+            Self::Unused(what, id) => write!(f, "{what} {id} is listed but nothing uses it"),
+            Self::Dangling(what, id) => write!(f, "a placement names {what} {id}, which does not exist"),
+            Self::NoteOutside(ClipId(id)) => write!(f, "clip {id} has a note that is invalid or past its end"),
+            Self::WindowOutside(PlacementId(id)) => write!(f, "placement {id} plays outside its clip"),
             Self::MisfiledAsset(id) => write!(f, "file {id} is filed under another hash"),
             Self::OutOfRange(what) => write!(f, "{what} is not a valid number"),
-            Self::IdAhead(TrackId(id)) => write!(f, "track {id} is past the id counter"),
+            Self::IdAhead(what, id) => write!(f, "{what} {id} is past the id counter"),
         }
     }
 }

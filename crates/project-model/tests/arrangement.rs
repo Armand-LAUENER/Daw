@@ -1,0 +1,163 @@
+//! Clips and placements, held to what decision D3 promises.
+//!
+//! The properties in `undo.rs` prove that no sequence of edits breaks the
+//! project. These pin down what the edits *mean*: a linked clip is one clip
+//! wherever it is placed, a copy is a separate one, and material leaves the
+//! project only when nothing plays it any more.
+
+use project_model::{Asset, AssetId, ClipId, Command, CommandError, Note, PlacementId, Session, Source, Tick, TrackId};
+
+const BAR: Tick = Tick(3_840);
+
+fn with_track() -> (Session, TrackId) {
+    let mut session = Session::new();
+    session.apply(Command::AddTrack { name: "t".into(), source: Source::Clips, file: None }).expect("adding works");
+    let id = session.project().tracks().next().expect("one track").id;
+    (session, id)
+}
+
+/// A one-bar MIDI clip on `track` at the start, and its placement.
+fn midi_clip(session: &mut Session, track: TrackId) -> (ClipId, PlacementId) {
+    session
+        .apply(Command::AddMidiClip { track, name: "m".into(), start: Tick(0), length: BAR })
+        .expect("the track exists");
+    let placement = *session.project().placements_on(track).last().expect("just placed");
+    (placement.clip, placement.id)
+}
+
+fn notes_of(session: &Session, clip: ClipId) -> usize {
+    session.project().clip(clip).and_then(|c| c.notes()).map_or(0, |n| n.len())
+}
+
+#[test]
+fn a_linked_placement_plays_the_same_clip() {
+    let (mut session, track) = with_track();
+    let (clip, first) = midi_clip(&mut session, track);
+    session.apply(Command::DuplicatePlacement { id: first, track, start: BAR, linked: true }).unwrap();
+
+    let on = session.project().placements_on(track);
+    assert_eq!(on.len(), 2);
+    assert!(on.iter().all(|p| p.clip == clip), "a linked duplicate got a clip of its own");
+    assert_eq!(session.project().clips().len(), 1);
+
+    // An edit to the clip is an edit to both placements, because there is one.
+    session.apply(Command::AddNote { clip, note: Note::new(60, 100, Tick(0), Tick(960)) }).unwrap();
+    assert_eq!(notes_of(&session, clip), 1);
+}
+
+#[test]
+fn a_copy_is_a_separate_clip_with_separate_notes() {
+    let (mut session, track) = with_track();
+    let (clip, first) = midi_clip(&mut session, track);
+    session.apply(Command::AddNote { clip, note: Note::new(60, 100, Tick(0), Tick(960)) }).unwrap();
+    session.apply(Command::DuplicatePlacement { id: first, track, start: BAR, linked: false }).unwrap();
+
+    let copy = session.project().placements_on(track)[1].clip;
+    assert_ne!(copy, clip, "a copy shares the original's clip");
+    assert_eq!(notes_of(&session, copy), 1, "the copy lost its notes");
+    let keys = |c: ClipId| session.project().clip(c).unwrap().notes().unwrap().keys().copied().collect::<Vec<_>>();
+    assert_ne!(keys(clip), keys(copy), "the copy's notes are the same notes under another clip");
+
+    // Editing one leaves the other alone.
+    session.apply(Command::AddNote { clip: copy, note: Note::new(67, 100, Tick(960), Tick(960)) }).unwrap();
+    assert_eq!((notes_of(&session, clip), notes_of(&session, copy)), (1, 2));
+}
+
+#[test]
+fn making_a_linked_placement_unique_splits_it_off() {
+    let (mut session, track) = with_track();
+    let (clip, first) = midi_clip(&mut session, track);
+    session.apply(Command::DuplicatePlacement { id: first, track, start: BAR, linked: true }).unwrap();
+    let second = session.project().placements_on(track)[1].id;
+
+    session.apply(Command::MakeUnique { id: second }).unwrap();
+    let own = session.project().placement(second).unwrap().clip;
+    assert_ne!(own, clip);
+    assert_eq!(session.project().placement(first).unwrap().clip, clip, "the other placement was moved too");
+
+    // Now it has its own clip, there is nothing left to split.
+    assert_eq!(session.apply(Command::MakeUnique { id: second }), Err(CommandError::Unchanged));
+}
+
+#[test]
+fn a_clip_leaves_with_its_last_placement_and_a_file_with_its_last_clip() {
+    let (mut session, track) = with_track();
+    let kick = Asset::new(AssetId::of_bytes(b"kick"), "/a/kick.wav");
+    session.apply(Command::AddAudioClip { track, asset: kick.clone(), start: Tick(0) }).unwrap();
+    session.apply(Command::AddAudioClip { track, asset: kick, start: BAR }).unwrap();
+    let on: Vec<_> = session.project().placements_on(track).iter().map(|p| p.id).collect();
+    assert_eq!(session.project().assets().len(), 1, "one file placed twice is one asset");
+    assert_eq!(session.project().clips().len(), 2);
+
+    session.apply(Command::RemovePlacement { id: on[0] }).unwrap();
+    assert_eq!(session.project().clips().len(), 1);
+    assert_eq!(session.project().assets().len(), 1, "the file left while a clip still played it");
+
+    session.apply(Command::RemovePlacement { id: on[1] }).unwrap();
+    assert_eq!(session.project().clips().len(), 0);
+    assert_eq!(session.project().assets().len(), 0, "a file nothing plays was kept");
+
+    // And one undo brings each back whole.
+    session.undo();
+    assert_eq!((session.project().clips().len(), session.project().assets().len()), (1, 1));
+}
+
+#[test]
+fn removing_a_track_takes_its_placements_and_undo_brings_them_back() {
+    let (mut session, track) = with_track();
+    let (clip, first) = midi_clip(&mut session, track);
+    session.apply(Command::DuplicatePlacement { id: first, track, start: BAR, linked: true }).unwrap();
+    session.apply(Command::AddNote { clip, note: Note::new(60, 100, Tick(0), Tick(960)) }).unwrap();
+    let before = session.project().clone();
+
+    session.apply(Command::RemoveTrack { id: track }).unwrap();
+    assert_eq!(session.project().placements().len(), 0);
+    assert_eq!(session.project().clips().len(), 0, "a clip outlived every placement of it");
+    session.check().unwrap();
+
+    session.undo();
+    assert_eq!(session.project(), &before, "the track came back without all of its material");
+}
+
+#[test]
+fn a_note_cannot_leave_its_clip_and_a_clip_cannot_shrink_under_its_notes() {
+    let (mut session, track) = with_track();
+    let (clip, _) = midi_clip(&mut session, track);
+    let past_the_end = Note::new(60, 100, Tick(3_000), Tick(960));
+    assert_eq!(session.apply(Command::AddNote { clip, note: past_the_end }), Err(CommandError::OutOfRange("a note")));
+    let silent = Note::new(60, 0, Tick(0), Tick(960));
+    assert!(session.apply(Command::AddNote { clip, note: silent }).is_err(), "velocity 0 is a note-off, not a note");
+
+    session.apply(Command::AddNote { clip, note: Note::new(60, 100, Tick(2_880), Tick(960)) }).unwrap();
+    let shorter = Command::SetClipLength { id: clip, length: Tick(1_920) };
+    assert!(session.apply(shorter).is_err(), "the clip shrank and left a note outside it");
+}
+
+#[test]
+fn an_audio_clip_has_no_notes_and_no_window() {
+    let (mut session, track) = with_track();
+    let asset = Asset::new(AssetId::of_bytes(b"x"), "/a/x.wav");
+    session.apply(Command::AddAudioClip { track, asset, start: Tick(0) }).unwrap();
+    let placement = *session.project().placements_on(track)[0];
+
+    let note = Note::new(60, 100, Tick(0), Tick(1));
+    assert_eq!(
+        session.apply(Command::AddNote { clip: placement.clip, note }),
+        Err(CommandError::NotMidi(placement.clip))
+    );
+    let window = Some(project_model::Window { offset: Tick(0), length: Tick(960) });
+    assert!(session.apply(Command::SetWindow { id: placement.id, window }).is_err());
+}
+
+#[test]
+fn a_dragged_placement_is_one_step() {
+    let (mut session, track) = with_track();
+    let (_, placement) = midi_clip(&mut session, track);
+    let depth = session.depth();
+    for beat in 1..=16u64 {
+        session.apply(Command::MovePlacement { id: placement, track, start: Tick(beat * 960) }).unwrap();
+    }
+    assert_eq!(session.depth(), depth + 1, "a drag left a step per frame");
+    session.undo();
+    assert_eq!(session.project().placement(placement).unwrap().start, Tick(0));
+}

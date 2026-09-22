@@ -16,6 +16,7 @@ use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::history::Ids;
 use crate::{FORMAT_VERSION, Invalid, Meter, Project, Session, Tempo};
@@ -118,7 +119,7 @@ impl Session {
         if header.version > FORMAT_VERSION {
             return Err(FileError::Newer(header.version));
         }
-        let mut value: serde_json::Value = serde_json::from_str(text)?;
+        let mut value: Value = serde_json::from_str(text)?;
         migrate(&mut value, header.version)?;
         let Read { next_ids, mut project } = serde_json::from_value(value)?;
         if let Some(folder) = folder {
@@ -168,17 +169,51 @@ impl Session {
 ///
 /// Works on the JSON rather than on old Rust types: an old shape then needs
 /// no struct kept alive for it, only the few lines that say what changed.
-fn migrate(value: &mut serde_json::Value, from: u32) -> Result<(), FileError> {
+fn migrate(value: &mut Value, from: u32) -> Result<(), FileError> {
     let mut version = from;
     while version < FORMAT_VERSION {
-        let project =
-            value.get_mut("project").and_then(serde_json::Value::as_object_mut).ok_or(FileError::NotAProject)?;
         match version {
             // Version 2 gave the project a tempo and a time signature. A
             // project from before had neither, and played at the default.
             1 => {
-                project.insert("tempo".into(), serde_json::json!(Tempo::default()));
-                project.insert("meter".into(), serde_json::json!(Meter::default()));
+                let project = project_of(value)?;
+                project.insert("tempo".into(), json!(Tempo::default()));
+                project.insert("meter".into(), json!(Meter::default()));
+            }
+            // Version 3 moved files off tracks and into clips placed on them.
+            // A track's file becomes an audio clip of the same name at the
+            // start of the timeline — where version 2 played it from.
+            2 => {
+                let project = project_of(value)?;
+                let order: Vec<Value> =
+                    project.get("track_order").and_then(Value::as_array).cloned().unwrap_or_default();
+                let tracks = project.get_mut("tracks").and_then(Value::as_object_mut).ok_or(FileError::NotAProject)?;
+                let (mut clips, mut placements) = (serde_json::Map::new(), serde_json::Map::new());
+                // In mixer order, so the ids given out do not depend on how
+                // the file happened to sort its keys.
+                for id in order {
+                    let Some(track) = tracks.get_mut(&id.to_string()).and_then(Value::as_object_mut) else {
+                        return Err(FileError::NotAProject);
+                    };
+                    if track.get("source") == Some(&json!("file")) {
+                        track.insert("source".into(), json!("clips"));
+                    }
+                    if let Some(Value::String(asset)) = track.remove("file") {
+                        let n = clips.len();
+                        let name = track.get("name").cloned().unwrap_or(json!(""));
+                        let content = json!({ "kind": "audio", "asset": asset });
+                        clips.insert(n.to_string(), json!({ "id": n, "name": name, "content": content }));
+                        let placement = json!({ "id": n, "clip": n, "track": id, "start": 0, "window": null });
+                        placements.insert(n.to_string(), placement);
+                    }
+                }
+                let made = clips.len();
+                project.insert("clips".into(), Value::Object(clips));
+                project.insert("placements".into(), Value::Object(placements));
+                let next = value.get_mut("next_ids").and_then(Value::as_object_mut).ok_or(FileError::NotAProject)?;
+                next.insert("clip".into(), json!(made));
+                next.insert("placement".into(), json!(made));
+                next.insert("note".into(), json!(0));
             }
             // Version 0 never existed: no file was written before the header.
             _ => return Err(FileError::NotAProject),
@@ -186,6 +221,10 @@ fn migrate(value: &mut serde_json::Value, from: u32) -> Result<(), FileError> {
         version += 1;
     }
     Ok(())
+}
+
+fn project_of(value: &mut Value) -> Result<&mut serde_json::Map<String, Value>, FileError> {
+    value.get_mut("project").and_then(Value::as_object_mut).ok_or(FileError::NotAProject)
 }
 
 /// A path as written in a project in `folder`: relative with forward slashes

@@ -10,7 +10,7 @@
 //! a new chance to write the reverse wrongly. That risk is paid for here, once,
 //! rather than discovered later as quietly corrupted work.
 
-use project_model::{Asset, AssetId, Command, Meter, Project, Session, Source, Tempo};
+use project_model::{Asset, AssetId, Command, Meter, Note, Project, Session, Source, Tempo, Tick, Window};
 use proptest::prelude::*;
 
 /// An edit aimed at a track by position, since the ids are not known until the
@@ -25,10 +25,22 @@ enum Action {
     Mute(u8, bool),
     Solo(u8, bool),
     Master(f32),
-    /// Gives a track one of a handful of files, or takes its file away, so
-    /// sequences share files between tracks and drop the last user of one.
-    File(u8, Option<u8>),
     AddWithFile(u8),
+    /// On a track: one of a handful of files, at a start in beats.
+    AddAudio(u8, u8, u8),
+    AddMidi(u8, u8, u8),
+    Clear(u8),
+    /// On a placement: to a track, at a start.
+    Move(u8, u8, u8),
+    Window(u8, u8, u8),
+    Duplicate(u8, u8, u8, bool),
+    Unique(u8),
+    RemovePlacement(u8),
+    /// On a clip.
+    ClipLength(u8, u8),
+    AddNote(u8, u8, u8, u8),
+    SetNote(u8, u8, u8, u8),
+    RemoveNote(u8, u8),
     /// Thousandths of a BPM, over a range wider than the valid one so refused
     /// tempos are exercised too.
     Tempo(u32),
@@ -54,8 +66,19 @@ fn action() -> impl Strategy<Value = Action> {
         1 => (any::<u8>(), any::<bool>()).prop_map(|(i, m)| Action::Mute(i, m)),
         1 => (any::<u8>(), any::<bool>()).prop_map(|(i, s)| Action::Solo(i, s)),
         1 => (-4.0f32..4.0).prop_map(Action::Master),
-        2 => (any::<u8>(), proptest::option::of(any::<u8>())).prop_map(|(i, f)| Action::File(i, f)),
         2 => any::<u8>().prop_map(Action::AddWithFile),
+        2 => any::<(u8, u8, u8)>().prop_map(|(t, f, s)| Action::AddAudio(t, f, s)),
+        2 => any::<(u8, u8, u8)>().prop_map(|(t, s, l)| Action::AddMidi(t, s, l)),
+        1 => any::<u8>().prop_map(Action::Clear),
+        2 => any::<(u8, u8, u8)>().prop_map(|(p, t, s)| Action::Move(p, t, s)),
+        1 => any::<(u8, u8, u8)>().prop_map(|(p, o, l)| Action::Window(p, o, l)),
+        2 => any::<(u8, u8, u8, bool)>().prop_map(|(p, t, s, l)| Action::Duplicate(p, t, s, l)),
+        1 => any::<u8>().prop_map(Action::Unique),
+        1 => any::<u8>().prop_map(Action::RemovePlacement),
+        1 => any::<(u8, u8)>().prop_map(|(c, l)| Action::ClipLength(c, l)),
+        3 => any::<(u8, u8, u8, u8)>().prop_map(|(c, p, s, l)| Action::AddNote(c, p, s, l)),
+        2 => any::<(u8, u8, u8, u8)>().prop_map(|(c, n, s, l)| Action::SetNote(c, n, s, l)),
+        1 => any::<(u8, u8)>().prop_map(|(c, n)| Action::RemoveNote(c, n)),
         1 => (0u32..1_200_000).prop_map(Action::Tempo),
         1 => (0u8..40, 0u8..40).prop_map(|(b, u)| Action::Meter(b, u)),
     ]
@@ -70,6 +93,23 @@ fn to_command(project: &Project, action: &Action) -> Option<Command> {
         let count = project.track_count();
         (count > 0).then(|| project.tracks().nth(usize::from(i) % count).expect("in range").id)
     };
+    let placement = |i: u8| {
+        let count = project.placements().len();
+        (count > 0).then(|| project.placements().nth(usize::from(i) % count).expect("in range").id)
+    };
+    let clip = |i: u8| {
+        let count = project.clips().len();
+        (count > 0).then(|| project.clips().nth(usize::from(i) % count).expect("in range").id)
+    };
+    // Sizes in quarters of a beat and positions in beats, small enough that
+    // edits collide with each other and with the ends of clips.
+    let beats = |n: u8| Tick(u64::from(n % 16) * 960);
+    let quarters = |n: u8| Tick(u64::from(n % 32) * 240);
+    // A note on some existing note of the clip, when it has one.
+    let note_of = |c, i: u8| {
+        let notes = project.clip(c)?.notes()?;
+        (!notes.is_empty()).then(|| *notes.keys().nth(usize::from(i) % notes.len()).expect("in range"))
+    };
     Some(match action {
         Action::Add => Command::AddTrack { name: "track".into(), source: Default::default(), file: None },
         Action::Remove(i) => Command::RemoveTrack { id: pick(*i)? },
@@ -79,7 +119,33 @@ fn to_command(project: &Project, action: &Action) -> Option<Command> {
         Action::Mute(i, muted) => Command::SetMuted { id: pick(*i)?, muted: *muted },
         Action::Solo(i, soloed) => Command::SetSoloed { id: pick(*i)?, soloed: *soloed },
         Action::Master(gain) => Command::SetMasterGain { gain: *gain },
-        Action::File(i, file) => Command::SetFile { id: pick(*i)?, file: file.map(asset) },
+        Action::AddAudio(t, f, s) => Command::AddAudioClip { track: pick(*t)?, asset: asset(*f), start: beats(*s) },
+        Action::AddMidi(t, s, l) => {
+            Command::AddMidiClip { track: pick(*t)?, name: "midi".into(), start: beats(*s), length: quarters(*l) }
+        }
+        Action::Clear(t) => Command::ClearTrack { id: pick(*t)? },
+        Action::Move(p, t, s) => Command::MovePlacement { id: placement(*p)?, track: pick(*t)?, start: beats(*s) },
+        Action::Window(p, o, l) => {
+            let window = (*l != 0).then(|| Window { offset: quarters(*o), length: quarters(*l) });
+            Command::SetWindow { id: placement(*p)?, window }
+        }
+        Action::Duplicate(p, t, s, linked) => {
+            Command::DuplicatePlacement { id: placement(*p)?, track: pick(*t)?, start: beats(*s), linked: *linked }
+        }
+        Action::Unique(p) => Command::MakeUnique { id: placement(*p)? },
+        Action::RemovePlacement(p) => Command::RemovePlacement { id: placement(*p)? },
+        Action::ClipLength(c, l) => Command::SetClipLength { id: clip(*c)?, length: quarters(*l) },
+        Action::AddNote(c, pitch, s, l) => {
+            Command::AddNote { clip: clip(*c)?, note: Note::new(pitch % 128, 100, quarters(*s), quarters(*l)) }
+        }
+        Action::SetNote(c, n, s, l) => {
+            let c = clip(*c)?;
+            Command::SetNote { clip: c, id: note_of(c, *n)?, note: Note::new(60, 80, quarters(*s), quarters(*l)) }
+        }
+        Action::RemoveNote(c, n) => {
+            let c = clip(*c)?;
+            Command::RemoveNote { clip: c, id: note_of(c, *n)? }
+        }
         // Built without the checked constructors, through serde, so an
         // out-of-range value reaches the command and has to be refused there.
         Action::Tempo(millis) => {
@@ -91,7 +157,7 @@ fn to_command(project: &Project, action: &Action) -> Option<Command> {
             Command::SetMeter { meter }
         }
         Action::AddWithFile(n) => {
-            Command::AddTrack { name: "file".into(), source: Source::File, file: Some(asset(*n)) }
+            Command::AddTrack { name: "file".into(), source: Source::Clips, file: Some(asset(*n)) }
         }
     })
 }

@@ -18,8 +18,10 @@
 //! movement of a fader would mean a ten-millisecond crossfade per mouse frame.
 //! [`route`] is where that distinction is made, once.
 
+mod plan;
 mod time;
 
+pub use plan::{audio_starts, note_plan};
 pub use time::{Position, Timing};
 
 use engine_core::{Gain, Graph, GraphBuilder, GraphError, Limiter, Mute, Node, Pan, ParamId, Solo, SoloBus};
@@ -154,10 +156,22 @@ pub fn route(bindings: &Bindings, command: &Command) -> Change {
         Command::AddTrack { .. }
         | Command::RemoveTrack { .. }
         | Command::SetSource { .. }
-        | Command::SetFile { .. } => Change::Rebuild,
-        // Nothing plays from the tempo yet: it is read by the transport's
-        // display, and by the timeline when there is one.
-        Command::RenameTrack { .. } | Command::SetTempo { .. } | Command::SetMeter { .. } => Change::Nothing,
+        | Command::ClearTrack { .. }
+        | Command::AddAudioClip { .. }
+        | Command::AddMidiClip { .. }
+        | Command::MovePlacement { .. }
+        | Command::SetWindow { .. }
+        | Command::DuplicatePlacement { .. }
+        | Command::MakeUnique { .. }
+        | Command::RemovePlacement { .. }
+        | Command::SetClipLength { .. }
+        | Command::AddNote { .. }
+        | Command::SetNote { .. }
+        | Command::RemoveNote { .. }
+        // Every clip's start is a tick; a new tempo puts it on another frame.
+        | Command::SetTempo { .. } => Change::Rebuild,
+        // Names, and a meter that only changes how bars are counted.
+        Command::RenameTrack { .. } | Command::RenameClip { .. } | Command::SetMeter { .. } => Change::Nothing,
         Command::SetGain { id, gain } => aimed(*id, |b| b.gain, *gain),
         Command::SetPan { id, pan } => aimed(*id, |b| b.pan, pan.clamp(-1.0, 1.0)),
         Command::SetMuted { id, muted } => aimed(*id, |b| b.muted, flag(*muted)),

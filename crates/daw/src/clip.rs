@@ -6,10 +6,11 @@
 //! seconds of work and tens of megabytes. One decode, one copy, however many
 //! graphs.
 //!
-//! It plays from the start of the timeline, once, following the transport's
-//! clock rather than a cursor of its own. That is what lets a graph be rebuilt
-//! mid-song — a track added, a source switched — without every file jumping
-//! back to its first sample: the new node asks the clock where it is.
+//! A track's audio clips are one [`Lane`]: each file from the frame its clip is
+//! placed at, played once, following the transport's clock rather than a
+//! cursor of its own. That is what lets a graph be rebuilt mid-song — a track
+//! added, a clip moved — without every file jumping back to its first sample:
+//! the new node asks the clock where it is.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -65,42 +66,52 @@ impl Node for Silence {
     fn process(&mut self, _buffer: &mut AudioBuffer<'_>) {}
 }
 
-/// Plays shared audio into the graph, from the timeline's start.
-pub struct Clip {
-    audio: Shared,
+/// Plays a track's audio clips, each from the timeline frame it starts at.
+///
+/// Clips that overlap are summed, as two regions on one track would be heard
+/// in any case; which one wins is a question for the editor, not the engine.
+pub struct Lane {
+    /// Start frame and audio, earliest first.
+    clips: Vec<(u64, Shared)>,
     /// Where the timeline is. Read once per block, lock-free.
     clock: Arc<Clock>,
 }
 
-impl Clip {
-    pub fn new(audio: Shared, clock: Arc<Clock>) -> Self {
-        Self { audio, clock }
+impl Lane {
+    pub fn new(clips: Vec<(u64, Shared)>, clock: Arc<Clock>) -> Self {
+        Self { clips, clock }
     }
 }
 
-impl Node for Clip {
+impl Node for Lane {
     fn process(&mut self, buffer: &mut AudioBuffer<'_>) {
         let (frames, channels) = (buffer.frames(), buffer.channels());
-        let source_channels = usize::from(self.audio.channels);
-        let total = self.audio.frames();
+        // The buffer arrives silenced, so a clip not playing in this block has
+        // nothing to write. A stopped clock still has a position, and the
+        // transport's fade is what keeps it quiet — this only has to be right
+        // about where each file is.
+        let now = self.clock.position();
+        let block_end = now + frames as u64;
 
-        // Past the end, or a stopped timeline: the buffer arrives silenced, so
-        // there is nothing to write. A stopped clock still has a position, and
-        // the transport's fade is what keeps it quiet — this only has to be
-        // right about where the file is.
-        let start = usize::try_from(self.clock.position()).unwrap_or(usize::MAX);
-        if source_channels == 0 || start >= total {
-            return;
-        }
-
-        for frame in 0..frames.min(total - start) {
-            let position = start + frame;
-            for channel in 0..channels {
-                // A mono file feeds both sides; a file with more channels than
-                // the graph has keeps the ones that fit. Neither is a mix, but
-                // both beat silence and a panic.
-                let taken = channel.min(source_channels - 1);
-                buffer.channel_mut(channel)[frame] = self.audio.samples[position * source_channels + taken];
+        for (start, audio) in &self.clips {
+            let source_channels = usize::from(audio.channels);
+            let total = audio.frames() as u64;
+            if source_channels == 0 || *start >= block_end || start + total <= now {
+                continue;
+            }
+            // Where in the block the clip begins, and where in the file.
+            let first = start.saturating_sub(now) as usize;
+            let into = now.saturating_sub(*start) as usize;
+            let count = (frames - first).min(total as usize - into);
+            for frame in 0..count {
+                let position = into + frame;
+                for channel in 0..channels {
+                    // A mono file feeds both sides; a file with more channels
+                    // than the graph has keeps the ones that fit. Neither is a
+                    // mix, but both beat silence and a panic.
+                    let taken = channel.min(source_channels - 1);
+                    buffer.channel_mut(channel)[first + frame] += audio.samples[position * source_channels + taken];
+                }
             }
         }
     }
@@ -124,16 +135,20 @@ mod tests {
         (Arc::clone(control.clock()), transport)
     }
 
-    fn render(clip: &mut Clip, frames: usize, channels: usize) -> Vec<f32> {
+    fn render(clip: &mut Lane, frames: usize, channels: usize) -> Vec<f32> {
         let mut data = vec![0.0; frames * channels];
         clip.process(&mut AudioBuffer::new(&mut data, channels));
         data
     }
 
+    fn lane(clips: Vec<(u64, Shared)>, clock: Arc<Clock>) -> Lane {
+        Lane::new(clips, clock)
+    }
+
     #[test]
     fn a_stereo_file_keeps_its_sides_apart() {
         let (clock, _t) = clock_at(0);
-        let mut clip = Clip::new(audio(vec![1.0, -1.0, 1.0, -1.0], 2), clock);
+        let mut clip = lane(vec![(0, audio(vec![1.0, -1.0, 1.0, -1.0], 2))], clock);
         let out = render(&mut clip, 2, 2);
         // Planar: the first half is the left channel, the second the right.
         assert_eq!(out, vec![1.0, 1.0, -1.0, -1.0]);
@@ -142,34 +157,41 @@ mod tests {
     #[test]
     fn a_mono_file_reaches_both_sides() {
         let (clock, _t) = clock_at(0);
-        let mut clip = Clip::new(audio(vec![0.5, 0.25], 1), clock);
+        let mut clip = lane(vec![(0, audio(vec![0.5, 0.25], 1))], clock);
         let out = render(&mut clip, 2, 2);
         assert_eq!(out, vec![0.5, 0.25, 0.5, 0.25]);
     }
 
     #[test]
     fn it_plays_from_where_the_timeline_is() {
-        // A graph rebuilt mid-song makes a new clip; it must pick up at the
+        // A graph rebuilt mid-song makes a new lane; it must pick up at the
         // playhead, not at the file's first sample.
         let (clock, _t) = clock_at(2);
-        let mut clip = Clip::new(audio(vec![1.0, 2.0, 3.0, 4.0], 1), clock);
+        let mut clip = lane(vec![(0, audio(vec![1.0, 2.0, 3.0, 4.0], 1))], clock);
         assert_eq!(render(&mut clip, 2, 1), vec![3.0, 4.0]);
     }
 
     #[test]
-    fn it_stops_at_the_end_of_the_file() {
-        let (clock, _t) = clock_at(1);
-        let mut clip = Clip::new(audio(vec![1.0, 2.0, 3.0], 1), clock);
-        assert_eq!(render(&mut clip, 4, 1), vec![2.0, 3.0, 0.0, 0.0]);
+    fn a_clip_starts_at_its_own_frame_and_stops_at_its_end() {
+        let (clock, _t) = clock_at(0);
+        let mut clip = lane(vec![(2, audio(vec![1.0, 2.0, 3.0], 1))], clock);
+        assert_eq!(render(&mut clip, 7, 1), vec![0.0, 0.0, 1.0, 2.0, 3.0, 0.0, 0.0]);
         let (clock, _t) = clock_at(10);
-        let mut clip = Clip::new(audio(vec![1.0, 2.0, 3.0], 1), clock);
+        let mut clip = lane(vec![(0, audio(vec![1.0, 2.0, 3.0], 1))], clock);
         assert!(render(&mut clip, 4, 1).iter().all(|s| *s == 0.0), "a file played past its end");
+    }
+
+    #[test]
+    fn overlapping_clips_are_summed() {
+        let (clock, _t) = clock_at(0);
+        let mut clip = lane(vec![(0, audio(vec![1.0, 1.0, 1.0], 1)), (1, audio(vec![0.5, 0.5], 1))], clock);
+        assert_eq!(render(&mut clip, 4, 1), vec![1.0, 1.5, 1.5, 0.0]);
     }
 
     #[test]
     fn an_empty_file_plays_silence_rather_than_panicking() {
         let (clock, _t) = clock_at(0);
-        let mut clip = Clip::new(audio(Vec::new(), 2), clock);
+        let mut clip = lane(vec![(0, audio(Vec::new(), 2))], clock);
         assert!(render(&mut clip, 4, 2).iter().all(|s| *s == 0.0));
     }
 

@@ -216,7 +216,7 @@ fn changing_what_a_track_plays_asks_for_a_rebuild() {
     let session = with_tracks(1);
     let id = ids(&session)[0];
     let compiled = build(&session);
-    let source = Source::File;
+    let source = Source::Clips;
     assert_eq!(route(&compiled.bindings, &Command::SetSource { id, source }), Change::Rebuild);
 }
 
@@ -224,7 +224,7 @@ fn changing_what_a_track_plays_asks_for_a_rebuild() {
 fn the_source_survives_being_undone_and_redone() {
     let mut session = with_tracks(1);
     let id = ids(&session)[0];
-    let source = Source::File;
+    let source = Source::Clips;
     session.apply(Command::SetSource { id, source }).unwrap();
     assert_eq!(session.project().track(id).unwrap().source, source);
 

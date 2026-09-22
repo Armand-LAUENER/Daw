@@ -1,0 +1,4 @@
+# Project files are compared byte for byte (see project-model/src/file.rs):
+# a checkout that rewrote their line endings would make the same project
+# a different file on Windows.
+*.daw text eol=lf

@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use project_model::{Asset, AssetId, Command, FileError, Invalid, Session, Source};
+use project_model::{Asset, AssetId, Command, FileError, Invalid, Note, Session, Source, Tick, Window};
 use proptest::prelude::*;
 
 fn folder() -> PathBuf {
@@ -17,11 +17,38 @@ fn folder() -> PathBuf {
     if cfg!(windows) { PathBuf::from(r"C:\songs\demo") } else { PathBuf::from("/songs/demo") }
 }
 
+/// The demo, plus what only version 3 can hold: a MIDI clip with notes,
+/// placed twice and linked, the second time windowed.
+fn demo_v3() -> Session {
+    let mut session = demo();
+    let pad = session.project().tracks().nth(1).expect("two tracks").id;
+    session
+        .apply(Command::AddMidiClip { track: pad, name: "Chords".into(), start: Tick(0), length: Tick(3_840) })
+        .expect("the track exists");
+    let (clip, placement) = {
+        let p = session.project().placements_on(pad)[0];
+        (p.clip, p.id)
+    };
+    session.apply(Command::AddNote { clip, note: Note::new(60, 100, Tick(0), Tick(960)) }).expect("fits");
+    session.apply(Command::AddNote { clip, note: Note::new(64, 90, Tick(960), Tick(480)) }).expect("fits");
+    session
+        .apply(Command::DuplicatePlacement { id: placement, track: pad, start: Tick(3_840), linked: true })
+        .expect("the placement exists");
+    let second = session.project().placements_on(pad)[1].id;
+    let window = Some(Window { offset: Tick(0), length: Tick(1_920) });
+    session.apply(Command::SetWindow { id: second, window }).expect("fits");
+    session
+}
+
+/// The format, pinned. If this fails because the format was changed on
+/// purpose, bump `FORMAT_VERSION`, write the migration, and update this.
+const REFERENCE: &str = include_str!("reference.daw");
+
 fn demo() -> Session {
     let mut session = Session::new();
     let kick = Asset::new(AssetId::of_bytes(b"kick"), folder().join("audio").join("kick.wav"));
     session
-        .apply(Command::AddTrack { name: "Kick".into(), source: Source::File, file: Some(kick) })
+        .apply(Command::AddTrack { name: "Kick".into(), source: Source::Clips, file: Some(kick) })
         .expect("adding works");
     session.apply(Command::AddTrack { name: "Pad".into(), source: Source::Tone, file: None }).expect("adding works");
     let pad = session.project().tracks().nth(1).expect("two tracks").id;
@@ -30,9 +57,9 @@ fn demo() -> Session {
     session
 }
 
-/// The format, pinned. If this fails because the format was changed on
-/// purpose, bump `FORMAT_VERSION`, write the migration, and update this.
-const REFERENCE: &str = r#"{
+/// A project as version 2 wrote it, before files moved into clips. Kept byte
+/// for byte, like version 1.
+const VERSION_2: &str = r#"{
   "format": "daw-project",
   "version": 2,
   "next_ids": {
@@ -130,23 +157,36 @@ const VERSION_1: &str = r#"{
 
 #[test]
 fn a_project_is_written_exactly_as_the_reference() {
-    assert_eq!(demo().to_json(Some(&folder())), REFERENCE);
+    let written = demo_v3().to_json(Some(&folder()));
+    // `DAW_BLESS=1 cargo test` rewrites the reference after a deliberate
+    // change to the format, so the new bytes show up in review as a diff.
+    if std::env::var_os("DAW_BLESS").is_some() {
+        std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reference.daw"), &written).unwrap();
+        return;
+    }
+    assert_eq!(written, REFERENCE, "the format changed: bump FORMAT_VERSION, migrate, then bless");
 }
 
 #[test]
 fn the_reference_reads_back_as_the_project_it_came_from() {
     let session = Session::from_json(REFERENCE, Some(&folder())).unwrap();
-    assert_eq!(session.project(), demo().project());
+    assert_eq!(session.project(), demo_v3().project());
     assert!(!session.can_undo(), "an opened project arrived with a history");
 }
 
 #[test]
-fn a_version_1_file_opens_at_the_default_tempo() {
-    let session = Session::from_json(VERSION_1, Some(&folder())).unwrap();
-    assert_eq!(session.project(), demo().project(), "the migration changed more than it added");
-    assert_eq!(session.project().tempo(), project_model::Tempo::default());
-    // And it is written back in the current format, not the one it came in.
-    assert_eq!(session.to_json(Some(&folder())), REFERENCE);
+fn older_files_open_as_the_project_they_always_were() {
+    // Both older versions hold the same project: a kick track with its file,
+    // and a tone track. Migrated, each must be exactly what the commands build
+    // today — the file now a clip placed at the start.
+    for (version, text) in [(1, VERSION_1), (2, VERSION_2)] {
+        let session = Session::from_json(text, Some(&folder())).unwrap();
+        assert_eq!(session.project(), demo().project(), "version {version} migrated to something else");
+        assert_eq!(session.project().tempo(), project_model::Tempo::default());
+        // Written back in the current format, and identical to a project made
+        // from scratch: the counters were carried across too.
+        assert_eq!(session.to_json(Some(&folder())), demo().to_json(Some(&folder())), "version {version}");
+    }
 }
 
 #[test]
@@ -168,7 +208,7 @@ fn a_file_outside_the_project_folder_keeps_its_full_path() {
     let elsewhere =
         if cfg!(windows) { PathBuf::from(r"D:\samples\snare.wav") } else { PathBuf::from("/samples/snare.wav") };
     let snare = Asset::new(AssetId::of_bytes(b"snare"), &elsewhere);
-    session.apply(Command::AddTrack { name: "Snare".into(), source: Source::File, file: Some(snare) }).unwrap();
+    session.apply(Command::AddTrack { name: "Snare".into(), source: Source::Clips, file: Some(snare) }).unwrap();
 
     let opened = Session::from_json(&session.to_json(Some(&folder())), Some(&folder())).unwrap();
     assert_eq!(opened.project().assets().next().unwrap().path, elsewhere);
@@ -176,7 +216,7 @@ fn a_file_outside_the_project_folder_keeps_its_full_path() {
 
 #[test]
 fn a_file_from_a_newer_version_is_refused_by_name() {
-    let newer = REFERENCE.replace("\"version\": 2", "\"version\": 99");
+    let newer = REFERENCE.replace("\"version\": 3", "\"version\": 99");
     assert!(matches!(Session::from_json(&newer, None), Err(FileError::Newer(99))));
 }
 
@@ -194,12 +234,16 @@ fn a_damaged_project_is_refused_rather_than_opened() {
     // play the tone and say nothing.
     let hash = "f09b2136a68a271423955b63129a24cc00b1d326f31f481e965f786315000a26";
     let other = "0".repeat(64);
-    let dangling = REFERENCE.replacen(&format!("\"file\": \"{hash}\""), &format!("\"file\": \"{other}\""), 1);
+    let dangling = REFERENCE.replacen(&format!("\"asset\": \"{hash}\""), &format!("\"asset\": \"{other}\""), 1);
     assert!(matches!(Session::from_json(&dangling, None), Err(FileError::Invalid(Invalid::MissingAsset(_)))));
 
     // A track missing from the order would never be shown, or played.
     let unordered = REFERENCE.replace("      0,\n      1\n", "      0\n");
     assert!(matches!(Session::from_json(&unordered, None), Err(FileError::Invalid(Invalid::Order))));
+
+    // A note past the end of its clip: the clip is 3840 ticks long.
+    let overlong = REFERENCE.replacen("\"length\": 960", "\"length\": 9600", 1);
+    assert!(matches!(Session::from_json(&overlong, None), Err(FileError::Invalid(Invalid::NoteOutside(_)))));
 }
 
 #[test]
@@ -258,7 +302,7 @@ fn build(edits: &[Edit], folder: &Path) -> Session {
         let command = match edit {
             Edit::Add(file) => Some(Command::AddTrack {
                 name: "t".into(),
-                source: Source::File,
+                source: Source::Clips,
                 file: file.map(|n| Asset::new(AssetId::of_bytes(&[n % 3]), folder.join(format!("{}.wav", n % 3)))),
             }),
             Edit::Remove(i) => pick(*i).map(|id| Command::RemoveTrack { id }),
