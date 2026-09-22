@@ -239,3 +239,31 @@ fn an_audio_window_means_the_same_moment_at_any_rate() {
     assert_eq!(window.at(48_000), (48_000, 24_000));
     assert_eq!(window.at(44_100), (44_100, 22_050));
 }
+
+#[test]
+fn removing_a_bus_takes_its_sends_and_one_undo_brings_all_back() {
+    let (mut session, track) = with_track();
+    session.apply(Command::AddBus { name: "Reverb".into() }).unwrap();
+    let bus = session.project().buses().next().unwrap().id;
+    session.apply(Command::SetSend { track, bus, level: Some(0.4) }).unwrap();
+    let before = session.project().clone();
+
+    session.apply(Command::RemoveBus { id: bus }).unwrap();
+    assert!(session.project().track(track).unwrap().sends.is_empty(), "a send was left pointing nowhere");
+    session.check().unwrap();
+
+    session.undo();
+    assert_eq!(session.project(), &before);
+
+    // A send to a bus that does not exist is refused, and so is a level past full.
+    assert!(session.apply(Command::SetSend { track, bus: project_model::BusId(99), level: Some(0.5) }).is_err());
+    assert!(session.apply(Command::SetSend { track, bus, level: Some(1.5) }).is_err());
+}
+
+#[test]
+fn a_new_bus_is_a_reverb_return() {
+    let (mut session, _) = with_track();
+    session.apply(Command::AddBus { name: "Reverb".into() }).unwrap();
+    let bus = session.project().buses().next().unwrap();
+    assert!(bus.reverb.on && bus.reverb.mix == 1.0, "a new bus should be a fully wet reverb");
+}

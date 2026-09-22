@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::command::{Command, CommandError, Edit, Target, apply, resolve};
-use crate::{Clip, ClipId, Invalid, NoteId, PlacementId, Project, TrackId};
+use crate::{BusId, Clip, ClipId, Invalid, NoteId, PlacementId, Project, TrackId};
 
 /// The next identifier of each kind, handed out once and never again.
 ///
@@ -17,6 +17,9 @@ pub(crate) struct Ids {
     clip: u32,
     placement: u32,
     note: u32,
+    /// Absent from files written before buses existed: none had been made.
+    #[serde(default)]
+    bus: u32,
 }
 
 impl Ids {
@@ -28,6 +31,7 @@ impl Ids {
             clip: next(&mut project.clips().map(|c| c.id.0)),
             placement: next(&mut project.placements().map(|p| p.id.0)),
             note: next(&mut project.clips().filter_map(Clip::notes).flat_map(|n| n.keys().map(|id| id.0))),
+            bus: next(&mut project.buses().map(|b| b.id.0)),
         }
     }
 
@@ -39,6 +43,7 @@ impl Ids {
             clip: self.clip.max(other.clip),
             placement: self.placement.max(other.placement),
             note: self.note.max(other.note),
+            bus: self.bus.max(other.bus),
         }
     }
 
@@ -54,6 +59,10 @@ impl Ids {
         PlacementId(take(&mut self.placement))
     }
 
+    pub(crate) fn take_bus(&mut self) -> BusId {
+        BusId(take(&mut self.bus))
+    }
+
     pub(crate) fn take_note(&mut self) -> NoteId {
         NoteId(take(&mut self.note))
     }
@@ -66,6 +75,7 @@ impl Ids {
             ("clip", clearing.clip, self.clip),
             ("placement", clearing.placement, self.placement),
             ("note", clearing.note, self.note),
+            ("bus", clearing.bus, self.bus),
         ];
         match ahead.into_iter().find(|(_, needed, have)| needed > have) {
             Some((what, needed, _)) => Err(Invalid::IdAhead(what, needed - 1)),

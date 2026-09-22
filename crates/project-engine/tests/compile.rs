@@ -317,3 +317,58 @@ fn an_effects_settings_are_parameters_while_it_stays_on() {
         matches!(route(&compiled.bindings, &Command::SetCompressor { track: id, value: moved }), Change::Params(p) if p.len() == 5)
     );
 }
+
+/// A session with one track sending all of itself to a bus with no effects
+/// on — a plain return, so what arrives there is exactly what was sent.
+fn with_plain_send() -> (Session, TrackId, project_model::BusId) {
+    let mut session = with_tracks(1);
+    let track = ids(&session)[0];
+    session.apply(Command::AddBus { name: "return".into() }).expect("adding a bus works");
+    let bus = session.project().buses().next().expect("the bus just added").clone();
+    let off = project_model::ReverbSettings { on: false, ..bus.reverb };
+    session
+        .apply(Command::SetBusEffects { id: bus.id, comp: bus.comp, delay: bus.delay, reverb: off })
+        .expect("valid settings");
+    session.apply(Command::SetSend { track, bus: bus.id, level: Some(1.0) }).expect("both exist");
+    (session, track, bus.id)
+}
+
+#[test]
+fn a_send_reaches_the_master_through_its_bus() {
+    let dry = settled(&mut build(&with_tracks(1)), 8).0;
+    let (session, ..) = with_plain_send();
+    let sent = settled(&mut build(&session), 8).0;
+    assert!((sent - 2.0 * dry).abs() < 1e-4, "direct and return should add up: {sent} against {dry}");
+}
+
+#[test]
+fn a_send_follows_its_tracks_mute_and_the_bus_ignores_solo() {
+    // Post-fader: muting the track silences what it sends too.
+    let (mut session, track, _) = with_plain_send();
+    session.apply(Command::SetMuted { id: track, muted: true }).unwrap();
+    assert!(settled(&mut build(&session), 40).0.abs() < 1e-4, "a muted track still reached its bus");
+
+    // Solo-safe: soloing the sending track keeps its return open, although
+    // the bus itself is not soloed.
+    let (mut session, track, _) = with_plain_send();
+    session.apply(Command::AddTrack { name: "other".into(), source: Source::default(), clip: None }).unwrap();
+    session.apply(Command::SetSoloed { id: track, soloed: true }).unwrap();
+    let dry = settled(&mut build(&with_tracks(1)), 8).0;
+    let soloed = settled(&mut build(&session), 40).0;
+    assert!((soloed - 2.0 * dry).abs() < 1e-3, "soloing took the return away: {soloed}");
+}
+
+#[test]
+fn a_send_level_is_a_parameter_but_a_new_send_is_a_rebuild() {
+    let (session, track, bus) = with_plain_send();
+    let compiled = build(&session);
+    let moved = Command::SetSend { track, bus, level: Some(0.3) };
+    assert!(matches!(route(&compiled.bindings, &moved), Change::Param { .. }));
+    let removed = Command::SetSend { track, bus, level: None };
+    assert_eq!(route(&compiled.bindings, &removed), Change::Rebuild);
+
+    let bare = with_tracks(1);
+    let compiled = build(&bare);
+    let first = Command::SetSend { track: ids(&bare)[0], bus, level: Some(0.3) };
+    assert_eq!(route(&compiled.bindings, &first), Change::Rebuild);
+}

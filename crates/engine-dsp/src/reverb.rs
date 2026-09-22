@@ -91,6 +91,8 @@ impl Tank {
 #[derive(Debug, Clone)]
 pub struct Reverb {
     tanks: Vec<Tank>,
+    /// How much of the input is kept: 1 as an insert, 0 on an effects bus.
+    dry: f32,
     size: f32,
     damping: f32,
     mix: LinearSmoother,
@@ -102,10 +104,17 @@ impl Reverb {
     pub fn new(channels: usize, size: f32, damping: f32, mix: f32, sample_rate: f32) -> Self {
         Self {
             tanks: (0..channels.max(1)).map(|c| Tank::new(if c % 2 == 1 { SPREAD } else { 0 }, sample_rate)).collect(),
+            dry: 1.0,
             size: size.clamp(0.0, 1.0),
             damping: damping.clamp(0.0, 1.0),
             mix: LinearSmoother::with_duration(mix.clamp(0.0, 1.0), 20.0, sample_rate),
         }
+    }
+
+    /// Only the room, none of the input: for an effects bus.
+    pub fn wet_only(mut self) -> Self {
+        self.dry = 0.0;
+        self
     }
 
     pub fn set_size(&mut self, size: f32) {
@@ -133,7 +142,7 @@ impl Reverb {
         let tanks = self.tanks.len();
         for (channel, sample) in frame.iter_mut().enumerate() {
             let tank = &mut self.tanks[channel % tanks];
-            *sample += tank.process(input, feedback, damp) * mix;
+            *sample = *sample * self.dry + tank.process(input, feedback, damp) * mix;
         }
     }
 
@@ -204,6 +213,14 @@ mod tests {
         let out = impulse(&mut reverb, 10_000);
         assert_eq!(out[0], (1.0, 1.0));
         assert!(out[1..].iter().all(|(l, r)| *l == 0.0 && *r == 0.0));
+    }
+
+    #[test]
+    fn wet_only_leaves_out_the_input() {
+        let mut reverb = Reverb::new(2, 0.5, 0.5, 1.0, SR).wet_only();
+        let out = impulse(&mut reverb, 20_000);
+        assert_eq!(out[0], (0.0, 0.0), "the input came through a wet-only reverb");
+        assert!(energy(&out) > 0.0, "and no room either");
     }
 
     #[test]

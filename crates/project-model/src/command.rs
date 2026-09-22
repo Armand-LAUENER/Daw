@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::history::Ids;
 use crate::{
-    Asset, AssetId, AudioWindow, BANDS, Clip, ClipId, CompSettings, Content, DelaySettings, EqBand, Meter, NewClip,
-    Note, NoteId, Placement, PlacementId, Project, ReverbSettings, Source, Tempo, Tick, Track, TrackId, Window, time,
+    Asset, AssetId, AudioWindow, BANDS, Bus, BusId, Clip, ClipId, CompSettings, Content, DelaySettings, EqBand, Meter,
+    NewClip, Note, NoteId, Placement, PlacementId, Project, ReverbSettings, Source, Tempo, Tick, Track, TrackId,
+    Window, time,
 };
 
 /// A change someone asked for.
@@ -89,6 +90,39 @@ pub enum Command {
     SetReverb {
         track: TrackId,
         value: ReverbSettings,
+    },
+    /// A new effects bus, a reverb return to begin with.
+    AddBus {
+        name: String,
+    },
+    /// Takes the sends to it with it, so no track is left sending nowhere.
+    RemoveBus {
+        id: BusId,
+    },
+    RenameBus {
+        id: BusId,
+        name: String,
+    },
+    SetBusGain {
+        id: BusId,
+        gain: f32,
+    },
+    SetBusMuted {
+        id: BusId,
+        muted: bool,
+    },
+    /// A bus's three effects together. Dragged, so one step per gesture.
+    SetBusEffects {
+        id: BusId,
+        comp: CompSettings,
+        delay: DelaySettings,
+        reverb: ReverbSettings,
+    },
+    /// How much of a track a bus hears. `None` removes the send.
+    SetSend {
+        track: TrackId,
+        bus: BusId,
+        level: Option<f32>,
     },
     /// Removes every placement on a track, keeping the track and its settings.
     ClearTrack {
@@ -182,7 +216,7 @@ pub enum Command {
 /// place in the history; a fader dragged across the screen is one decision that
 /// happens to arrive sixty times a second.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Target(u8, u32);
+pub(crate) struct Target(u8, u32, u32);
 
 impl Command {
     /// The control this change moves, when it is one that can be dragged.
@@ -190,24 +224,32 @@ impl Command {
         // The project-wide controls have no object of their own to be named by.
         const PROJECT: u32 = u32::MAX;
         match self {
-            Self::SetGain { id, .. } => Some(Target(0, id.0)),
-            Self::SetPan { id, .. } => Some(Target(1, id.0)),
-            Self::SetMasterGain { .. } => Some(Target(2, PROJECT)),
-            Self::SetTempo { .. } => Some(Target(3, PROJECT)),
-            Self::MovePlacement { id, .. } => Some(Target(4, id.0)),
-            Self::SetWindow { id, .. } | Self::TrimPlacement { id, .. } => Some(Target(5, id.0)),
-            Self::SetNote { id, .. } => Some(Target(6, id.0)),
+            Self::SetGain { id, .. } => Some(Target(0, id.0, 0)),
+            Self::SetPan { id, .. } => Some(Target(1, id.0, 0)),
+            Self::SetMasterGain { .. } => Some(Target(2, PROJECT, 0)),
+            Self::SetTempo { .. } => Some(Target(3, PROJECT, 0)),
+            Self::MovePlacement { id, .. } => Some(Target(4, id.0, 0)),
+            Self::SetWindow { id, .. } | Self::TrimPlacement { id, .. } => Some(Target(5, id.0, 0)),
+            Self::SetNote { id, .. } => Some(Target(6, id.0, 0)),
             // One target per band, above every other kind.
-            Self::SetEqBand { track, band, .. } => Some(Target(8u8.saturating_add(*band), track.0)),
-            Self::SetCompressor { track, .. } => Some(Target(200, track.0)),
-            Self::SetDelay { track, .. } => Some(Target(201, track.0)),
-            Self::SetReverb { track, .. } => Some(Target(202, track.0)),
+            Self::SetEqBand { track, band, .. } => Some(Target(8u8.saturating_add(*band), track.0, 0)),
+            Self::SetCompressor { track, .. } => Some(Target(200, track.0, 0)),
+            Self::SetDelay { track, .. } => Some(Target(201, track.0, 0)),
+            Self::SetReverb { track, .. } => Some(Target(202, track.0, 0)),
+            Self::SetBusGain { id, .. } => Some(Target(203, id.0, 0)),
+            Self::SetBusEffects { id, .. } => Some(Target(204, id.0, 0)),
+            // Two ids: one track's sends to two buses are two controls.
+            Self::SetSend { track, bus, .. } => Some(Target(205, track.0, bus.0)),
             Self::AddTrack { .. }
             | Self::RemoveTrack { .. }
             | Self::RenameTrack { .. }
             | Self::SetMuted { .. }
             | Self::SetSoloed { .. }
             | Self::SetMeter { .. }
+            | Self::AddBus { .. }
+            | Self::RemoveBus { .. }
+            | Self::RenameBus { .. }
+            | Self::SetBusMuted { .. }
             | Self::SetSource { .. }
             | Self::ClearTrack { .. }
             | Self::AddAudioClip { .. }
@@ -232,6 +274,7 @@ pub enum CommandError {
     NoSuchClip(ClipId),
     NoSuchPlacement(PlacementId),
     NoSuchNote(NoteId),
+    NoSuchBus(BusId),
     /// A gain that is NaN or infinite would silence or destroy the output, and
     /// would survive into a saved file to do it again tomorrow.
     NotFinite(&'static str),
@@ -252,6 +295,7 @@ impl fmt::Display for CommandError {
             Self::NoSuchClip(ClipId(id)) => write!(f, "there is no clip {id}"),
             Self::NoSuchPlacement(PlacementId(id)) => write!(f, "there is no placement {id}"),
             Self::NoSuchNote(NoteId(id)) => write!(f, "there is no note {id}"),
+            Self::NoSuchBus(BusId(id)) => write!(f, "there is no bus {id}"),
             Self::NotFinite(what) => write!(f, "{what} must be a finite number"),
             Self::OutOfRange(what) => write!(f, "{what} is out of range"),
             Self::NotMidi(ClipId(id)) => write!(f, "clip {id} is audio and has no notes"),
@@ -343,6 +387,22 @@ pub(crate) enum Edit {
         band: usize,
         value: EqBand,
     },
+    InsertBus {
+        at: usize,
+        bus: Bus,
+    },
+    RemoveBus {
+        id: BusId,
+    },
+    /// Replaces a bus's settings whole: renamed, faded, muted or re-effected.
+    SetBus {
+        bus: Bus,
+    },
+    SetSend {
+        track: TrackId,
+        bus: BusId,
+        level: Option<f32>,
+    },
     SetCompressor {
         id: TrackId,
         value: CompSettings,
@@ -390,6 +450,7 @@ pub(crate) fn resolve(project: &Project, ids: &mut Ids, command: Command) -> Res
     let track = |id: TrackId| project.track(id).ok_or(CommandError::NoSuchTrack(id));
     let placement = |id: PlacementId| project.placement(id).copied().ok_or(CommandError::NoSuchPlacement(id));
     let clip = |id: ClipId| project.clip(id).ok_or(CommandError::NoSuchClip(id));
+    let bus = |id: BusId| project.bus(id).ok_or(CommandError::NoSuchBus(id));
     let midi = |id: ClipId| {
         let found = clip(id)?;
         match &found.content {
@@ -506,6 +567,57 @@ pub(crate) fn resolve(project: &Project, ids: &mut Ids, command: Command) -> Res
                 return Err(CommandError::OutOfRange("a reverb setting"));
             }
             one(Edit::SetReverb { id, value }, Edit::SetReverb { id, value: was })
+        }
+        Command::AddBus { name } => {
+            let at = project.bus_order.len();
+            let bus = Bus::new(ids.take_bus(), name);
+            let id = bus.id;
+            one(Edit::InsertBus { at, bus }, Edit::RemoveBus { id })
+        }
+        Command::RemoveBus { id } => {
+            let bus = bus(id)?.clone();
+            let at = project.position_of_bus(id).ok_or(CommandError::NoSuchBus(id))?;
+            let mut change = Change::new(project);
+            for track in project.tracks() {
+                if let Some(level) = track.sends.get(&id) {
+                    let (t, level) = (track.id, *level);
+                    change.push(
+                        Edit::SetSend { track: t, bus: id, level: None },
+                        Edit::SetSend { track: t, bus: id, level: Some(level) },
+                    );
+                }
+            }
+            change.push(Edit::RemoveBus { id }, Edit::InsertBus { at, bus });
+            change.finish()
+        }
+        Command::RenameBus { id, name } => {
+            let was = bus(id)?.clone();
+            one(Edit::SetBus { bus: Bus { name, ..was.clone() } }, Edit::SetBus { bus: was })
+        }
+        Command::SetBusGain { id, gain } => {
+            let was = bus(id)?.clone();
+            finite(gain, "a bus's gain")?;
+            one(Edit::SetBus { bus: Bus { gain, ..was.clone() } }, Edit::SetBus { bus: was })
+        }
+        Command::SetBusMuted { id, muted } => {
+            let was = bus(id)?.clone();
+            one(Edit::SetBus { bus: Bus { muted, ..was.clone() } }, Edit::SetBus { bus: was })
+        }
+        Command::SetBusEffects { id, comp, delay, reverb } => {
+            let was = bus(id)?.clone();
+            let now = Bus { comp, delay, reverb, ..was.clone() };
+            if !now.is_valid() {
+                return Err(CommandError::OutOfRange("a bus effect's settings"));
+            }
+            one(Edit::SetBus { bus: now }, Edit::SetBus { bus: was })
+        }
+        Command::SetSend { track: t, bus: b, level } => {
+            let was = track(t)?.sends.get(&b).copied();
+            bus(b)?;
+            if level.is_some_and(|l| !crate::SEND.contains(&l)) {
+                return Err(CommandError::OutOfRange("a send level"));
+            }
+            one(Edit::SetSend { track: t, bus: b, level }, Edit::SetSend { track: t, bus: b, level: was })
         }
         Command::ClearTrack { id } => {
             track(id)?;
@@ -756,6 +868,17 @@ fn apply_one(project: &mut Project, edit: &Edit) {
             project.track_order.insert(*at, track.id);
             project.tracks.insert(track.id, track.clone());
         }
+        Edit::InsertBus { at, bus } => {
+            project.bus_order.insert(*at, bus.id);
+            project.buses.insert(bus.id, bus.clone());
+        }
+        Edit::RemoveBus { id } => {
+            project.bus_order.retain(|b| b != id);
+            project.buses.remove(id);
+        }
+        Edit::SetBus { bus } => {
+            project.buses.insert(bus.id, bus.clone());
+        }
         Edit::RemoveTrack { id } => {
             project.track_order.retain(|t| t != id);
             project.tracks.remove(id);
@@ -788,6 +911,14 @@ fn apply_one(project: &mut Project, edit: &Edit) {
         Edit::SetMeter { meter } => project.meter = *meter,
         Edit::SetSource { id, source } => on(*id, &mut |t| t.source = *source),
         Edit::SetCompressor { id, value } => on(*id, &mut |t| t.comp = *value),
+        Edit::SetSend { track, bus, level } => on(*track, &mut |t| match level {
+            Some(level) => {
+                t.sends.insert(*bus, *level);
+            }
+            None => {
+                t.sends.remove(bus);
+            }
+        }),
         Edit::SetDelay { id, value } => on(*id, &mut |t| t.delay = *value),
         Edit::SetReverb { id, value } => on(*id, &mut |t| t.reverb = *value),
         Edit::SetEqBand { id, band, value } => on(*id, &mut |t| {

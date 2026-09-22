@@ -1,11 +1,12 @@
 {
   "format": "daw-project",
-  "version": 6,
+  "version": 7,
   "next_ids": {
     "track": 2,
     "clip": 2,
     "placement": 3,
-    "note": 2
+    "note": 2,
+    "bus": 0
   },
   "project": {
     "tempo": 120000,
@@ -76,7 +77,8 @@
           "size": 0.5,
           "damping": 0.5,
           "mix": 0.2
-        }
+        },
+        "sends": {}
       },
       "1": {
         "id": 1,
@@ -135,7 +137,8 @@
           "size": 0.5,
           "damping": 0.5,
           "mix": 0.2
-        }
+        },
+        "sends": {}
       }
     },
     "clips": {
@@ -204,6 +207,8 @@
         "id": "f09b2136a68a271423955b63129a24cc00b1d326f31f481e965f786315000a26",
         "path": "audio/kick.wav"
       }
-    }
+    },
+    "bus_order": [],
+    "buses": {}
   }
 }

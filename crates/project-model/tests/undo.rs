@@ -52,6 +52,12 @@ enum Action {
     /// A track, which effect, whether it is on, and a value over a range
     /// wider than the valid ones.
     Effect(u8, u8, bool, f32),
+    AddBus,
+    RemoveBus(u8),
+    /// A track, a bus, and a level over a range wider than the valid one;
+    /// below zero removes the send.
+    Send(u8, u8, f32),
+    BusGain(u8, f32),
 }
 
 /// One of four files, by content. Few enough that tracks keep landing on the
@@ -92,6 +98,10 @@ fn action() -> impl Strategy<Value = Action> {
         2 => (any::<u8>(), 0u8..6, 0u8..5, 1.0f32..30_000.0, -40.0f32..40.0, 0.0f32..25.0)
             .prop_map(|(t, band, shape, f, g, q)| Action::Eq(t, band, shape, f, g, q)),
         2 => (any::<u8>(), 0u8..3, any::<bool>(), -2.0f32..2.0).prop_map(|(t, e, on, v)| Action::Effect(t, e, on, v)),
+        1 => Just(Action::AddBus),
+        1 => any::<u8>().prop_map(Action::RemoveBus),
+        2 => (any::<u8>(), any::<u8>(), -0.5f32..1.5).prop_map(|(t, b, l)| Action::Send(t, b, l)),
+        1 => (any::<u8>(), -2.0f32..2.0).prop_map(|(b, g)| Action::BusGain(b, g)),
     ]
 }
 
@@ -116,6 +126,10 @@ fn to_command(project: &Project, action: &Action) -> Option<Command> {
     // edits collide with each other and with the ends of clips.
     let beats = |n: u8| Tick(u64::from(n % 16) * 960);
     let quarters = |n: u8| Tick(u64::from(n % 32) * 240);
+    let bus = |i: u8| {
+        let count = project.buses().len();
+        (count > 0).then(|| project.buses().nth(usize::from(i) % count).expect("in range").id)
+    };
     // A note on some existing note of the clip, when it has one.
     let note_of = |c, i: u8| {
         let notes = project.clip(c)?.notes()?;
@@ -152,6 +166,12 @@ fn to_command(project: &Project, action: &Action) -> Option<Command> {
                 },
             }
         }
+        Action::AddBus => Command::AddBus { name: "bus".into() },
+        Action::RemoveBus(b) => Command::RemoveBus { id: bus(*b)? },
+        Action::Send(t, b, level) => {
+            Command::SetSend { track: pick(*t)?, bus: bus(*b)?, level: (*level >= 0.0).then_some(*level) }
+        }
+        Action::BusGain(b, gain) => Command::SetBusGain { id: bus(*b)?, gain: *gain },
         Action::AddAudio(t, f, s) => Command::AddAudioClip { track: pick(*t)?, asset: asset(*f), start: beats(*s) },
         Action::AddMidi(t, s, l) => {
             Command::AddMidiClip { track: pick(*t)?, name: "midi".into(), start: beats(*s), length: quarters(*l) }

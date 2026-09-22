@@ -209,7 +209,7 @@ struct App {
     /// The track whose equaliser is open, in the mixer.
     eq_track: Option<project_model::TrackId>,
     /// The track whose effects are open, in the mixer.
-    fx_track: Option<project_model::TrackId>,
+    fx_track: Option<fx_view::Strip>,
     /// Files already read, so a rebuild reuses what was decoded rather than
     /// reading it again.
     sources: FileSources,

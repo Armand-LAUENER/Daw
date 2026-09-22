@@ -81,6 +81,11 @@ impl Echo {
     pub fn new(channels: usize, time_frames: f32, feedback: f32, mix: f32, sample_rate: f32) -> Self {
         Self(Delay::new(channels, time_frames, feedback, mix, sample_rate))
     }
+
+    /// Echoes only, for an effects bus.
+    pub fn wet_only(self) -> Self {
+        Self(self.0.wet_only())
+    }
 }
 
 impl Node for Echo {
@@ -113,6 +118,11 @@ impl Room {
 
     pub fn new(channels: usize, size: f32, damping: f32, mix: f32, sample_rate: f32) -> Self {
         Self(Reverb::new(channels, size, damping, mix, sample_rate))
+    }
+
+    /// The room only, for an effects bus.
+    pub fn wet_only(self) -> Self {
+        Self(self.0.wet_only())
     }
 }
 

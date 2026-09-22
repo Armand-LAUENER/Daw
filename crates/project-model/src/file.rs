@@ -252,6 +252,17 @@ fn migrate(value: &mut Value, from: u32) -> Result<(), FileError> {
                     track.insert("reverb".into(), json!(ReverbSettings::default()));
                 }
             }
+            // Version 7 added effects buses and the sends that feed them.
+            // A project from before had neither.
+            6 => {
+                let project = project_of(value)?;
+                project.insert("bus_order".into(), json!([]));
+                project.insert("buses".into(), json!({}));
+                let tracks = project.get_mut("tracks").and_then(Value::as_object_mut).ok_or(FileError::NotAProject)?;
+                for track in tracks.values_mut().filter_map(Value::as_object_mut) {
+                    track.insert("sends".into(), json!({}));
+                }
+            }
             // Version 0 never existed: no file was written before the header.
             _ => return Err(FileError::NotAProject),
         }

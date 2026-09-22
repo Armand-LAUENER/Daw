@@ -29,7 +29,7 @@ use engine_core::{
     Room, Solo, SoloBus,
 };
 use engine_dsp::{CompressorSettings, Shape};
-use project_model::{BANDS, BandShape, Command, Project, Track, TrackId};
+use project_model::{BANDS, BandShape, BusId, Command, Project, Track, TrackId};
 
 /// The ceiling the master sits under.
 ///
@@ -59,6 +59,19 @@ pub struct TrackBinding {
     pub soloed: ParamId,
 }
 
+/// Where one bus's controls ended up in a compiled graph.
+#[derive(Debug, Clone, Copy)]
+pub struct BusBinding {
+    pub id: BusId,
+    /// Where its sends arrive.
+    pub input: NodeId,
+    pub comp: Option<NodeId>,
+    pub delay: Option<NodeId>,
+    pub reverb: Option<NodeId>,
+    pub gain: ParamId,
+    pub muted: ParamId,
+}
+
 /// Where every control ended up, so an edit can be aimed without rebuilding.
 ///
 /// Belongs to one compiled graph. A graph built to replace it has its own, and
@@ -71,6 +84,9 @@ pub struct Bindings {
     /// into frames.
     timing: Option<Timing>,
     tracks: Vec<TrackBinding>,
+    buses: Vec<BusBinding>,
+    /// Each send's level, by track and bus.
+    sends: Vec<(TrackId, BusId, ParamId)>,
 }
 
 impl Bindings {
@@ -84,6 +100,14 @@ impl Bindings {
 
     pub fn tracks(&self) -> &[TrackBinding] {
         &self.tracks
+    }
+
+    pub fn bus(&self, id: BusId) -> Option<&BusBinding> {
+        self.buses.iter().find(|b| b.id == id)
+    }
+
+    pub fn send(&self, track: TrackId, bus: BusId) -> Option<ParamId> {
+        self.sends.iter().find(|(t, b, _)| *t == track && *b == bus).map(|(.., p)| *p)
     }
 }
 
@@ -112,6 +136,31 @@ pub fn compile(
     let bus = SoloBus::new();
     let master = builder.add(Box::new(Gain::new(project.master_gain(), sample_rate)));
     let mut tracks = Vec::with_capacity(project.track_count());
+    let timing = Timing::new(project.tempo(), sample_rate as u32);
+
+    // Buses first, so tracks have somewhere to send. Each: a summing point
+    // for its sends, its effects, its fader and mute, into the master. No
+    // solo node: a return stays open when a track is soloed, or soloing a
+    // track would take its reverb away.
+    let mut buses = Vec::with_capacity(project.buses().len());
+    for bus in project.buses() {
+        let input = builder.add(Box::new(Gain::new(1.0, sample_rate)));
+        let (last, [comp, delay, reverb]) =
+            effect_chain(&mut builder, input, &bus.comp, &bus.delay, &bus.reverb, true, timing, channels, sample_rate);
+        let gain = builder.add(Box::new(Gain::new(bus.gain, sample_rate)));
+        let muted = builder.add(Box::new(Mute::new(bus.muted, sample_rate)));
+        builder.connect(last, gain).connect(gain, muted).connect(muted, master);
+        buses.push(BusBinding {
+            id: bus.id,
+            input,
+            comp,
+            delay,
+            reverb,
+            gain: ParamId::new(gain, Gain::PARAM_GAIN),
+            muted: ParamId::new(muted, Mute::PARAM_MUTED),
+        });
+    }
+    let mut sends = Vec::new();
 
     for track in project.tracks() {
         let source = builder.add(source_for(track));
@@ -125,36 +174,38 @@ pub fn compile(
             on: b.on,
         });
         let eq = builder.add(Box::new(Eq::new(&bands, channels, sample_rate)));
+        builder.connect(source, eq);
         // The effects that are on, in order, after the equaliser.
-        let timing = Timing::new(project.tempo(), sample_rate as u32);
-        let comp = track.comp.on.then(|| builder.add(Box::new(Compress::new(comp_settings(&track.comp), sample_rate))));
-        let delay = track.delay.on.then(|| {
-            let d = &track.delay;
-            let time = timing.frame_of(d.time) as f32;
-            builder.add(Box::new(Echo::new(channels, time, d.feedback, d.mix, sample_rate)))
-        });
-        let reverb = track.reverb.on.then(|| {
-            let r = &track.reverb;
-            builder.add(Box::new(Room::new(channels, r.size, r.damping, r.mix, sample_rate)))
-        });
+        let (last, [comp, delay, reverb]) = effect_chain(
+            &mut builder,
+            eq,
+            &track.comp,
+            &track.delay,
+            &track.reverb,
+            false,
+            timing,
+            channels,
+            sample_rate,
+        );
         let gain = builder.add(Box::new(Gain::new(track.gain, sample_rate)));
         let pan = builder.add(Box::new(Pan::new(track.pan, sample_rate)));
         let muted = builder.add(Box::new(Mute::new(track.muted, sample_rate)));
         let soloed = builder.add(Box::new(Solo::new(&bus, track.soloed, sample_rate)));
-        builder.connect(source, eq);
-        // Each effect that is on takes the chain's end; whatever is last feeds
-        // the fader.
-        let mut last = eq;
-        for effect in [comp, delay, reverb].into_iter().flatten() {
-            builder.connect(last, effect);
-            last = effect;
-        }
         builder
             .connect(last, gain)
             .connect(gain, pan)
             .connect(pan, muted)
             .connect(muted, soloed)
             .connect(soloed, master);
+
+        // Sends, after everything the track does: its fader, pan, mute and
+        // solo all reach what it sends.
+        for (bus_id, level) in &track.sends {
+            let Some(bus) = buses.iter().find(|b| b.id == *bus_id) else { continue };
+            let send = builder.add(Box::new(Gain::new(*level, sample_rate)));
+            builder.connect(soloed, send).connect(send, bus.input);
+            sends.push((track.id, *bus_id, ParamId::new(send, Gain::PARAM_GAIN)));
+        }
 
         tracks.push(TrackBinding {
             id: track.id,
@@ -174,9 +225,47 @@ pub fn compile(
     builder.connect(master, ceiling).output(ceiling);
 
     let graph = builder.build(channels, max_frames)?;
-    let timing = Some(Timing::new(project.tempo(), sample_rate as u32));
-    let bindings = Bindings { master_gain: Some(ParamId::new(master, Gain::PARAM_GAIN)), timing, tracks };
+    let bindings = Bindings {
+        master_gain: Some(ParamId::new(master, Gain::PARAM_GAIN)),
+        timing: Some(timing),
+        tracks,
+        buses,
+        sends,
+    };
     Ok(Compiled { graph: Box::new(graph), bindings })
+}
+
+/// The effects that are on, in series after `from`, and the node the chain
+/// now ends on. On a bus the delay and the reverb are wet only: the dry sound
+/// already reaches the mix through its own track.
+#[allow(clippy::too_many_arguments)]
+fn effect_chain(
+    builder: &mut GraphBuilder,
+    from: NodeId,
+    comp: &project_model::CompSettings,
+    delay: &project_model::DelaySettings,
+    reverb: &project_model::ReverbSettings,
+    wet_only: bool,
+    timing: Timing,
+    channels: usize,
+    sample_rate: f32,
+) -> (NodeId, [Option<NodeId>; 3]) {
+    let comp = comp.on.then(|| builder.add(Box::new(Compress::new(comp_settings(comp), sample_rate))));
+    let delay = delay.on.then(|| {
+        let time = timing.frame_of(delay.time) as f32;
+        let echo = Echo::new(channels, time, delay.feedback, delay.mix, sample_rate);
+        builder.add(Box::new(if wet_only { echo.wet_only() } else { echo }))
+    });
+    let reverb = reverb.on.then(|| {
+        let room = Room::new(channels, reverb.size, reverb.damping, reverb.mix, sample_rate);
+        builder.add(Box::new(if wet_only { room.wet_only() } else { room }))
+    });
+    let mut last = from;
+    for effect in [comp, delay, reverb].into_iter().flatten() {
+        builder.connect(last, effect);
+        last = effect;
+    }
+    (last, [comp, delay, reverb])
 }
 
 /// How an effect's settings reach the engine: as parameters when it is in the
@@ -195,6 +284,28 @@ fn effect(
         (None, false) => Change::Nothing,
         _ => Change::Rebuild,
     }
+}
+
+fn comp_params(node: NodeId, c: &project_model::CompSettings) -> Vec<(ParamId, f32)> {
+    let p = |which| ParamId::new(node, which);
+    vec![
+        (p(Compress::PARAM_THRESHOLD), c.threshold),
+        (p(Compress::PARAM_RATIO), c.ratio),
+        (p(Compress::PARAM_ATTACK), c.attack),
+        (p(Compress::PARAM_RELEASE), c.release),
+        (p(Compress::PARAM_MAKEUP), c.makeup),
+    ]
+}
+
+fn delay_params(node: NodeId, d: &project_model::DelaySettings, timing: Option<Timing>) -> Vec<(ParamId, f32)> {
+    let p = |which| ParamId::new(node, which);
+    let time = timing.map_or(0.0, |t| t.frame_of(d.time) as f32);
+    vec![(p(Echo::PARAM_TIME), time), (p(Echo::PARAM_FEEDBACK), d.feedback), (p(Echo::PARAM_MIX), d.mix)]
+}
+
+fn reverb_params(node: NodeId, r: &project_model::ReverbSettings) -> Vec<(ParamId, f32)> {
+    let p = |which| ParamId::new(node, which);
+    vec![(p(Room::PARAM_SIZE), r.size), (p(Room::PARAM_DAMPING), r.damping), (p(Room::PARAM_MIX), r.mix)]
 }
 
 fn comp_settings(c: &project_model::CompSettings) -> CompressorSettings {
@@ -300,27 +411,51 @@ pub fn route(bindings: &Bindings, command: &Command) -> Change {
                 _ => Change::Rebuild,
             }
         }
-        Command::SetCompressor { track, value } => effect(bindings, *track, value.on, |b| b.comp, |node| {
-            let p = |which| ParamId::new(node, which);
-            vec![
-                (p(Compress::PARAM_THRESHOLD), value.threshold),
-                (p(Compress::PARAM_RATIO), value.ratio),
-                (p(Compress::PARAM_ATTACK), value.attack),
-                (p(Compress::PARAM_RELEASE), value.release),
-                (p(Compress::PARAM_MAKEUP), value.makeup),
-            ]
-        }),
+        Command::SetCompressor { track, value } => {
+            effect(bindings, *track, value.on, |b| b.comp, |node| comp_params(node, value))
+        }
         // The time is sent in ticks' worth of frames at the tempo the graph
         // was built for; a new tempo rebuilds, and recomputes it.
-        Command::SetDelay { track, value } => effect(bindings, *track, value.on, |b| b.delay, |node| {
-            let p = |which| ParamId::new(node, which);
-            let time = bindings.timing.map_or(0.0, |t| t.frame_of(value.time) as f32);
-            vec![(p(Echo::PARAM_TIME), time), (p(Echo::PARAM_FEEDBACK), value.feedback), (p(Echo::PARAM_MIX), value.mix)]
-        }),
-        Command::SetReverb { track, value } => effect(bindings, *track, value.on, |b| b.reverb, |node| {
-            let p = |which| ParamId::new(node, which);
-            vec![(p(Room::PARAM_SIZE), value.size), (p(Room::PARAM_DAMPING), value.damping), (p(Room::PARAM_MIX), value.mix)]
-        }),
+        Command::SetDelay { track, value } => {
+            effect(bindings, *track, value.on, |b| b.delay, |node| delay_params(node, value, bindings.timing))
+        }
+        Command::SetReverb { track, value } => {
+            effect(bindings, *track, value.on, |b| b.reverb, |node| reverb_params(node, value))
+        }
+        // A bus appearing or going is a different graph; its name is not a sound.
+        Command::AddBus { .. } | Command::RemoveBus { .. } => Change::Rebuild,
+        Command::RenameBus { .. } => Change::Nothing,
+        Command::SetBusGain { id, gain } => {
+            bindings.bus(*id).map_or(Change::Rebuild, |b| Change::Param { param: b.gain, value: *gain })
+        }
+        Command::SetBusMuted { id, muted } => {
+            bindings.bus(*id).map_or(Change::Rebuild, |b| Change::Param { param: b.muted, value: flag(*muted) })
+        }
+        Command::SetBusEffects { id, comp, delay, reverb } => match bindings.bus(*id) {
+            // The same effects on as when built: their settings are
+            // parameters. Any switched on or off: a rebuild.
+            Some(b)
+                if b.comp.is_some() == comp.on && b.delay.is_some() == delay.on && b.reverb.is_some() == reverb.on =>
+            {
+                let mut params = Vec::new();
+                if let Some(node) = b.comp {
+                    params.extend(comp_params(node, comp));
+                }
+                if let Some(node) = b.delay {
+                    params.extend(delay_params(node, delay, bindings.timing));
+                }
+                if let Some(node) = b.reverb {
+                    params.extend(reverb_params(node, reverb));
+                }
+                if params.is_empty() { Change::Nothing } else { Change::Params(params) }
+            }
+            _ => Change::Rebuild,
+        },
+        Command::SetSend { track, bus, level } => match (bindings.send(*track, *bus), level) {
+            (Some(param), Some(level)) => Change::Param { param, value: *level },
+            // A send made or removed changes the graph's shape.
+            _ => Change::Rebuild,
+        },
         Command::SetMasterGain { gain } => {
             bindings.master_gain().map_or(Change::Rebuild, |param| Change::Param { param, value: *gain })
         }

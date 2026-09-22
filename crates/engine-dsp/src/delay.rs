@@ -33,6 +33,9 @@ pub struct Delay {
     mix: LinearSmoother,
     /// One low-pass state per channel, in the feedback path.
     tone: Vec<f32>,
+    /// How much of the input is kept: 1 as an insert, 0 on an effects bus,
+    /// where the dry signal already reaches the mix through its own track.
+    dry: f32,
     tone_coefficient: f32,
 }
 
@@ -54,7 +57,14 @@ impl Delay {
             mix: LinearSmoother::with_duration(mix.clamp(0.0, 1.0), 20.0, sample_rate),
             tone: vec![0.0; channels.max(1)],
             tone_coefficient,
+            dry: 1.0,
         }
+    }
+
+    /// Only the echoes, none of the input: for an effects bus.
+    pub fn wet_only(mut self) -> Self {
+        self.dry = 0.0;
+        self
     }
 
     pub fn set_time(&mut self, frames: f32) {
@@ -90,8 +100,9 @@ impl Delay {
                 back = 0.0;
             }
             line[self.write] = back;
-            // The dry signal stays whole; the echo is added on top of it.
-            *sample += echo * mix;
+            // The dry signal stays whole — or goes, on a bus — and the echo is
+            // added on top.
+            *sample = *sample * self.dry + echo * mix;
         }
         self.write = (self.write + 1) % length;
     }
@@ -160,6 +171,14 @@ mod tests {
         let out = impulse(&mut delay, 2_000);
         assert_eq!(out[0], 1.0);
         assert!(out[1..].iter().all(|s| s.abs() < 1e-6));
+    }
+
+    #[test]
+    fn wet_only_leaves_out_the_input() {
+        let mut delay = Delay::new(1, 100.0, 0.0, 1.0, SR).wet_only();
+        let out = impulse(&mut delay, 300);
+        assert_eq!(out[0], 0.0, "the input came through a wet-only delay");
+        assert!(peak_near(&out, 100) > 0.5);
     }
 
     #[test]

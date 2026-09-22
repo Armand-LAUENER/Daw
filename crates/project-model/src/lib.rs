@@ -21,6 +21,7 @@
 
 mod arrangement;
 mod asset;
+mod bus;
 mod command;
 mod effects;
 mod eq;
@@ -36,6 +37,7 @@ use serde::{Deserialize, Serialize};
 
 pub use arrangement::{AudioWindow, Clip, ClipId, Content, NewClip, Note, NoteId, Placement, PlacementId, Window};
 pub use asset::{Asset, AssetId};
+pub use bus::{Bus, BusId, SEND};
 pub use command::{Command, CommandError};
 pub use effects::{CompSettings, DelaySettings, ReverbSettings};
 pub use eq::{BANDS, BandShape, EqBand, default_eq};
@@ -49,7 +51,7 @@ pub use time::{Meter, PPQ, Tempo, Tick};
 /// written. Adding a version to a format that already has files in the wild
 /// means guessing what the unversioned ones were, and that guess is always
 /// wrong for somebody.
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 
 /// Identifies a track for the life of a project.
 ///
@@ -96,6 +98,9 @@ pub struct Track {
     pub comp: CompSettings,
     pub delay: DelaySettings,
     pub reverb: ReverbSettings,
+    /// How much of the track each bus hears, taken after its fader, pan, mute
+    /// and solo — so the track's reverb follows the track.
+    pub sends: BTreeMap<BusId, f32>,
 }
 
 impl Track {
@@ -112,6 +117,7 @@ impl Track {
             comp: CompSettings::default(),
             delay: DelaySettings::default(),
             reverb: ReverbSettings::default(),
+            sends: BTreeMap::new(),
         }
     }
 }
@@ -136,6 +142,9 @@ pub struct Project {
     /// Every file an audio clip plays, and nothing else: an asset is removed
     /// with the last clip that used it.
     assets: BTreeMap<AssetId, Asset>,
+    /// The mixer's order of buses, under the tracks.
+    bus_order: Vec<BusId>,
+    buses: BTreeMap<BusId, Bus>,
 }
 
 impl Default for Project {
@@ -149,6 +158,8 @@ impl Default for Project {
             clips: BTreeMap::new(),
             placements: BTreeMap::new(),
             assets: BTreeMap::new(),
+            bus_order: Vec::new(),
+            buses: BTreeMap::new(),
         }
     }
 }
@@ -175,6 +186,19 @@ impl Project {
     /// The tracks, in the mixer's order.
     pub fn tracks(&self) -> impl DoubleEndedIterator<Item = &Track> + ExactSizeIterator {
         self.track_order.iter().map(|id| &self.tracks[id])
+    }
+
+    /// The buses, in the mixer's order.
+    pub fn buses(&self) -> impl DoubleEndedIterator<Item = &Bus> + ExactSizeIterator {
+        self.bus_order.iter().map(|id| &self.buses[id])
+    }
+
+    pub fn bus(&self, id: BusId) -> Option<&Bus> {
+        self.buses.get(&id)
+    }
+
+    pub fn position_of_bus(&self, id: BusId) -> Option<usize> {
+        self.bus_order.iter().position(|b| *b == id)
     }
 
     pub fn track_count(&self) -> usize {
@@ -304,6 +328,14 @@ impl Project {
             if !(track.comp.is_valid() && track.delay.is_valid() && track.reverb.is_valid()) {
                 return Err(Invalid::OutOfRange("an effect's settings"));
             }
+            for (bus, level) in &track.sends {
+                if !self.buses.contains_key(bus) {
+                    return Err(Invalid::Dangling("bus", bus.0));
+                }
+                if !SEND.contains(level) {
+                    return Err(Invalid::OutOfRange("a send level"));
+                }
+            }
         }
         for (key, clip) in &self.clips {
             if clip.id != *key {
@@ -351,6 +383,23 @@ impl Project {
                 && (clip.asset().is_none() || audio.length == 0 || audio.rate == 0)
             {
                 return Err(Invalid::WindowOutside(*key));
+            }
+        }
+        if self.bus_order.len() != self.buses.len() {
+            return Err(Invalid::Order);
+        }
+        let mut seen = BTreeSet::new();
+        for id in &self.bus_order {
+            if !self.buses.contains_key(id) || !seen.insert(*id) {
+                return Err(Invalid::Order);
+            }
+        }
+        for (key, bus) in &self.buses {
+            if bus.id != *key {
+                return Err(Invalid::Misfiled("bus", key.0));
+            }
+            if !bus.is_valid() {
+                return Err(Invalid::OutOfRange("a bus's settings"));
             }
         }
         for (key, asset) in &self.assets {

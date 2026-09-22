@@ -10,6 +10,7 @@ use engine_core::TransportCommand;
 use project_engine::Position;
 use project_model::{Command, Meter, Project, Source, Tempo, TrackId};
 
+use crate::fx_view::Strip;
 use crate::layout::Layout;
 use crate::theme::Theme;
 
@@ -38,7 +39,7 @@ pub struct Actions {
     /// A track whose equaliser was asked for.
     pub eq: Option<TrackId>,
     /// A track whose effects were asked for.
-    pub fx: Option<TrackId>,
+    pub fx: Option<Strip>,
     /// The project is to be written to disk.
     pub save: bool,
     /// Play, pause, stop or seek. Not a [`Command`]: where the playhead is
@@ -187,6 +188,15 @@ pub fn mixer(ui: &mut Ui, project: &Project, theme: &Theme, layout: &Layout, act
         ui.add_space(layout.strip_spacing);
     }
 
+    // The buses, under the tracks: shared effects the tracks send to.
+    for bus in project.buses() {
+        bus_strip(ui, bus, theme, layout, actions);
+        ui.add_space(layout.strip_spacing);
+    }
+    if ui.button("Add FX bus").on_hover_text("a shared reverb that tracks send to").clicked() {
+        actions.commands.push(Command::AddBus { name: "Reverb".into() });
+    }
+
     ui.separator();
     ui.horizontal(|ui| {
         ui.label(RichText::new("Master").color(theme.dim).strong());
@@ -244,7 +254,7 @@ fn strip(
             let effects_on = track.comp.on || track.delay.on || track.reverb.on;
             let fx_colour = if effects_on { theme.accent } else { theme.dim };
             if ui.add(egui::Button::new(RichText::new("FX").color(fx_colour).small())).clicked() {
-                actions.fx = Some(id);
+                actions.fx = Some(Strip::Track(id));
             }
 
             ui.label(RichText::new("gain").color(theme.dim).small());
@@ -305,6 +315,47 @@ fn strip(
                 }
                 let colour = if track.source == Source::Clips { theme.accent } else { theme.dim };
                 ui.label(RichText::new(project.playing(track)).color(colour).small());
+            });
+        });
+    });
+}
+
+/// A bus: its name, mute, fader and effects. No solo: a return stays open when
+/// a track is soloed, or soloing a track would take its reverb away.
+fn bus_strip(ui: &mut Ui, bus: &project_model::Bus, theme: &Theme, layout: &Layout, actions: &mut Actions) {
+    let id = bus.id;
+    egui::Frame::group(ui.style()).fill(theme.panel).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            let mut name = bus.name.clone();
+            let field = ui.add_sized([layout.name_width, 20.0], egui::TextEdit::singleline(&mut name));
+            if field.lost_focus() && name != bus.name {
+                actions.commands.push(Command::RenameBus { id, name });
+            }
+            let mute_colour = if bus.muted { theme.muted } else { theme.dim };
+            if ui.add(egui::Button::new(RichText::new("M").color(mute_colour).strong())).clicked() {
+                actions.commands.push(Command::SetBusMuted { id, muted: !bus.muted });
+            }
+            let effects_on = bus.comp.on || bus.delay.on || bus.reverb.on;
+            let fx_colour = if effects_on { theme.accent } else { theme.dim };
+            if ui.add(egui::Button::new(RichText::new("FX").color(fx_colour).small())).clicked() {
+                actions.fx = Some(Strip::Bus(id));
+            }
+            ui.label(RichText::new("return").color(theme.dim).small());
+            let mut gain = bus.gain;
+            ui.spacing_mut().slider_width = layout.gain_width;
+            let slider = ui.add(egui::Slider::new(&mut gain, 0.0..=2.0).show_value(false));
+            if slider.changed() {
+                actions.commands.push(Command::SetBusGain { id, gain });
+            }
+            if slider.drag_stopped() {
+                actions.seal = true;
+            }
+            ui.label(RichText::new(format!("{:.2}", bus.gain)).color(theme.text).monospace());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(RichText::new("remove").color(theme.warning).small()).clicked() {
+                    actions.commands.push(Command::RemoveBus { id });
+                }
+                ui.label(RichText::new("bus").color(theme.accent).small());
             });
         });
     });
