@@ -192,6 +192,8 @@ impl Engine for LiveEngine {
 enum Pending {
     Open(PathBuf),
     New,
+    /// The window's close button, or the system asking the program to quit.
+    Quit,
 }
 
 struct App {
@@ -233,6 +235,8 @@ struct App {
     confirm: Option<Pending>,
     /// The name being typed for Save as, while its window is up.
     naming: Option<String>,
+    /// Closing was agreed to: the next close request goes through.
+    closing: bool,
     /// Where the project was last saved or opened from. `None` until then,
     /// and the first save picks a name.
     project_path: Option<PathBuf>,
@@ -344,6 +348,7 @@ impl App {
             saved_revision: 0,
             confirm: None,
             naming: None,
+            closing: false,
             project_path: None,
             stats,
             _engine: engine,
@@ -516,6 +521,9 @@ impl App {
     fn carry_out_pending(&mut self, pending: Pending) {
         match pending {
             Pending::Open(path) => self.open(&path),
+            // Closed on the next frame, where there is a context to ask with;
+            // the close request that follows is let through.
+            Pending::Quit => self.closing = true,
             Pending::New => {
                 self.studio.replace(Session::new(), &mut self.sources);
                 self.project_path = None;
@@ -723,6 +731,16 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
         self.take_screenshot(&ctx);
+
+        // Closing with changes not saved is asked about, as opening another
+        // project is: a window closed by mistake must not take the work with it.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.closing && self.dirty() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm = Some(Pending::Quit);
+        }
+        if self.closing {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         if self.theme_applied != Some(self.theme) {
             self.themes[self.theme].apply(&ctx);
             self.theme_applied = Some(self.theme);

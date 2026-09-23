@@ -24,6 +24,11 @@ use crate::ui::Actions;
 const KEYS_WIDTH: f32 = 44.0;
 /// Height of the strip along the top holding the clip's name and controls.
 const HEADER_HEIGHT: f32 = 26.0;
+/// Height of the velocity lane under the grid.
+const LANE_HEIGHT: f32 = 56.0;
+/// Width of a velocity bar, however long its note.
+const BAR_WIDTH: f32 = 5.0;
+
 /// How close to a note's right end the pointer must be to stretch it rather
 /// than move it.
 const EDGE: f32 = 6.0;
@@ -162,7 +167,10 @@ pub fn show(ui: &mut Ui, project: &Project, editor: &mut Editor, cx: &Context<'_
     let mut open = true;
     header(ui, project, &placement, clip.name.as_str(), length, cx.theme, actions, &mut open);
 
-    let (rect, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
+    let (whole, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
+    // The velocity lane takes the bottom; the grid and keyboard the rest.
+    let rect = Rect::from_min_max(whole.left_top(), Pos2::new(whole.right(), whole.bottom() - LANE_HEIGHT));
+    let lane = Rect::from_min_max(Pos2::new(whole.left() + KEYS_WIDTH, rect.bottom()), whole.right_bottom());
     let keys = Rect::from_min_max(rect.left_top(), Pos2::new(rect.left() + KEYS_WIDTH, rect.bottom()));
     let grid_rect = Rect::from_min_max(Pos2::new(keys.right(), rect.top()), rect.right_bottom());
     if !editor.framed {
@@ -230,7 +238,71 @@ pub fn show(ui: &mut Ui, project: &Project, editor: &mut Editor, cx: &Context<'_
     }
 
     draw_keys(&painter.with_clip_rect(keys), editor, keys, cx.theme);
+    velocity_lane(ui, editor, lane, clip.id, notes, cx.theme, actions);
     open
+}
+
+/// A velocity from a height in the lane: the top is 127, the bottom 1 — never
+/// 0, which MIDI reads as a note-off.
+pub fn velocity_at(y: f32, height: f32) -> u8 {
+    let fraction = 1.0 - (y / height.max(1.0)).clamp(0.0, 1.0);
+    (fraction * 127.0).round().clamp(1.0, 127.0) as u8
+}
+
+/// One bar per note, as tall as it is loud. Picking a bar up and moving it
+/// sets that note's velocity; one gesture, one undo step, and the note is
+/// heard at its new velocity when let go.
+fn velocity_lane(
+    ui: &Ui,
+    editor: &mut Editor,
+    lane: Rect,
+    clip: ClipId,
+    notes: &std::collections::BTreeMap<NoteId, Note>,
+    theme: &Theme,
+    actions: &mut Actions,
+) {
+    let painter = ui.painter_at(lane);
+    painter.rect_filled(lane, 0.0, theme.panel);
+    painter.line_segment([lane.left_top(), lane.right_top()], Stroke::new(1.0, theme.control));
+    let usable = lane.shrink2(Vec2::new(0.0, 4.0));
+
+    for (id, note) in notes {
+        let x = lane.left() + editor.x_of(note.start.0);
+        if x + BAR_WIDTH < lane.left() || x > lane.right() {
+            continue;
+        }
+        let top = usable.bottom() - f32::from(note.velocity) / 127.0 * usable.height();
+        let bar = Rect::from_min_max(Pos2::new(x, top), Pos2::new(x + BAR_WIDTH, usable.bottom()));
+        let selected = editor.selected == Some(*id);
+        painter.rect_filled(bar, 1.0, if selected { theme.text } else { theme.accent });
+
+        let grab =
+            Rect::from_min_max(Pos2::new(x - 2.0, usable.top()), Pos2::new(x + BAR_WIDTH + 2.0, usable.bottom()));
+        let response = ui.interact(grab, ui.id().with(("velocity", id.0)), Sense::click_and_drag());
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
+        }
+        if (response.dragged() || response.clicked())
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            editor.selected = Some(*id);
+            let velocity = velocity_at(pos.y - usable.top(), usable.height());
+            if velocity != note.velocity {
+                actions.commands.push(Command::SetNote { clip, id: *id, note: Note { velocity, ..*note } });
+            }
+        }
+        if response.drag_stopped() || response.clicked() {
+            actions.seal = true;
+            actions.preview = Some((note.pitch, note.velocity));
+        }
+    }
+    painter.text(
+        lane.left_top() + Vec2::new(4.0, 2.0),
+        Align2::LEFT_TOP,
+        "velocity",
+        FontId::proportional(9.0),
+        theme.dim,
+    );
 }
 
 fn note_rect(editor: &Editor, grid: Rect, note: &Note) -> Rect {
@@ -549,6 +621,15 @@ mod tests {
 
         editor.frame(0, 3_840, std::iter::empty(), Vec2::new(800.0, 240.0));
         assert_eq!(editor.top, 70.0, "an empty clip opens on middle C");
+    }
+
+    #[test]
+    fn a_height_in_the_lane_is_a_velocity_never_zero() {
+        assert_eq!(velocity_at(0.0, 50.0), 127);
+        assert_eq!(velocity_at(50.0, 50.0), 1, "the bottom must not be a note-off");
+        assert_eq!(velocity_at(25.0, 50.0), 64);
+        assert_eq!(velocity_at(-10.0, 50.0), 127);
+        assert_eq!(velocity_at(99.0, 50.0), 1);
     }
 
     #[test]
