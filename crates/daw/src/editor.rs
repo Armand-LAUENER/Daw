@@ -14,7 +14,9 @@
 
 use eframe::egui::{self, Align2, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
 use project_engine::Timing;
-use project_model::{ClipId, Command, Content, Meter, Note, NoteId, PPQ, Placement, PlacementId, Project, Tick};
+use project_model::{
+    ClipId, Command, Content, Meter, Note, NoteId, PPQ, Placement, PlacementId, Project, Tick, TrackId,
+};
 
 use crate::theme::Theme;
 use crate::timeline::snap;
@@ -163,6 +165,8 @@ pub fn show(ui: &mut Ui, project: &Project, editor: &mut Editor, cx: &Context<'_
     let Some(clip) = project.clip(placement.clip) else { return false };
     let Content::Midi { length, notes } = &clip.content else { return false };
     let (length, meter) = (*length, project.meter());
+    // Whose instrument a note is heard with.
+    let track = placement.track;
 
     let mut open = true;
     header(ui, project, &placement, clip.name.as_str(), length, cx.theme, actions, &mut open);
@@ -194,7 +198,7 @@ pub fn show(ui: &mut Ui, project: &Project, editor: &mut Editor, cx: &Context<'_
         let (pointer, pitch) = (editor.tick_at(pos.x - grid_rect.left()), editor.pitch_at(pos.y - grid_rect.top()));
         if let Some(note) = drawn(pointer, pitch, editor.length, grid, length) {
             actions.commands.push(Command::AddNote { clip: clip.id, note });
-            actions.preview = Some((note.pitch, note.velocity));
+            actions.preview = Some((track, note.pitch, note.velocity));
         }
     }
 
@@ -211,7 +215,7 @@ pub fn show(ui: &mut Ui, project: &Project, editor: &mut Editor, cx: &Context<'_
         note_painter.rect_stroke(body, 2.0, outline, StrokeKind::Inside);
 
         let response = ui.interact(body.intersect(grid_rect), ui.id().with(("note", id.0)), Sense::click_and_drag());
-        handle_note(ui, response, editor, clip.id, *id, *note, body, grid_rect, grid, length, actions);
+        handle_note(ui, response, editor, track, clip.id, *id, *note, body, grid_rect, grid, length, actions);
     }
 
     if editor.selected.is_some_and(|id| !notes.contains_key(&id)) {
@@ -238,7 +242,7 @@ pub fn show(ui: &mut Ui, project: &Project, editor: &mut Editor, cx: &Context<'_
     }
 
     draw_keys(&painter.with_clip_rect(keys), editor, keys, cx.theme);
-    velocity_lane(ui, editor, lane, clip.id, notes, cx.theme, actions);
+    velocity_lane(ui, editor, lane, track, clip.id, notes, cx.theme, actions);
     open
 }
 
@@ -252,10 +256,12 @@ pub fn velocity_at(y: f32, height: f32) -> u8 {
 /// One bar per note, as tall as it is loud. Picking a bar up and moving it
 /// sets that note's velocity; one gesture, one undo step, and the note is
 /// heard at its new velocity when let go.
+#[allow(clippy::too_many_arguments)]
 fn velocity_lane(
     ui: &Ui,
     editor: &mut Editor,
     lane: Rect,
+    track: TrackId,
     clip: ClipId,
     notes: &std::collections::BTreeMap<NoteId, Note>,
     theme: &Theme,
@@ -293,7 +299,7 @@ fn velocity_lane(
         }
         if response.drag_stopped() || response.clicked() {
             actions.seal = true;
-            actions.preview = Some((note.pitch, note.velocity));
+            actions.preview = Some((track, note.pitch, note.velocity));
         }
     }
     painter.text(
@@ -370,6 +376,7 @@ fn handle_note(
     ui: &Ui,
     response: egui::Response,
     editor: &mut Editor,
+    track: TrackId,
     clip: ClipId,
     id: NoteId,
     note: Note,
@@ -388,7 +395,7 @@ fn handle_note(
     }
     if response.clicked() || response.drag_started() {
         editor.selected = Some(id);
-        actions.preview = Some((note.pitch, note.velocity));
+        actions.preview = Some((track, note.pitch, note.velocity));
     }
     if response.drag_started()
         && let Some(pos) = response.interact_pointer_pos()
@@ -412,7 +419,7 @@ fn handle_note(
         };
         if changed.pitch != note.pitch {
             // Heard at each new pitch, so a note is placed by ear.
-            actions.preview = Some((changed.pitch, changed.velocity));
+            actions.preview = Some((track, changed.pitch, changed.velocity));
         }
         if changed != note {
             // Every frame the note moves; the history folds them into one

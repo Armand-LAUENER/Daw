@@ -330,3 +330,24 @@ fn the_effects_never_allocate_while_playing_or_being_moved() {
         }
     });
 }
+
+#[test]
+fn a_synth_taking_patches_never_allocates() {
+    // A patch is a small struct of numbers: popping it and handing its
+    // envelope to a voice must not reach for the allocator.
+    let (mut notes, queue) = engine_core::note_channel(64);
+    let (mut patches, patch_queue) = engine_core::patch_channel(8);
+    let envelope = engine_dsp::Adsr::new(0.01, 0.1, 0.7, 0.2, SR);
+    let mut synth =
+        engine_core::Synth::new(4, engine_dsp::Waveform::Saw, &envelope, queue, SR).with_patches(patch_queue);
+    let mut data = vec![0.0f32; MAX_FRAMES * CHANNELS];
+    for (block, shape) in
+        [engine_dsp::Waveform::Sine, engine_dsp::Waveform::Square, engine_dsp::Waveform::Saw].into_iter().enumerate()
+    {
+        patches.send(engine_core::Patch { shape, envelope: engine_dsp::Adsr::new(0.001, 0.05, 0.5, 0.1, SR) });
+        notes.send(engine_core::NoteEvent::on(60 + block as u8, 1.0, 0)).unwrap();
+        assert_no_alloc(|| {
+            synth.process(&mut AudioBuffer::new(&mut data, CHANNELS));
+        });
+    }
+}

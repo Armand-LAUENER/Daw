@@ -1,4 +1,5 @@
 use engine_dsp::{Adsr, Osc, Waveform};
+use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::{AudioBuffer, Node, NoteAction, NoteQueue, pitch_to_hz};
 
@@ -6,6 +7,9 @@ use crate::{AudioBuffer, Node, NoteAction, NoteQueue, pitch_to_hz};
 struct Voice {
     osc: Osc,
     env: Adsr,
+    /// Its own, taken when it starts, so a patch arriving later changes the
+    /// notes after it and not this one.
+    shape: Waveform,
     pitch: u8,
     velocity: f32,
     /// When this voice was last started, so the oldest can be identified.
@@ -30,6 +34,9 @@ struct Voice {
 pub struct Synth {
     voices: Voices,
     notes: NoteQueue,
+    /// A new sound for the notes that follow, when the synth plays for more
+    /// than one instrument — as the editor's auditioner does.
+    patches: Option<PatchQueue>,
     /// Where the next block starts on the engine's timeline.
     frame: u64,
 }
@@ -37,7 +44,15 @@ pub struct Synth {
 impl Synth {
     /// `envelope` is the shape every voice takes; `voices` is the polyphony.
     pub fn new(voices: usize, shape: Waveform, envelope: &Adsr, notes: NoteQueue, sample_rate: f32) -> Self {
-        Self { voices: Voices::new(voices, shape, envelope, sample_rate), notes, frame: 0 }
+        Self { voices: Voices::new(voices, shape, envelope, sample_rate), notes, patches: None, frame: 0 }
+    }
+
+    /// Takes new sounds from `patches`, each for the notes started after it
+    /// arrives. Notes already sounding keep theirs, so a change never cuts
+    /// one short or reshapes its tail.
+    pub fn with_patches(mut self, patches: PatchQueue) -> Self {
+        self.patches = Some(patches);
+        self
     }
 
     /// How many voices are sounding, for metering and for tests.
@@ -50,6 +65,38 @@ impl Synth {
     }
 }
 
+/// A synth's sound: the wave its voices play and the envelope they follow.
+#[derive(Debug, Clone)]
+pub struct Patch {
+    pub shape: Waveform,
+    pub envelope: Adsr,
+}
+
+/// The control side of a patch lane.
+pub struct PatchSender {
+    tx: Producer<Patch>,
+}
+
+impl PatchSender {
+    /// False when the queue is full: the audio thread has not run for a while,
+    /// and the note will be heard with the sound before.
+    pub fn send(&mut self, patch: Patch) -> bool {
+        self.tx.push(patch).is_ok()
+    }
+}
+
+/// The audio thread's side of a patch lane.
+pub struct PatchQueue {
+    rx: Consumer<Patch>,
+}
+
+/// Opens a one-way lane for patches. Pushing or popping one moves a small
+/// struct of numbers; nothing is allocated on either side.
+pub fn patch_channel(capacity: usize) -> (PatchSender, PatchQueue) {
+    let (tx, rx) = RingBuffer::new(capacity);
+    (PatchSender { tx }, PatchQueue { rx })
+}
+
 /// A fixed pool of voices and the rules for sharing them.
 ///
 /// Shared by everything that turns notes into sound — the live [`Synth`] and
@@ -58,6 +105,8 @@ impl Synth {
 pub(crate) struct Voices {
     voices: Vec<Voice>,
     shape: Waveform,
+    /// The envelope a voice takes when it starts a new note.
+    envelope: Adsr,
     /// Counts note starts, which is all "oldest" has to mean here.
     age: u64,
 }
@@ -65,9 +114,22 @@ pub(crate) struct Voices {
 impl Voices {
     pub(crate) fn new(voices: usize, shape: Waveform, envelope: &Adsr, sample_rate: f32) -> Self {
         let voices = (0..voices.max(1))
-            .map(|_| Voice { osc: Osc::new(sample_rate), env: envelope.clone(), pitch: 0, velocity: 0.0, started: 0 })
+            .map(|_| Voice {
+                osc: Osc::new(sample_rate),
+                env: envelope.clone(),
+                shape,
+                pitch: 0,
+                velocity: 0.0,
+                started: 0,
+            })
             .collect();
-        Self { voices, shape, age: 0 }
+        Self { voices, shape, envelope: envelope.clone(), age: 0 }
+    }
+
+    /// A new sound for the notes that start from now on.
+    pub(crate) fn set_patch(&mut self, patch: Patch) {
+        self.shape = patch.shape;
+        self.envelope = patch.envelope;
     }
 
     pub(crate) fn active(&self) -> usize {
@@ -93,7 +155,7 @@ impl Voices {
                 continue;
             }
             let level = voice.env.next_value() * voice.velocity;
-            mixed += voice.osc.next_sample(pitch_to_hz(voice.pitch), self.shape) * level;
+            mixed += voice.osc.next_sample(pitch_to_hz(voice.pitch), voice.shape) * level;
         }
         mixed
     }
@@ -119,6 +181,13 @@ impl Voices {
         self.age += 1;
         let index = self.pick(pitch);
         let voice = &mut self.voices[index];
+        if voice.pitch != pitch || !voice.env.is_active() {
+            // A voice taken for a new note starts it with the current
+            // envelope; retriggering a pitch still sounding keeps the one it
+            // has, so a repeated note does not change shape halfway.
+            voice.env = self.envelope.clone();
+            voice.shape = self.shape;
+        }
         if voice.pitch != pitch {
             // A voice taken from another note starts that note's waveform from
             // the beginning; retriggering the same pitch keeps its phase, so a
@@ -168,6 +237,13 @@ impl Voices {
 impl Node for Synth {
     fn process(&mut self, buffer: &mut AudioBuffer<'_>) {
         let (frames, channels) = (buffer.frames(), buffer.channels());
+        // A patch sent before a note arrives before it: taken at the top of
+        // the block, it is in place for every note in the block.
+        if let Some(patches) = &mut self.patches {
+            while let Ok(patch) = patches.rx.pop() {
+                self.voices.set_patch(patch);
+            }
+        }
 
         for frame in 0..frames {
             let at = self.frame + frame as u64;
@@ -343,6 +419,48 @@ mod tests {
         synth.reset();
         assert_eq!(synth.active_voices(), 0);
         assert!(render(&mut synth, 256, 0).iter().all(|s| *s == 0.0), "a queued note survived the reset");
+    }
+
+    #[test]
+    fn a_patch_changes_the_notes_after_it_not_the_one_sounding() {
+        // A slow attack, sent as a patch: the next note swells in rather than
+        // arriving at once, while a note already held keeps its instant one.
+        let (mut sender, queue) = note_channel(16);
+        let (mut patches, patch_queue) = patch_channel(4);
+        let mut synth = Synth::new(4, Waveform::Saw, &instant(), queue, SR).with_patches(patch_queue);
+
+        sender.send(NoteEvent::on(48, 1.0, 0)).unwrap();
+        render(&mut synth, 64, 0);
+        let slow = Adsr::new(0.5, 0.0, 1.0, 0.0, SR);
+        assert!(patches.send(Patch { shape: Waveform::Saw, envelope: slow }));
+        sender.send(NoteEvent::off(48, 64)).unwrap();
+        sender.send(NoteEvent::on(72, 1.0, 64)).unwrap();
+        let out = render(&mut synth, 256, 64);
+        // Half a second of attack: a few milliseconds in, barely audible.
+        let peak = out[16..].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak < 0.05, "the new note ignored its patch: peak {peak}");
+
+        // And a note sounding when a patch arrives is left as it was.
+        let (mut sender, queue) = note_channel(16);
+        let (mut patches, patch_queue) = patch_channel(4);
+        let mut synth = Synth::new(4, Waveform::Saw, &instant(), queue, SR).with_patches(patch_queue);
+        sender.send(NoteEvent::on(48, 1.0, 0)).unwrap();
+        render(&mut synth, 64, 0);
+        patches.send(Patch { shape: Waveform::Saw, envelope: Adsr::new(0.5, 0.0, 1.0, 0.0, SR) });
+        let held = render(&mut synth, 256, 64);
+        assert!(held.iter().any(|s| s.abs() > 0.3), "a patch reshaped a note already sounding");
+
+        // Its wave too: a saw held through a patch to a sine is still a saw,
+        // which a sine is not — a saw's samples jump at every cycle.
+        let (mut sender, queue) = note_channel(16);
+        let (mut patches, patch_queue) = patch_channel(4);
+        let mut synth = Synth::new(4, Waveform::Saw, &instant(), queue, SR).with_patches(patch_queue);
+        sender.send(NoteEvent::on(60, 1.0, 0)).unwrap();
+        render(&mut synth, 64, 0);
+        patches.send(Patch { shape: Waveform::Sine, envelope: instant() });
+        let out = render(&mut synth, 2_048, 64);
+        let largest_step = out.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(largest_step > 0.5, "the held saw turned into something smooth: step {largest_step}");
     }
 
     #[test]

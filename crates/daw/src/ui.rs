@@ -35,7 +35,7 @@ pub struct Actions {
     pub keys_to_editor: Option<bool>,
     /// A note to hear, as pitch and velocity: one just placed, picked up, or
     /// moved to another pitch in the editor.
-    pub preview: Option<(u8, u8)>,
+    pub preview: Option<(TrackId, u8, u8)>,
     /// A track whose equaliser was asked for.
     pub eq: Option<TrackId>,
     /// A track whose effects were asked for.

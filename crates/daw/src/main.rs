@@ -24,9 +24,9 @@ use std::sync::Arc;
 
 use eframe::egui;
 use engine_core::{
-    AudioBuffer, AutomationSender, Clock, Graph, GraphSwapper, Node, NoteAction, NoteEvent, NoteSender, ParamId,
-    Sequencer, Synth, TransportCommand, TransportControl, automation_channel, graph_channel, note_channel,
-    transport_channel,
+    AudioBuffer, AutomationSender, Clock, Graph, GraphSwapper, Node, NoteAction, NoteEvent, NoteSender, ParamId, Patch,
+    PatchSender, Sequencer, Synth, TransportCommand, TransportControl, automation_channel, graph_channel, note_channel,
+    patch_channel, transport_channel,
 };
 use engine_dsp::{Adsr, SineOsc, Waveform};
 use engine_io::{AudioEngine, EngineOptions, Stats, default_output_config, map_frames};
@@ -133,9 +133,6 @@ fn tone_for(track: &Track, sample_rate: f32) -> Box<dyn Node> {
 
 /// How many notes a MIDI track can hold at once before it steals a voice.
 const INSTRUMENT_VOICES: usize = 12;
-/// Each note's share of full scale at the highest velocity, so a full chord
-/// of voices stays near the top rather than far past it.
-const INSTRUMENT_LEVEL: f32 = 0.2;
 
 /// What a MIDI track plays through until tracks can choose an instrument: a
 /// band-limited saw with a short attack and a soft release.
@@ -238,6 +235,10 @@ struct App {
     transport: TransportControl,
     /// Notes heard while editing.
     preview: NoteSender,
+    /// Sounds for the notes heard, one per track's instrument.
+    patches: PatchSender,
+    /// The instrument last sent, so a patch is only sent when it changes.
+    patched: Option<project_model::Instrument>,
     /// When each note being heard is let go.
     releases: Vec<(std::time::Instant, u8)>,
     /// The last thing that went wrong, for the strip along the bottom.
@@ -289,8 +290,12 @@ impl App {
         // the graph, so a rebuild never cuts one off, and with the tracks'
         // instrument, so a note sounds as it will when played.
         let (preview, preview_notes) = note_channel(64);
+        // Each note is heard with its track's instrument: the patch is sent
+        // ahead of the note, and the synth takes it for the notes after it.
+        let (patches, patch_queue) = patch_channel(16);
         let mut auditioner =
-            Synth::new(4, INSTRUMENT_SHAPE, &instrument_envelope(sample_rate), preview_notes, sample_rate);
+            Synth::new(4, INSTRUMENT_SHAPE, &instrument_envelope(sample_rate), preview_notes, sample_rate)
+                .with_patches(patch_queue);
         let mut auditioned = vec![0.0f32; MAX_GRAPH_FRAMES * GRAPH_CHANNELS];
         let mut frame = 0u64;
         let (transport, mut timeline) = transport_channel(sample_rate, 64);
@@ -357,6 +362,8 @@ impl App {
             sources,
             transport,
             preview,
+            patches,
+            patched: None,
             releases: Vec::new(),
             trouble: None,
             saved_revision: 0,
@@ -666,8 +673,23 @@ impl App {
         if actions.new_project {
             self.request(Pending::New);
         }
-        if let Some((pitch, velocity)) = actions.preview {
-            let level = f32::from(velocity) / 127.0 * INSTRUMENT_LEVEL;
+        if let Some((track, pitch, velocity)) = actions.preview {
+            // The track's own instrument, or the default for a track gone.
+            let instrument = self.studio.project().track(track).map(|t| t.instrument).unwrap_or_default();
+            if self.patched != Some(instrument) {
+                let envelope = Adsr::new(
+                    instrument.attack / 1000.0,
+                    instrument.decay / 1000.0,
+                    instrument.sustain,
+                    instrument.release / 1000.0,
+                    self.sources.sample_rate,
+                );
+                // Sent before the note, so it is in place when the note is.
+                if self.patches.send(Patch { shape: wave(instrument.wave), envelope }) {
+                    self.patched = Some(instrument);
+                }
+            }
+            let level = f32::from(velocity) / 127.0 * instrument.level;
             // Frame zero is always due: the note plays at the next block.
             if self.preview.send(NoteEvent::on(pitch, level, 0)).is_ok() {
                 self.releases.push((std::time::Instant::now() + PREVIEW, pitch));
