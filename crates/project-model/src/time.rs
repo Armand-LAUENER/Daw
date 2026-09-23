@@ -130,9 +130,103 @@ impl fmt::Display for Meter {
     }
 }
 
-/// Whether a tempo and a meter read from a file are ones this build accepts.
-pub(crate) fn valid(tempo: Tempo, meter: Meter) -> bool {
-    Tempo::from_millis(tempo.0).is_some() && meter.is_valid()
+/// A tempo taking effect at a tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TempoChange {
+    pub at: Tick,
+    pub tempo: Tempo,
+}
+
+/// How the tempo moves through a project: a list of changes, each holding
+/// until the next. Steps, not ramps.
+///
+/// The first change is always at tick 0, so every tick has a tempo; the
+/// changes are in order and no two share a tick. A change is named by its
+/// place in the list, which dragging it never alters — it stops at its
+/// neighbours — so a drag stays one gesture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TempoMap(Vec<TempoChange>);
+
+impl TempoMap {
+    /// One tempo from the start.
+    pub fn constant(tempo: Tempo) -> Self {
+        Self(vec![TempoChange { at: Tick(0), tempo }])
+    }
+
+    pub fn changes(&self) -> &[TempoChange] {
+        &self.0
+    }
+
+    /// The tempo the project starts at.
+    pub fn start(&self) -> Tempo {
+        self.0[0].tempo
+    }
+
+    /// The tempo in effect at a tick.
+    pub fn tempo_at(&self, tick: Tick) -> Tempo {
+        let index = self.0.partition_point(|c| c.at <= tick).saturating_sub(1);
+        self.0[index].tempo
+    }
+
+    /// Whether this map keeps its promises: a change at 0, in order, no two
+    /// at one tick, every tempo in range.
+    pub fn is_valid(&self) -> bool {
+        self.0.first().is_some_and(|c| c.at == Tick(0))
+            && self.0.windows(2).all(|w| w[0].at < w[1].at)
+            && self.0.iter().all(|c| Tempo::from_millis(c.tempo.millis()).is_some())
+    }
+
+    pub(crate) fn with_tempo(&self, index: usize, tempo: Tempo) -> Option<Self> {
+        let mut changes = self.0.clone();
+        changes.get_mut(index)?.tempo = tempo;
+        Some(Self(changes))
+    }
+
+    /// A new change at `at`, or `None` when there is one there already — it
+    /// should be changed instead — or `at` is the start.
+    pub(crate) fn with_change(&self, at: Tick, tempo: Tempo) -> Option<Self> {
+        if at == Tick(0) || self.0.iter().any(|c| c.at == at) {
+            return None;
+        }
+        let mut changes = self.0.clone();
+        let index = changes.partition_point(|c| c.at < at);
+        changes.insert(index, TempoChange { at, tempo });
+        Some(Self(changes))
+    }
+
+    /// A change moved to `to`, kept strictly between its neighbours so the
+    /// order — and every change's place in it — holds. The first cannot move.
+    pub(crate) fn with_moved(&self, index: usize, to: Tick) -> Option<Self> {
+        if index == 0 || index >= self.0.len() {
+            return None;
+        }
+        let low = self.0[index - 1].at.0 + 1;
+        let high = self.0.get(index + 1).map_or(u64::MAX, |c| c.at.0 - 1);
+        let mut changes = self.0.clone();
+        changes[index].at = Tick(to.0.clamp(low, high));
+        Some(Self(changes))
+    }
+
+    /// Without a change. The first cannot go: something has to hold at 0.
+    pub(crate) fn without(&self, index: usize) -> Option<Self> {
+        if index == 0 || index >= self.0.len() {
+            return None;
+        }
+        let mut changes = self.0.clone();
+        changes.remove(index);
+        Some(Self(changes))
+    }
+}
+
+impl Default for TempoMap {
+    fn default() -> Self {
+        Self::constant(Tempo::default())
+    }
+}
+
+pub(crate) fn meter_valid(meter: Meter) -> bool {
+    meter.is_valid()
 }
 
 #[cfg(test)]
@@ -156,6 +250,50 @@ mod tests {
         assert_eq!(Meter::default().bar_length(), Tick(3_840));
         assert_eq!(Meter::new(4, 3), None, "a beat of a third of a whole note does not exist");
         assert_eq!(Meter::new(0, 4), None);
+    }
+
+    fn map(changes: &[(u64, f64)]) -> TempoMap {
+        TempoMap(
+            changes
+                .iter()
+                .map(|&(at, bpm)| TempoChange { at: Tick(at), tempo: Tempo::from_bpm(bpm).unwrap() })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_tick_takes_the_tempo_of_the_last_change_before_it() {
+        let m = map(&[(0, 120.0), (3_840, 90.0), (7_680, 140.0)]);
+        assert_eq!(m.tempo_at(Tick(0)).bpm(), 120.0);
+        assert_eq!(m.tempo_at(Tick(3_839)).bpm(), 120.0);
+        assert_eq!(m.tempo_at(Tick(3_840)).bpm(), 90.0, "a change takes effect on its own tick");
+        assert_eq!(m.tempo_at(Tick(99_999)).bpm(), 140.0);
+        assert!(m.is_valid());
+    }
+
+    #[test]
+    fn a_map_keeps_its_promises_through_every_edit() {
+        let m = map(&[(0, 120.0), (3_840, 90.0), (7_680, 140.0)]);
+        // Added in order, refused on an occupied tick and at the start.
+        let added = m.with_change(Tick(1_000), Tempo::default()).unwrap();
+        assert!(added.is_valid());
+        assert_eq!(added.changes()[1].at, Tick(1_000));
+        assert!(m.with_change(Tick(3_840), Tempo::default()).is_none());
+        assert!(m.with_change(Tick(0), Tempo::default()).is_none());
+        // Moved no further than its neighbours allow.
+        assert_eq!(m.with_moved(1, Tick(99_999)).unwrap().changes()[1].at, Tick(7_679));
+        assert_eq!(m.with_moved(1, Tick(0)).unwrap().changes()[1].at, Tick(1));
+        assert!(m.with_moved(0, Tick(10)).is_none(), "the start moved");
+        // Removed, except the start.
+        assert_eq!(m.without(1).unwrap().changes().len(), 2);
+        assert!(m.without(0).is_none());
+    }
+
+    #[test]
+    fn a_map_that_breaks_a_promise_is_invalid() {
+        assert!(!map(&[(10, 120.0)]).is_valid(), "no tempo at the start");
+        assert!(!map(&[(0, 120.0), (500, 90.0), (500, 100.0)]).is_valid(), "two changes on one tick");
+        assert!(!map(&[(0, 120.0), (900, 90.0), (500, 100.0)]).is_valid(), "out of order");
     }
 
     #[test]

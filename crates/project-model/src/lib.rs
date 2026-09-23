@@ -45,7 +45,7 @@ pub use eq::{BANDS, BandShape, EqBand, default_eq};
 pub use file::FileError;
 pub use history::Session;
 pub use instrument::{Instrument, Wave};
-pub use time::{Meter, PPQ, Tempo, Tick};
+pub use time::{Meter, PPQ, Tempo, TempoChange, TempoMap, Tick};
 
 /// Which version of the file format this build writes.
 ///
@@ -53,7 +53,7 @@ pub use time::{Meter, PPQ, Tempo, Tick};
 /// written. Adding a version to a format that already has files in the wild
 /// means guessing what the unversioned ones were, and that guess is always
 /// wrong for somebody.
-pub const FORMAT_VERSION: u32 = 8;
+pub const FORMAT_VERSION: u32 = 9;
 
 /// Identifies a track for the life of a project.
 ///
@@ -133,7 +133,7 @@ impl Track {
 /// tables and the order that indexes them cannot drift apart.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
-    tempo: Tempo,
+    tempo_map: TempoMap,
     meter: Meter,
     master_gain: f32,
     /// The mixer's order. Every entry names a track in `tracks`, and every
@@ -155,7 +155,7 @@ pub struct Project {
 impl Default for Project {
     fn default() -> Self {
         Self {
-            tempo: Tempo::default(),
+            tempo_map: TempoMap::default(),
             meter: Meter::default(),
             master_gain: 1.0,
             track_order: Vec::new(),
@@ -174,10 +174,14 @@ impl Project {
         Self::default()
     }
 
-    /// One tempo for the whole project. A map of changes comes with the
-    /// timeline; until then there is nothing to place a change on.
+    /// The tempo the project starts at.
     pub fn tempo(&self) -> Tempo {
-        self.tempo
+        self.tempo_map.start()
+    }
+
+    /// How the tempo moves through the project.
+    pub fn tempo_map(&self) -> &TempoMap {
+        &self.tempo_map
     }
 
     pub fn meter(&self) -> Meter {
@@ -302,7 +306,7 @@ impl Project {
     /// edited — and for the tests that prove no sequence of commands breaks
     /// them.
     pub fn check(&self) -> Result<(), Invalid> {
-        if !time::valid(self.tempo, self.meter) {
+        if !(self.tempo_map.is_valid() && time::meter_valid(self.meter)) {
             return Err(Invalid::OutOfRange("the tempo or time signature"));
         }
         if !self.master_gain.is_finite() {

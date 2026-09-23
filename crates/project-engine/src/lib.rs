@@ -153,7 +153,7 @@ pub fn compile(
     let bus = SoloBus::new();
     let master = builder.add(Box::new(Gain::new(project.master_gain(), sample_rate)));
     let mut tracks = Vec::with_capacity(project.track_count());
-    let timing = Timing::new(project.tempo(), sample_rate as u32);
+    let timing = Timing::new(project.tempo_map(), sample_rate as u32);
 
     // Buses first, so tracks have somewhere to send. Each: a summing point
     // for its sends, its effects, its fader and mute, into the master. No
@@ -164,7 +164,7 @@ pub fn compile(
     for bus in project.buses() {
         let input = builder.add(Box::new(Gain::new(1.0, sample_rate)));
         let (last, [comp, delay, reverb], meter) =
-            effect_chain(&mut builder, input, &bus.comp, &bus.delay, &bus.reverb, true, timing, channels, sample_rate);
+            effect_chain(&mut builder, input, &bus.comp, &bus.delay, &bus.reverb, true, &timing, channels, sample_rate);
         if let Some(meter) = meter {
             meters.push((Metered::Bus(bus.id), meter));
         }
@@ -204,7 +204,7 @@ pub fn compile(
             &track.delay,
             &track.reverb,
             false,
-            timing,
+            &timing,
             channels,
             sample_rate,
         );
@@ -271,7 +271,7 @@ fn effect_chain(
     delay: &project_model::DelaySettings,
     reverb: &project_model::ReverbSettings,
     wet_only: bool,
-    timing: Timing,
+    timing: &Timing,
     channels: usize,
     sample_rate: f32,
 ) -> (NodeId, [Option<NodeId>; 3], Option<Arc<ReductionMeter>>) {
@@ -280,7 +280,9 @@ fn effect_chain(
         builder.add(Box::new(Compress::new(comp_settings(comp), sample_rate).with_meter(Arc::clone(meter))))
     });
     let delay = delay.on.then(|| {
-        let time = timing.frame_of(delay.time) as f32;
+        // At the tempo the project starts at; a delay does not follow tempo
+        // changes during the song.
+        let time = timing.frames_for(delay.time, project_model::Tick(0)) as f32;
         let echo = Echo::new(channels, time, delay.feedback, delay.mix, sample_rate);
         builder.add(Box::new(if wet_only { echo.wet_only() } else { echo }))
     });
@@ -325,9 +327,9 @@ fn comp_params(node: NodeId, c: &project_model::CompSettings) -> Vec<(ParamId, f
     ]
 }
 
-fn delay_params(node: NodeId, d: &project_model::DelaySettings, timing: Option<Timing>) -> Vec<(ParamId, f32)> {
+fn delay_params(node: NodeId, d: &project_model::DelaySettings, timing: Option<&Timing>) -> Vec<(ParamId, f32)> {
     let p = |which| ParamId::new(node, which);
-    let time = timing.map_or(0.0, |t| t.frame_of(d.time) as f32);
+    let time = timing.map_or(0.0, |t| t.frames_for(d.time, project_model::Tick(0)) as f32);
     vec![(p(Echo::PARAM_TIME), time), (p(Echo::PARAM_FEEDBACK), d.feedback), (p(Echo::PARAM_MIX), d.mix)]
 }
 
@@ -416,6 +418,10 @@ pub fn route(bindings: &Bindings, command: &Command) -> Change {
         | Command::RemoveNote { .. }
         // Every clip's start is a tick; a new tempo puts it on another frame.
         | Command::SetTempo { .. }
+        | Command::AddTempoChange { .. }
+        | Command::SetTempoChange { .. }
+        | Command::MoveTempoChange { .. }
+        | Command::RemoveTempoChange { .. }
         // A different instrument is a different synth.
         | Command::SetInstrument { .. } => Change::Rebuild,
         // Names, and a meter that only changes how bars are counted.
@@ -447,7 +453,7 @@ pub fn route(bindings: &Bindings, command: &Command) -> Change {
         // The time is sent in ticks' worth of frames at the tempo the graph
         // was built for; a new tempo rebuilds, and recomputes it.
         Command::SetDelay { track, value } => {
-            effect(bindings, *track, value.on, |b| b.delay, |node| delay_params(node, value, bindings.timing))
+            effect(bindings, *track, value.on, |b| b.delay, |node| delay_params(node, value, bindings.timing.as_ref()))
         }
         Command::SetReverb { track, value } => {
             effect(bindings, *track, value.on, |b| b.reverb, |node| reverb_params(node, value))
@@ -472,7 +478,7 @@ pub fn route(bindings: &Bindings, command: &Command) -> Change {
                     params.extend(comp_params(node, comp));
                 }
                 if let Some(node) = b.delay {
-                    params.extend(delay_params(node, delay, bindings.timing));
+                    params.extend(delay_params(node, delay, bindings.timing.as_ref()));
                 }
                 if let Some(node) = b.reverb {
                     params.extend(reverb_params(node, reverb));

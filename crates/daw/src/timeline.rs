@@ -29,6 +29,8 @@ use crate::ui::Actions;
 const HEADER_WIDTH: f32 = 140.0;
 /// Height of the bar ruler along the top.
 const RULER_HEIGHT: f32 = 22.0;
+/// Height of the tempo lane, under the ruler.
+const TEMPO_HEIGHT: f32 = 18.0;
 const ROW_HEIGHT: f32 = 64.0;
 /// The zoom range, in pixels per beat.
 const MIN_ZOOM: f32 = 4.0;
@@ -202,7 +204,7 @@ pub fn trim_audio_start(
     length: u64,
     pointer: Tick,
     min: u64,
-    timing: Timing,
+    timing: &Timing,
 ) -> (Tick, u64, u64) {
     let at = timing.frame_of(start);
     let end = at + length;
@@ -229,7 +231,7 @@ pub fn trim_audio_start(
 fn length_of(
     project: &Project,
     placement: &Placement,
-    timing: Timing,
+    timing: &Timing,
     peaks: &dyn Fn(AssetId) -> Option<Arc<Peaks>>,
 ) -> u64 {
     let Some(clip) = project.clip(placement.clip) else { return 0 };
@@ -266,8 +268,9 @@ pub fn show(ui: &mut Ui, project: &Project, view: &mut View, cx: &Context<'_>, a
         Pos2::new(rect.left() + HEADER_WIDTH, rect.top()),
         Pos2::new(rect.right(), rect.top() + RULER_HEIGHT),
     );
-    let lanes = Rect::from_min_max(Pos2::new(ruler.left(), ruler.bottom()), rect.right_bottom());
-    let headers = Rect::from_min_max(Pos2::new(rect.left(), ruler.bottom()), Pos2::new(ruler.left(), rect.bottom()));
+    let tempo = Rect::from_min_max(ruler.left_bottom(), Pos2::new(ruler.right(), ruler.bottom() + TEMPO_HEIGHT));
+    let lanes = Rect::from_min_max(Pos2::new(ruler.left(), tempo.bottom()), rect.right_bottom());
+    let headers = Rect::from_min_max(Pos2::new(rect.left(), tempo.bottom()), Pos2::new(ruler.left(), rect.bottom()));
     let tracks: Vec<TrackId> = project.tracks().map(|t| t.id).collect();
     let meter = project.meter();
 
@@ -313,7 +316,7 @@ pub fn show(ui: &mut Ui, project: &Project, view: &mut View, cx: &Context<'_>, a
     let clip_painter = painter.with_clip_rect(lanes);
     for placement in project.placements() {
         let Some(row) = tracks.iter().position(|t| *t == placement.track) else { continue };
-        let length = length_of(project, placement, cx.timing, cx.peaks);
+        let length = length_of(project, placement, &cx.timing, cx.peaks);
         let x = lanes.left() + view.x_of(placement.start);
         let body = Rect::from_min_size(
             Pos2::new(x, row_top(row) + 3.0),
@@ -346,6 +349,7 @@ pub fn show(ui: &mut Ui, project: &Project, view: &mut View, cx: &Context<'_>, a
     }
 
     draw_ruler(ui, &painter, view, ruler, meter, cx, actions);
+    tempo_lane(ui, &painter, project, view, tempo, cx.theme, actions);
     draw_headers(&painter.with_clip_rect(headers), project, headers, &tracks, row_top, theme);
 }
 
@@ -591,7 +595,7 @@ fn handle_clip(
                     let (offset, length) = audio_part(placement, file, rate);
                     let min = cx.timing.frame_of(Tick(grid.unwrap_or(1)));
                     let (start, offset, length) =
-                        trim_audio_start(placement.start, offset, length, snap(pointer, grid), min, cx.timing);
+                        trim_audio_start(placement.start, offset, length, snap(pointer, grid), min, &cx.timing);
                     let audio = audio_window(offset, length, file, rate);
                     if start != placement.start || audio != placement.audio {
                         actions.commands.push(Command::TrimPlacement { id, start, window: None, audio });
@@ -663,7 +667,7 @@ fn keyboard(ui: &Ui, project: &Project, view: &mut View, cx: &Context<'_>, actio
         view.selected = None;
     }
     if duplicate {
-        let start = Tick(placement.start.0 + length_of(project, placement, cx.timing, cx.peaks));
+        let start = Tick(placement.start.0 + length_of(project, placement, &cx.timing, cx.peaks));
         actions.commands.push(Command::DuplicatePlacement { id, track: placement.track, start, linked: false });
     }
 }
@@ -709,6 +713,87 @@ fn draw_ruler(
         let tick = snap(view.tick_at(pos.x - ruler.left()), None);
         actions.transport = Some(TransportCommand::Seek(cx.timing.frame_of(tick)));
     }
+}
+
+/// The tempo map, as markers along a lane under the ruler: each change shows
+/// its tempo from where it takes effect. A double click adds one on the bar;
+/// a marker drags along the beats; its menu sets its tempo or removes it.
+fn tempo_lane(
+    ui: &Ui,
+    painter: &egui::Painter,
+    project: &Project,
+    view: &View,
+    lane: Rect,
+    theme: &Theme,
+    actions: &mut Actions,
+) {
+    let meter = project.meter();
+    painter.rect_filled(lane, 0.0, theme.background);
+    let lane_painter = painter.with_clip_rect(lane);
+
+    let background = ui.interact(lane, ui.id().with("tempo-lane"), Sense::click());
+    if background.double_clicked()
+        && let Some(pos) = background.interact_pointer_pos()
+    {
+        let at = snap(view.tick_at(pos.x - lane.left()), Some(meter.bar_length().0));
+        let tempo = project.tempo_map().tempo_at(at);
+        actions.commands.push(Command::AddTempoChange { at, tempo });
+    }
+
+    for (index, change) in project.tempo_map().changes().iter().enumerate() {
+        let x = lane.left() + view.x_of(change.at);
+        let label = format!("{:.1}", change.tempo.bpm());
+        let galley = painter.layout_no_wrap(label, FontId::proportional(10.0), theme.text);
+        let flag =
+            Rect::from_min_size(Pos2::new(x, lane.top() + 2.0), Vec2::new(galley.size().x + 8.0, lane.height() - 4.0));
+        if flag.right() < lane.left() || flag.left() > lane.right() {
+            continue;
+        }
+        lane_painter.rect_filled(flag, 2.0, theme.control);
+        lane_painter
+            .line_segment([Pos2::new(x, lane.top()), Pos2::new(x, lane.bottom())], Stroke::new(1.5, theme.soloed));
+        lane_painter.galley(flag.left_top() + Vec2::new(5.0, 1.0), galley, theme.text);
+
+        let response = ui.interact(flag.intersect(lane), ui.id().with(("tempo", index)), Sense::click_and_drag());
+        // The first holds the start and does not move.
+        if index > 0
+            && response.dragged()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let grid = (!ui.input(|i| i.modifiers.alt)).then(|| meter.beat_length().0);
+            let to = snap(view.tick_at(pos.x - lane.left()), grid);
+            if to != change.at {
+                actions.commands.push(Command::MoveTempoChange { index, to });
+            }
+        }
+        if response.drag_stopped() {
+            actions.seal = true;
+        }
+        response.context_menu(|ui| {
+            let mut bpm = change.tempo.bpm();
+            let range = project_model::Tempo::MIN.bpm()..=project_model::Tempo::MAX.bpm();
+            let field = ui.add(egui::DragValue::new(&mut bpm).range(range).speed(0.1).max_decimals(3).suffix(" bpm"));
+            if field.changed()
+                && let Some(tempo) = project_model::Tempo::from_bpm(bpm)
+            {
+                actions.commands.push(Command::SetTempoChange { index, tempo });
+            }
+            if field.drag_stopped() || field.lost_focus() {
+                actions.seal = true;
+            }
+            if index > 0 && ui.button("Remove").clicked() {
+                actions.commands.push(Command::RemoveTempoChange { index });
+                ui.close();
+            }
+        });
+    }
+    painter.text(
+        lane.left_top() - Vec2::new(HEADER_WIDTH - 8.0, -3.0),
+        Align2::LEFT_TOP,
+        "tempo",
+        FontId::proportional(10.0),
+        theme.dim,
+    );
 }
 
 fn draw_headers(
@@ -835,7 +920,7 @@ mod tests {
 
     fn at_120() -> Timing {
         // A beat is 24 000 frames, a tick 25.
-        Timing::new(project_model::Tempo::default(), 48_000)
+        Timing::constant(project_model::Tempo::default(), 48_000)
     }
 
     #[test]
@@ -852,13 +937,13 @@ mod tests {
     fn trimming_an_audio_clips_front_keeps_the_sound_where_it_was() {
         let timing = at_120();
         // The whole file at bar 2 (frame 96 000); the front dragged a beat on.
-        let (start, offset, length) = trim_audio_start(Tick(3_840), 0, 192_000, Tick(4_800), 1, timing);
+        let (start, offset, length) = trim_audio_start(Tick(3_840), 0, 192_000, Tick(4_800), 1, &timing);
         assert_eq!((start, offset, length), (Tick(4_800), 24_000, 168_000));
         // What was at file frame 24 000 still plays at timeline frame 120 000.
         assert_eq!(timing.frame_of(start) - offset, 96_000);
 
         // Pulled back before the file's own start: it stops at the file's start.
-        let (start, offset, length) = trim_audio_start(Tick(4_800), 24_000, 168_000, Tick(0), 1, timing);
+        let (start, offset, length) = trim_audio_start(Tick(4_800), 24_000, 168_000, Tick(0), 1, &timing);
         assert_eq!((start, offset, length), (Tick(3_840), 0, 192_000));
     }
 
@@ -866,11 +951,11 @@ mod tests {
     fn a_front_trim_never_slides_the_sound_by_a_rounding() {
         // At 44.1 kHz and 128.5 BPM a tick is not a whole number of frames,
         // so the offset has to come from the frame the new start lands on.
-        let timing = Timing::new(project_model::Tempo::from_bpm(128.5).unwrap(), 44_100);
+        let timing = Timing::constant(project_model::Tempo::from_bpm(128.5).unwrap(), 44_100);
         let start = Tick(3_840);
         let at = timing.frame_of(start);
         for pointer in [3_841u64, 3_900, 4_321, 5_000] {
-            let (new, offset, length) = trim_audio_start(start, 0, 441_000, Tick(pointer), 1, timing);
+            let (new, offset, length) = trim_audio_start(start, 0, 441_000, Tick(pointer), 1, &timing);
             assert_eq!(timing.frame_of(new) - offset, at, "the sound slid when trimmed to {pointer}");
             assert_eq!(timing.frame_of(new) + length, at + 441_000, "the end moved");
         }

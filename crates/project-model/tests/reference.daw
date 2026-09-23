@@ -1,6 +1,6 @@
 {
   "format": "daw-project",
-  "version": 8,
+  "version": 9,
   "next_ids": {
     "track": 2,
     "clip": 2,
@@ -9,7 +9,12 @@
     "bus": 0
   },
   "project": {
-    "tempo": 120000,
+    "tempo_map": [
+      {
+        "at": 0,
+        "tempo": 120000
+      }
+    ],
     "meter": {
       "beats": 4,
       "unit": 4

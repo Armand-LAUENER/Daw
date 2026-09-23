@@ -94,8 +94,8 @@ impl Sources for FileSources {
             // has not read: the tone says so audibly, where silence would look
             // like a track that had quietly gone missing.
             Source::Clips => {
-                let timing = Timing::new(project.tempo(), self.rate);
-                let starts = audio_spans(project, track.id, timing);
+                let timing = Timing::new(project.tempo_map(), self.rate);
+                let starts = audio_spans(project, track.id, &timing);
                 let clips: Vec<_> = starts
                     .iter()
                     .filter_map(|span| {
@@ -111,7 +111,7 @@ impl Sources for FileSources {
                 if !clips.is_empty() {
                     layers.push(Box::new(Lane::new(clips, Arc::clone(&self.clock))));
                 }
-                let notes = note_plan(project, track.id, timing);
+                let notes = note_plan(project, track.id, &timing);
                 if !notes.is_empty() {
                     layers.push(instrument(&track.instrument, notes, Arc::clone(&self.clock), self.sample_rate));
                 }
@@ -795,8 +795,8 @@ impl eframe::App for App {
             // the list.
             let folder = projects::folder().ok();
             let project = self.studio.project();
-            let timing = Timing::new(project.tempo(), self.sources.rate);
-            let position = Position::of(self.transport.clock().position(), timing, project.meter());
+            let timing = Timing::new(project.tempo_map(), self.sources.rate);
+            let position = Position::of(self.transport.clock().position(), &timing, project.meter());
             let bar = Bar {
                 can_undo: self.studio.can_undo(),
                 can_redo: self.studio.can_redo(),
@@ -877,7 +877,7 @@ impl eframe::App for App {
             let project = self.studio.project();
             let cx = editor::Context {
                 theme: &theme,
-                timing: Timing::new(project.tempo(), self.sources.rate),
+                timing: Timing::new(project.tempo_map(), self.sources.rate),
                 playhead: self.transport.clock().position(),
                 keys: self.editor_keys,
             };
@@ -899,7 +899,7 @@ impl eframe::App for App {
                 let peaks = |asset| project.asset(asset).and_then(|a| library.peaks(&a.path));
                 let cx = timeline::Context {
                     theme: &theme,
-                    timing: Timing::new(project.tempo(), self.sources.rate),
+                    timing: Timing::new(project.tempo_map(), self.sources.rate),
                     playhead: self.transport.clock().position(),
                     playing: self.transport.is_playing(),
                     peaks: &peaks,

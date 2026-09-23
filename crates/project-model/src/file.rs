@@ -275,6 +275,13 @@ fn migrate(value: &mut Value, from: u32) -> Result<(), FileError> {
                     track.insert("instrument".into(), json!(Instrument::default()));
                 }
             }
+            // Version 9 let the tempo change during the project: the one tempo
+            // becomes a map with one change, at the start.
+            8 => {
+                let project = project_of(value)?;
+                let tempo = project.remove("tempo").ok_or(FileError::NotAProject)?;
+                project.insert("tempo_map".into(), json!([{ "at": 0, "tempo": tempo }]));
+            }
             // Version 0 never existed: no file was written before the header.
             _ => return Err(FileError::NotAProject),
         }

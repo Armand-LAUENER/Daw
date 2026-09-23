@@ -27,7 +27,7 @@ pub struct AudioSpan {
 
 /// Each audio clip on a track, earliest first: where it starts, and which part
 /// of its file it plays, converted to the engine's rate.
-pub fn audio_spans(project: &Project, track: TrackId, timing: Timing) -> Vec<AudioSpan> {
+pub fn audio_spans(project: &Project, track: TrackId, timing: &Timing) -> Vec<AudioSpan> {
     project
         .placements_on(track)
         .into_iter()
@@ -55,7 +55,7 @@ pub fn audio_spans(project: &Project, track: TrackId, timing: Timing) -> Vec<Aud
 /// At the same frame, offs come before ons. A note repeated back to back on
 /// one pitch then ends and restarts, instead of the new note-on being cut off
 /// by the old note's off.
-pub fn note_plan(project: &Project, track: TrackId, timing: Timing) -> Vec<NoteEvent> {
+pub fn note_plan(project: &Project, track: TrackId, timing: &Timing) -> Vec<NoteEvent> {
     let mut events = Vec::new();
     for placement in project.placements_on(track) {
         let Some(clip) = project.clip(placement.clip) else { continue };
@@ -90,7 +90,7 @@ mod tests {
     const BAR: Tick = Tick(3_840);
     /// 120 BPM at 48 kHz: a beat is 24 000 frames, a bar 96 000.
     fn timing() -> Timing {
-        Timing::new(Tempo::default(), 48_000)
+        Timing::constant(Tempo::default(), 48_000)
     }
 
     fn session_with_clip(notes: &[Note]) -> (Session, TrackId) {
@@ -113,7 +113,7 @@ mod tests {
     fn a_note_lands_where_its_clip_is_placed() {
         // The clip starts at bar 2; its note starts a beat in.
         let (session, track) = session_with_clip(&[Note::new(60, 127, Tick(960), Tick(960))]);
-        let plan = note_plan(session.project(), track, timing());
+        let plan = note_plan(session.project(), track, &timing());
         assert_eq!(frames(&plan), vec![(96_000 + 24_000, true), (96_000 + 48_000, false)]);
         assert!(matches!(plan[0].action, engine_core::NoteAction::On { velocity } if velocity == 1.0));
     }
@@ -123,7 +123,7 @@ mod tests {
         let (mut session, track) = session_with_clip(&[Note::new(60, 100, Tick(0), Tick(960))]);
         let first = session.project().placements_on(track)[0].id;
         session.apply(Command::DuplicatePlacement { id: first, track, start: Tick(BAR.0 * 3), linked: true }).unwrap();
-        let plan = note_plan(session.project(), track, timing());
+        let plan = note_plan(session.project(), track, &timing());
         let ons: Vec<u64> = plan.iter().filter(|e| e.is_on()).map(|e| e.frame).collect();
         assert_eq!(ons, vec![96_000, 288_000]);
     }
@@ -138,7 +138,7 @@ mod tests {
         let window = Some(Window { offset: Tick(480), length: Tick(1_920) });
         session.apply(Command::SetWindow { id, window }).unwrap();
 
-        let plan = note_plan(session.project(), track, timing());
+        let plan = note_plan(session.project(), track, &timing());
         // Placed at bar 2 (96 000); the window's start is what lands there.
         assert_eq!(
             frames(&plan),
@@ -157,7 +157,7 @@ mod tests {
     fn a_repeated_note_ends_before_it_starts_again() {
         let notes = [Note::new(60, 100, Tick(0), Tick(960)), Note::new(60, 100, Tick(960), Tick(960))];
         let (session, track) = session_with_clip(&notes);
-        let plan = note_plan(session.project(), track, timing());
+        let plan = note_plan(session.project(), track, &timing());
         let at_beat = &plan[1..3];
         assert_eq!(at_beat[0].frame, at_beat[1].frame);
         assert!(!at_beat[0].is_on() && at_beat[1].is_on(), "the second note was cut off by the first one's end");
@@ -171,10 +171,10 @@ mod tests {
         let asset = project_model::Asset::new(AssetId::of_bytes(b"a"), "/a.wav");
         session.apply(Command::AddAudioClip { track, asset, start: BAR }).unwrap();
 
-        assert_eq!(audio_spans(session.project(), track, timing())[0].start, 96_000);
-        let faster = Timing::new(Tempo::from_bpm(240.0).unwrap(), 48_000);
+        assert_eq!(audio_spans(session.project(), track, &timing())[0].start, 96_000);
+        let faster = Timing::constant(Tempo::from_bpm(240.0).unwrap(), 48_000);
         assert_eq!(
-            audio_spans(session.project(), track, faster)[0].start,
+            audio_spans(session.project(), track, &faster)[0].start,
             48_000,
             "the clip did not move with the tempo"
         );
@@ -193,7 +193,7 @@ mod tests {
         session.apply(Command::TrimPlacement { id, start: Tick(960), window: None, audio }).unwrap();
 
         // Played at 48 kHz: the same moments of the file.
-        let span = audio_spans(session.project(), track, timing())[0];
+        let span = audio_spans(session.project(), track, &timing())[0];
         assert_eq!((span.start, span.offset, span.length), (24_000, 24_000, Some(48_000)));
     }
 }

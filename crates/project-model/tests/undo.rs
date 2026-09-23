@@ -60,6 +60,11 @@ enum Action {
     BusGain(u8, f32),
     /// A track, a wave, and a sustain over a range wider than the valid one.
     Instrument(u8, u8, f32),
+    /// Tempo changes: added at a beat, retuned, moved and removed by place.
+    AddTempo(u8, u32),
+    RetuneTempo(u8, u32),
+    MoveTempo(u8, u8),
+    RemoveTempo(u8),
 }
 
 /// One of four files, by content. Few enough that tracks keep landing on the
@@ -105,6 +110,10 @@ fn action() -> impl Strategy<Value = Action> {
         2 => (any::<u8>(), any::<u8>(), -0.5f32..1.5).prop_map(|(t, b, l)| Action::Send(t, b, l)),
         1 => (any::<u8>(), -2.0f32..2.0).prop_map(|(b, g)| Action::BusGain(b, g)),
         1 => (any::<u8>(), 0u8..3, -0.5f32..1.5).prop_map(|(t, w, s)| Action::Instrument(t, w, s)),
+        1 => (any::<u8>(), 0u32..1_200_000).prop_map(|(b, t)| Action::AddTempo(b, t)),
+        1 => (0u8..6, 0u32..1_200_000).prop_map(|(i, t)| Action::RetuneTempo(i, t)),
+        1 => (0u8..6, any::<u8>()).prop_map(|(i, b)| Action::MoveTempo(i, b)),
+        1 => (0u8..6).prop_map(Action::RemoveTempo),
     ]
 }
 
@@ -170,6 +179,16 @@ fn to_command(project: &Project, action: &Action) -> Option<Command> {
             }
         }
         Action::AddBus => Command::AddBus { name: "bus".into() },
+        Action::AddTempo(beat, millis) => {
+            let tempo: Tempo = serde_json::from_value(serde_json::json!(millis)).ok()?;
+            Command::AddTempoChange { at: beats(*beat), tempo }
+        }
+        Action::RetuneTempo(index, millis) => {
+            let tempo: Tempo = serde_json::from_value(serde_json::json!(millis)).ok()?;
+            Command::SetTempoChange { index: usize::from(*index), tempo }
+        }
+        Action::MoveTempo(index, beat) => Command::MoveTempoChange { index: usize::from(*index), to: beats(*beat) },
+        Action::RemoveTempo(index) => Command::RemoveTempoChange { index: usize::from(*index) },
         Action::Instrument(t, wave, sustain) => Command::SetInstrument {
             track: pick(*t)?,
             value: project_model::Instrument {

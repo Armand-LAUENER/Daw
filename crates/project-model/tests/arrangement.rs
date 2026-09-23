@@ -267,3 +267,26 @@ fn a_new_bus_is_a_reverb_return() {
     let bus = session.project().buses().next().unwrap();
     assert!(bus.reverb.on && bus.reverb.mix == 1.0, "a new bus should be a fully wet reverb");
 }
+
+#[test]
+fn a_tempo_change_is_added_moved_and_removed_in_place() {
+    let (mut session, _) = with_track();
+    let fast = project_model::Tempo::from_bpm(150.0).unwrap();
+    session.apply(Command::AddTempoChange { at: BAR, tempo: fast }).unwrap();
+    assert_eq!(session.project().tempo_map().tempo_at(BAR), fast);
+    // Not twice on one tick, and never instead of the start.
+    assert!(session.apply(Command::AddTempoChange { at: BAR, tempo: fast }).is_err());
+    assert!(session.apply(Command::RemoveTempoChange { index: 0 }).is_err());
+
+    // A drag of the change is one step, and undo puts it back where it was.
+    let depth = session.depth();
+    for bar in 2..6u64 {
+        session.apply(Command::MoveTempoChange { index: 1, to: Tick(bar * BAR.0) }).unwrap();
+    }
+    assert_eq!(session.depth(), depth + 1);
+    session.undo();
+    assert_eq!(session.project().tempo_map().changes()[1].at, BAR);
+
+    session.apply(Command::RemoveTempoChange { index: 1 }).unwrap();
+    assert_eq!(session.project().tempo_map().changes().len(), 1);
+}

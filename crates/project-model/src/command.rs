@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::history::Ids;
 use crate::{
     Asset, AssetId, AudioWindow, BANDS, Bus, BusId, Clip, ClipId, CompSettings, Content, DelaySettings, EqBand,
-    Instrument, Meter, NewClip, Note, NoteId, Placement, PlacementId, Project, ReverbSettings, Source, Tempo, Tick,
-    Track, TrackId, Window, time,
+    Instrument, Meter, NewClip, Note, NoteId, Placement, PlacementId, Project, ReverbSettings, Source, Tempo, TempoMap,
+    Tick, Track, TrackId, Window, time,
 };
 
 /// A change someone asked for.
@@ -64,6 +64,28 @@ pub enum Command {
     },
     SetMeter {
         meter: Meter,
+    },
+    /// A tempo change from `at` onwards. Refused where there is one already —
+    /// that one is changed instead — and at the start, which always has one.
+    AddTempoChange {
+        at: Tick,
+        tempo: Tempo,
+    },
+    /// The tempo of a change, named by its place in the map; 0 is the start,
+    /// as [`Command::SetTempo`] sets. Dragged, so one step per gesture.
+    SetTempoChange {
+        index: usize,
+        tempo: Tempo,
+    },
+    /// Moves a change, stopping at its neighbours so every change keeps its
+    /// place in the map. The start cannot move.
+    MoveTempoChange {
+        index: usize,
+        to: Tick,
+    },
+    /// The start cannot be removed: something has to hold at 0.
+    RemoveTempoChange {
+        index: usize,
     },
     /// What the track plays. A change of material, not of setting, so it never
     /// folds into a neighbouring gesture.
@@ -234,6 +256,8 @@ impl Command {
             Self::SetPan { id, .. } => Some(Target(1, id.0, 0)),
             Self::SetMasterGain { .. } => Some(Target(2, PROJECT, 0)),
             Self::SetTempo { .. } => Some(Target(3, PROJECT, 0)),
+            Self::SetTempoChange { index, .. } => Some(Target(207, *index as u32, 0)),
+            Self::MoveTempoChange { index, .. } => Some(Target(208, *index as u32, 0)),
             Self::MovePlacement { id, .. } => Some(Target(4, id.0, 0)),
             Self::SetWindow { id, .. } | Self::TrimPlacement { id, .. } => Some(Target(5, id.0, 0)),
             Self::SetNote { id, .. } => Some(Target(6, id.0, 0)),
@@ -253,6 +277,8 @@ impl Command {
             | Self::SetMuted { .. }
             | Self::SetSoloed { .. }
             | Self::SetMeter { .. }
+            | Self::AddTempoChange { .. }
+            | Self::RemoveTempoChange { .. }
             | Self::AddBus { .. }
             | Self::RemoveBus { .. }
             | Self::RenameBus { .. }
@@ -379,8 +405,8 @@ pub(crate) enum Edit {
     SetMasterGain {
         gain: f32,
     },
-    SetTempo {
-        tempo: Tempo,
+    SetTempoMap {
+        map: TempoMap,
     },
     SetMeter {
         meter: Meter,
@@ -534,14 +560,13 @@ pub(crate) fn resolve(project: &Project, ids: &mut Ids, command: Command) -> Res
             finite(gain, "the master gain")?;
             one(Edit::SetMasterGain { gain }, Edit::SetMasterGain { gain: project.master_gain() })
         }
-        Command::SetTempo { tempo } => {
-            if !time::valid(tempo, project.meter()) {
-                return Err(CommandError::OutOfRange("a tempo"));
-            }
-            one(Edit::SetTempo { tempo }, Edit::SetTempo { tempo: project.tempo() })
-        }
+        Command::SetTempo { tempo } => tempo_edit(project, project.tempo_map().with_tempo(0, tempo))?,
+        Command::AddTempoChange { at, tempo } => tempo_edit(project, project.tempo_map().with_change(at, tempo))?,
+        Command::SetTempoChange { index, tempo } => tempo_edit(project, project.tempo_map().with_tempo(index, tempo))?,
+        Command::MoveTempoChange { index, to } => tempo_edit(project, project.tempo_map().with_moved(index, to))?,
+        Command::RemoveTempoChange { index } => tempo_edit(project, project.tempo_map().without(index))?,
         Command::SetMeter { meter } => {
-            if !time::valid(project.tempo(), meter) {
+            if !time::meter_valid(meter) {
                 return Err(CommandError::OutOfRange("a time signature"));
             }
             one(Edit::SetMeter { meter }, Edit::SetMeter { meter: project.meter() })
@@ -925,7 +950,7 @@ fn apply_one(project: &mut Project, edit: &Edit) {
         Edit::SetMuted { id, muted } => on(*id, &mut |t| t.muted = *muted),
         Edit::SetSoloed { id, soloed } => on(*id, &mut |t| t.soloed = *soloed),
         Edit::SetMasterGain { gain } => project.master_gain = *gain,
-        Edit::SetTempo { tempo } => project.tempo = *tempo,
+        Edit::SetTempoMap { map } => project.tempo_map = map.clone(),
         Edit::SetMeter { meter } => project.meter = *meter,
         Edit::SetSource { id, source } => on(*id, &mut |t| t.source = *source),
         Edit::SetCompressor { id, value } => on(*id, &mut |t| t.comp = *value),
@@ -966,6 +991,15 @@ fn apply_one(project: &mut Project, edit: &Edit) {
             }
         }
     }
+}
+
+/// A new tempo map as one edit and its inverse. `None` is a change the map
+/// refused — a change on an occupied tick, the start moved or removed, a
+/// place past its end — and every tempo must be in range.
+fn tempo_edit(project: &Project, map: Option<TempoMap>) -> Result<Resolved, CommandError> {
+    let map = map.filter(TempoMap::is_valid).ok_or(CommandError::OutOfRange("a tempo change"))?;
+    let was = project.tempo_map().clone();
+    Ok((vec![Edit::SetTempoMap { map }], vec![Edit::SetTempoMap { map: was }]))
 }
 
 fn finite(value: f32, what: &'static str) -> Result<(), CommandError> {
