@@ -1,6 +1,6 @@
 {
   "format": "daw-project",
-  "version": 7,
+  "version": 8,
   "next_ids": {
     "track": 2,
     "clip": 2,
@@ -78,7 +78,15 @@
           "damping": 0.5,
           "mix": 0.2
         },
-        "sends": {}
+        "sends": {},
+        "instrument": {
+          "wave": "saw",
+          "attack": 5.0,
+          "decay": 150.0,
+          "sustain": 0.6,
+          "release": 250.0,
+          "level": 0.2
+        }
       },
       "1": {
         "id": 1,
@@ -138,7 +146,15 @@
           "damping": 0.5,
           "mix": 0.2
         },
-        "sends": {}
+        "sends": {},
+        "instrument": {
+          "wave": "saw",
+          "attack": 5.0,
+          "decay": 150.0,
+          "sustain": 0.6,
+          "release": 250.0,
+          "level": 0.2
+        }
       }
     },
     "clips": {

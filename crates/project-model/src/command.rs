@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::history::Ids;
 use crate::{
-    Asset, AssetId, AudioWindow, BANDS, Bus, BusId, Clip, ClipId, CompSettings, Content, DelaySettings, EqBand, Meter,
-    NewClip, Note, NoteId, Placement, PlacementId, Project, ReverbSettings, Source, Tempo, Tick, Track, TrackId,
-    Window, time,
+    Asset, AssetId, AudioWindow, BANDS, Bus, BusId, Clip, ClipId, CompSettings, Content, DelaySettings, EqBand,
+    Instrument, Meter, NewClip, Note, NoteId, Placement, PlacementId, Project, ReverbSettings, Source, Tempo, Tick,
+    Track, TrackId, Window, time,
 };
 
 /// A change someone asked for.
@@ -90,6 +90,12 @@ pub enum Command {
     SetReverb {
         track: TrackId,
         value: ReverbSettings,
+    },
+    /// What a track's MIDI clips are played with. Dragged, so one step per
+    /// gesture.
+    SetInstrument {
+        track: TrackId,
+        value: Instrument,
     },
     /// A new effects bus, a reverb return to begin with.
     AddBus {
@@ -240,6 +246,7 @@ impl Command {
             Self::SetBusEffects { id, .. } => Some(Target(204, id.0, 0)),
             // Two ids: one track's sends to two buses are two controls.
             Self::SetSend { track, bus, .. } => Some(Target(205, track.0, bus.0)),
+            Self::SetInstrument { track, .. } => Some(Target(206, track.0, 0)),
             Self::AddTrack { .. }
             | Self::RemoveTrack { .. }
             | Self::RenameTrack { .. }
@@ -386,6 +393,10 @@ pub(crate) enum Edit {
         id: TrackId,
         band: usize,
         value: EqBand,
+    },
+    SetInstrument {
+        id: TrackId,
+        value: Instrument,
     },
     InsertBus {
         at: usize,
@@ -567,6 +578,13 @@ pub(crate) fn resolve(project: &Project, ids: &mut Ids, command: Command) -> Res
                 return Err(CommandError::OutOfRange("a reverb setting"));
             }
             one(Edit::SetReverb { id, value }, Edit::SetReverb { id, value: was })
+        }
+        Command::SetInstrument { track: id, value } => {
+            let was = track(id)?.instrument;
+            if !value.is_valid() {
+                return Err(CommandError::OutOfRange("an instrument setting"));
+            }
+            one(Edit::SetInstrument { id, value }, Edit::SetInstrument { id, value: was })
         }
         Command::AddBus { name } => {
             let at = project.bus_order.len();
@@ -911,6 +929,7 @@ fn apply_one(project: &mut Project, edit: &Edit) {
         Edit::SetMeter { meter } => project.meter = *meter,
         Edit::SetSource { id, source } => on(*id, &mut |t| t.source = *source),
         Edit::SetCompressor { id, value } => on(*id, &mut |t| t.comp = *value),
+        Edit::SetInstrument { id, value } => on(*id, &mut |t| t.instrument = *value),
         Edit::SetSend { track, bus, level } => on(*track, &mut |t| match level {
             Some(level) => {
                 t.sends.insert(*bus, *level);

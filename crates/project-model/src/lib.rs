@@ -28,6 +28,7 @@ mod eq;
 mod file;
 mod history;
 mod id;
+mod instrument;
 mod time;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,6 +44,7 @@ pub use effects::{CompSettings, DelaySettings, ReverbSettings};
 pub use eq::{BANDS, BandShape, EqBand, default_eq};
 pub use file::FileError;
 pub use history::Session;
+pub use instrument::{Instrument, Wave};
 pub use time::{Meter, PPQ, Tempo, Tick};
 
 /// Which version of the file format this build writes.
@@ -51,7 +53,7 @@ pub use time::{Meter, PPQ, Tempo, Tick};
 /// written. Adding a version to a format that already has files in the wild
 /// means guessing what the unversioned ones were, and that guess is always
 /// wrong for somebody.
-pub const FORMAT_VERSION: u32 = 7;
+pub const FORMAT_VERSION: u32 = 8;
 
 /// Identifies a track for the life of a project.
 ///
@@ -101,6 +103,8 @@ pub struct Track {
     /// How much of the track each bus hears, taken after its fader, pan, mute
     /// and solo — so the track's reverb follows the track.
     pub sends: BTreeMap<BusId, f32>,
+    /// What its MIDI clips are played with.
+    pub instrument: Instrument,
 }
 
 impl Track {
@@ -118,6 +122,7 @@ impl Track {
             delay: DelaySettings::default(),
             reverb: ReverbSettings::default(),
             sends: BTreeMap::new(),
+            instrument: Instrument::default(),
         }
     }
 }
@@ -327,6 +332,9 @@ impl Project {
             }
             if !(track.comp.is_valid() && track.delay.is_valid() && track.reverb.is_valid()) {
                 return Err(Invalid::OutOfRange("an effect's settings"));
+            }
+            if !track.instrument.is_valid() {
+                return Err(Invalid::OutOfRange("an instrument's settings"));
             }
             for (bus, level) in &track.sends {
                 if !self.buses.contains_key(bus) {

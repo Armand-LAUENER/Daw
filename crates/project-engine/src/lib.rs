@@ -387,7 +387,9 @@ pub fn route(bindings: &Bindings, command: &Command) -> Change {
         | Command::SetNote { .. }
         | Command::RemoveNote { .. }
         // Every clip's start is a tick; a new tempo puts it on another frame.
-        | Command::SetTempo { .. } => Change::Rebuild,
+        | Command::SetTempo { .. }
+        // A different instrument is a different synth.
+        | Command::SetInstrument { .. } => Change::Rebuild,
         // Names, and a meter that only changes how bars are counted.
         Command::RenameTrack { .. } | Command::RenameClip { .. } | Command::SetMeter { .. } => Change::Nothing,
         Command::SetGain { id, gain } => aimed(*id, |b| b.gain, *gain),

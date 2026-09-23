@@ -113,7 +113,7 @@ impl Sources for FileSources {
                 }
                 let notes = note_plan(project, track.id, timing);
                 if !notes.is_empty() {
-                    layers.push(instrument(notes, Arc::clone(&self.clock), self.sample_rate));
+                    layers.push(instrument(&track.instrument, notes, Arc::clone(&self.clock), self.sample_rate));
                 }
                 Box::new(Layers(layers))
             }
@@ -139,22 +139,36 @@ const INSTRUMENT_LEVEL: f32 = 0.2;
 
 /// What a MIDI track plays through until tracks can choose an instrument: a
 /// band-limited saw with a short attack and a soft release.
-fn instrument(events: Vec<NoteEvent>, clock: Arc<Clock>, sample_rate: f32) -> Box<dyn Node> {
+fn instrument(
+    settings: &project_model::Instrument,
+    events: Vec<NoteEvent>,
+    clock: Arc<Clock>,
+    sample_rate: f32,
+) -> Box<dyn Node> {
     let scaled = events
         .into_iter()
         .map(|e| match e.action {
-            NoteAction::On { velocity } => NoteEvent::on(e.pitch, velocity * INSTRUMENT_LEVEL, e.frame),
+            NoteAction::On { velocity } => NoteEvent::on(e.pitch, velocity * settings.level, e.frame),
             NoteAction::Off => e,
         })
         .collect();
-    Box::new(Sequencer::new(
-        INSTRUMENT_VOICES,
-        INSTRUMENT_SHAPE,
-        &instrument_envelope(sample_rate),
-        scaled,
-        clock,
+    let envelope = Adsr::new(
+        settings.attack / 1000.0,
+        settings.decay / 1000.0,
+        settings.sustain,
+        settings.release / 1000.0,
         sample_rate,
-    ))
+    );
+    Box::new(Sequencer::new(INSTRUMENT_VOICES, wave(settings.wave), &envelope, scaled, clock, sample_rate))
+}
+
+/// The model's wave as the oscillator knows it.
+fn wave(wave: project_model::Wave) -> Waveform {
+    match wave {
+        project_model::Wave::Sine => Waveform::Sine,
+        project_model::Wave::Saw => Waveform::Saw,
+        project_model::Wave::Square => Waveform::Square,
+    }
 }
 
 const INSTRUMENT_SHAPE: Waveform = Waveform::Saw;

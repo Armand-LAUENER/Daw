@@ -56,6 +56,9 @@ const VERSION_5: &str = include_str!("version_5.daw");
 /// Version 6 as it was written, before effects buses.
 const VERSION_6: &str = include_str!("version_6.daw");
 
+/// Version 7 as it was written, before tracks chose their instrument.
+const VERSION_7: &str = include_str!("version_7.daw");
+
 fn demo() -> Session {
     let mut session = Session::new();
     let kick = Asset::new(AssetId::of_bytes(b"kick"), folder().join("audio").join("kick.wav"));
@@ -206,8 +209,8 @@ fn older_files_open_as_the_project_they_always_were() {
 }
 
 #[test]
-fn versions_3_to_6_open_as_the_same_project() {
-    for (version, text) in [(3, VERSION_3), (4, VERSION_4), (5, VERSION_5), (6, VERSION_6)] {
+fn versions_3_to_7_open_as_the_same_project() {
+    for (version, text) in [(3, VERSION_3), (4, VERSION_4), (5, VERSION_5), (6, VERSION_6), (7, VERSION_7)] {
         let session = Session::from_json(text, Some(&folder())).unwrap();
         assert_eq!(session.project(), demo_v3().project(), "version {version}");
         assert_eq!(session.to_json(Some(&folder())), REFERENCE, "version {version}");

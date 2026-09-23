@@ -8,7 +8,9 @@
 use std::ops::RangeInclusive;
 
 use eframe::egui::{self, RichText, Ui};
-use project_model::{BusId, Command, CompSettings, DelaySettings, PPQ, Project, ReverbSettings, SEND, Tick, TrackId};
+use project_model::{
+    BusId, Command, CompSettings, DelaySettings, Instrument, PPQ, Project, ReverbSettings, SEND, Tick, TrackId, Wave,
+};
 
 use crate::theme::Theme;
 use crate::ui::Actions;
@@ -67,16 +69,35 @@ pub fn show(ui: &mut Ui, project: &Project, strip: Strip, theme: &Theme, actions
     });
     ui.separator();
 
-    let columns = if matches!(strip, Strip::Track(_)) { 4 } else { 3 };
+    // A track also has its instrument, first, and its sends, last.
+    let track = match strip {
+        Strip::Track(id) => project.track(id),
+        Strip::Bus(_) => None,
+    };
     let (mut c, mut d, mut r) = (comp, delay, reverb);
     let mut sealed = false;
-    ui.columns(columns, |cols| {
-        sealed |= compressor(&mut cols[0], &mut c, theme);
-        sealed |= delay_column(&mut cols[1], &mut d, theme, strip);
-        sealed |= reverb_column(&mut cols[2], &mut r, theme);
-        if let Strip::Track(id) = strip {
-            sends(&mut cols[3], project, id, theme, actions);
-        }
+    // Columns of a fixed width, side by side, scrolled sideways when the
+    // window is too narrow for them all — rather than squeezed until their
+    // controls run into each other.
+    egui::ScrollArea::horizontal().show(ui, |ui| {
+        ui.horizontal_top(|ui| {
+            if let Some(t) = track {
+                let mut inst = t.instrument;
+                sealed |= column(ui, |ui| instrument(ui, &mut inst, theme));
+                if inst != t.instrument {
+                    actions.commands.push(Command::SetInstrument { track: t.id, value: inst });
+                }
+            }
+            sealed |= column(ui, |ui| compressor(ui, &mut c, theme));
+            sealed |= column(ui, |ui| delay_column(ui, &mut d, theme, strip));
+            sealed |= column(ui, |ui| reverb_column(ui, &mut r, theme));
+            if let Some(t) = track {
+                column(ui, |ui| {
+                    sends(ui, project, t.id, theme, actions);
+                    false
+                });
+            }
+        });
     });
 
     match strip {
@@ -137,6 +158,20 @@ fn sends(ui: &mut Ui, project: &Project, track: TrackId, theme: &Theme, actions:
     }
 }
 
+/// Width of one column of controls: a label, a slider and its value.
+const COLUMN_WIDTH: f32 = 250.0;
+const SLIDER_WIDTH: f32 = 110.0;
+
+/// A column of controls, `COLUMN_WIDTH` wide. Returns what its contents say.
+fn column(ui: &mut Ui, contents: impl FnOnce(&mut Ui) -> bool) -> bool {
+    ui.allocate_ui(egui::vec2(COLUMN_WIDTH, ui.available_height()), |ui| {
+        ui.set_width(COLUMN_WIDTH);
+        ui.spacing_mut().slider_width = SLIDER_WIDTH;
+        ui.vertical(contents).inner
+    })
+    .inner
+}
+
 /// A labelled slider. Returns whether it moved, and whether it was let go.
 fn slider(
     ui: &mut Ui,
@@ -163,6 +198,27 @@ fn heading(ui: &mut Ui, name: &str, on: &mut bool, theme: &Theme) -> bool {
         ui.label(RichText::new(name).color(colour).strong());
     });
     changed
+}
+
+/// The track's instrument: its wave, its envelope and its level. Played by
+/// the track's MIDI clips; the tone and audio clips are not affected.
+fn instrument(ui: &mut Ui, i: &mut Instrument, theme: &Theme) -> bool {
+    ui.label(RichText::new("Instrument").color(theme.accent).strong());
+    let mut picked = false;
+    ui.horizontal(|ui| {
+        ui.add_sized([64.0, 18.0], egui::Label::new("wave"));
+        for wave in Wave::ALL {
+            picked |= ui.selectable_value(&mut i.wave, wave, wave.name()).clicked();
+        }
+    });
+    let moves = [
+        slider(ui, "attack", &mut i.attack, Instrument::ATTACK, true, " ms"),
+        slider(ui, "decay", &mut i.decay, Instrument::DECAY, true, " ms"),
+        slider(ui, "sustain", &mut i.sustain, Instrument::SUSTAIN, false, ""),
+        slider(ui, "release", &mut i.release, Instrument::RELEASE, true, " ms"),
+        slider(ui, "level", &mut i.level, Instrument::LEVEL, false, ""),
+    ];
+    picked || moves.iter().any(|(_, released)| *released)
 }
 
 /// Each column edits its settings in place and says whether a gesture ended:

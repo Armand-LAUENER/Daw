@@ -58,6 +58,8 @@ enum Action {
     /// below zero removes the send.
     Send(u8, u8, f32),
     BusGain(u8, f32),
+    /// A track, a wave, and a sustain over a range wider than the valid one.
+    Instrument(u8, u8, f32),
 }
 
 /// One of four files, by content. Few enough that tracks keep landing on the
@@ -102,6 +104,7 @@ fn action() -> impl Strategy<Value = Action> {
         1 => any::<u8>().prop_map(Action::RemoveBus),
         2 => (any::<u8>(), any::<u8>(), -0.5f32..1.5).prop_map(|(t, b, l)| Action::Send(t, b, l)),
         1 => (any::<u8>(), -2.0f32..2.0).prop_map(|(b, g)| Action::BusGain(b, g)),
+        1 => (any::<u8>(), 0u8..3, -0.5f32..1.5).prop_map(|(t, w, s)| Action::Instrument(t, w, s)),
     ]
 }
 
@@ -167,6 +170,14 @@ fn to_command(project: &Project, action: &Action) -> Option<Command> {
             }
         }
         Action::AddBus => Command::AddBus { name: "bus".into() },
+        Action::Instrument(t, wave, sustain) => Command::SetInstrument {
+            track: pick(*t)?,
+            value: project_model::Instrument {
+                wave: project_model::Wave::ALL[usize::from(*wave) % 3],
+                sustain: *sustain,
+                ..Default::default()
+            },
+        },
         Action::RemoveBus(b) => Command::RemoveBus { id: bus(*b)? },
         Action::Send(t, b, level) => {
             Command::SetSend { track: pick(*t)?, bus: bus(*b)?, level: (*level >= 0.0).then_some(*level) }

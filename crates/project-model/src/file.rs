@@ -20,7 +20,8 @@ use serde_json::{Value, json};
 
 use crate::history::Ids;
 use crate::{
-    CompSettings, DelaySettings, FORMAT_VERSION, Invalid, Meter, Project, ReverbSettings, Session, Tempo, default_eq,
+    CompSettings, DelaySettings, FORMAT_VERSION, Instrument, Invalid, Meter, Project, ReverbSettings, Session, Tempo,
+    default_eq,
 };
 
 /// What the first field of every project file says, so a JSON file that
@@ -261,6 +262,17 @@ fn migrate(value: &mut Value, from: u32) -> Result<(), FileError> {
                 let tracks = project.get_mut("tracks").and_then(Value::as_object_mut).ok_or(FileError::NotAProject)?;
                 for track in tracks.values_mut().filter_map(Value::as_object_mut) {
                     track.insert("sends".into(), json!({}));
+                }
+            }
+            // Version 8 let each track choose its instrument. A track from
+            // before played the one every track shared, which is the default.
+            7 => {
+                let tracks = project_of(value)?
+                    .get_mut("tracks")
+                    .and_then(Value::as_object_mut)
+                    .ok_or(FileError::NotAProject)?;
+                for track in tracks.values_mut().filter_map(Value::as_object_mut) {
+                    track.insert("instrument".into(), json!(Instrument::default()));
                 }
             }
             // Version 0 never existed: no file was written before the header.
