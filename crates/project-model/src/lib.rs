@@ -45,7 +45,7 @@ pub use eq::{BANDS, BandShape, EqBand, default_eq};
 pub use file::FileError;
 pub use history::Session;
 pub use instrument::{Instrument, Wave};
-pub use time::{Meter, PPQ, Tempo, TempoChange, TempoMap, Tick};
+pub use time::{LoopRegion, Meter, PPQ, Tempo, TempoChange, TempoMap, Tick};
 
 /// Which version of the file format this build writes.
 ///
@@ -53,7 +53,7 @@ pub use time::{Meter, PPQ, Tempo, TempoChange, TempoMap, Tick};
 /// written. Adding a version to a format that already has files in the wild
 /// means guessing what the unversioned ones were, and that guess is always
 /// wrong for somebody.
-pub const FORMAT_VERSION: u32 = 9;
+pub const FORMAT_VERSION: u32 = 10;
 
 /// Identifies a track for the life of a project.
 ///
@@ -136,6 +136,12 @@ pub struct Project {
     tempo_map: TempoMap,
     meter: Meter,
     master_gain: f32,
+    /// Where the transport repeats, when `loop_enabled` is set. Kept even
+    /// while off, so turning the loop on does not lose where it was drawn.
+    loop_region: Option<LoopRegion>,
+    loop_enabled: bool,
+    /// Whether the click sounds on each beat.
+    metronome: bool,
     /// The mixer's order. Every entry names a track in `tracks`, and every
     /// track appears here once.
     track_order: Vec<TrackId>,
@@ -158,6 +164,9 @@ impl Default for Project {
             tempo_map: TempoMap::default(),
             meter: Meter::default(),
             master_gain: 1.0,
+            loop_region: None,
+            loop_enabled: false,
+            metronome: false,
             track_order: Vec::new(),
             tracks: BTreeMap::new(),
             clips: BTreeMap::new(),
@@ -190,6 +199,20 @@ impl Project {
 
     pub fn master_gain(&self) -> f32 {
         self.master_gain
+    }
+
+    /// Where the transport repeats when the loop is on. Kept whether it is on
+    /// or not, so switching it off never loses where it was drawn.
+    pub fn loop_region(&self) -> Option<LoopRegion> {
+        self.loop_region
+    }
+
+    pub fn loop_enabled(&self) -> bool {
+        self.loop_enabled
+    }
+
+    pub fn metronome(&self) -> bool {
+        self.metronome
     }
 
     /// The tracks, in the mixer's order.
@@ -311,6 +334,9 @@ impl Project {
         }
         if !self.master_gain.is_finite() {
             return Err(Invalid::OutOfRange("the master gain"));
+        }
+        if self.loop_region.is_some_and(|r| !r.is_valid()) {
+            return Err(Invalid::OutOfRange("the loop region"));
         }
         if self.track_order.len() != self.tracks.len() {
             return Err(Invalid::Order);

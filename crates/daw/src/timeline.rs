@@ -18,7 +18,8 @@ use eframe::egui::{self, Align2, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, 
 use engine_core::TransportCommand;
 use project_engine::Timing;
 use project_model::{
-    AssetId, AudioWindow, Command, Content, Meter, PPQ, Placement, PlacementId, Project, Tick, TrackId, Window,
+    AssetId, AudioWindow, Command, Content, LoopRegion, Meter, PPQ, Placement, PlacementId, Project, Tick, TrackId,
+    Window,
 };
 
 use crate::peaks::Peaks;
@@ -71,11 +72,21 @@ pub struct View {
     /// A MIDI clip double-clicked, for the note editor to open on.
     pub open: Option<PlacementId>,
     drag: Option<Drag>,
+    /// Where a shift-drag on the ruler started, drawing the loop region.
+    loop_drag_start: Option<Tick>,
 }
 
 impl Default for View {
     fn default() -> Self {
-        Self { pixels_per_beat: 40.0, scroll: 0.0, scroll_y: 0.0, selected: None, open: None, drag: None }
+        Self {
+            pixels_per_beat: 40.0,
+            scroll: 0.0,
+            scroll_y: 0.0,
+            selected: None,
+            open: None,
+            drag: None,
+            loop_drag_start: None,
+        }
     }
 }
 
@@ -125,6 +136,15 @@ pub fn snap(ticks: f64, grid: Option<u64>) -> Tick {
 /// `x` pixels from the lanes' left edge.
 pub fn drop_at(view: &View, x: f32, grab: f64, grid: Option<u64>) -> Tick {
     snap(view.tick_at(x) - grab, grid)
+}
+
+/// The loop region a shift-drag on the ruler is drawing, from where it
+/// started to where the pointer is now — in either order, both snapped to the
+/// beat. `None` while the two ends have not yet parted, so a drag that has not
+/// moved anywhere does not collapse the loop to nothing.
+pub fn loop_drag_region(start: Tick, now: Tick) -> Option<LoopRegion> {
+    let (lo, hi) = (start.min(now), start.max(now));
+    (hi > lo).then_some(LoopRegion { start: lo, end: hi })
 }
 
 /// Which row a point this far below the top of the lanes falls in, clamped to
@@ -348,7 +368,7 @@ pub fn show(ui: &mut Ui, project: &Project, view: &mut View, cx: &Context<'_>, a
         );
     }
 
-    draw_ruler(ui, &painter, view, ruler, meter, cx, actions);
+    draw_ruler(ui, &painter, view, ruler, project, cx, actions);
     tempo_lane(ui, &painter, project, view, tempo, cx.theme, actions);
     draw_headers(&painter.with_clip_rect(headers), project, headers, &tracks, row_top, theme);
 }
@@ -672,16 +692,19 @@ fn keyboard(ui: &Ui, project: &Project, view: &mut View, cx: &Context<'_>, actio
     }
 }
 
+/// The ruler: bar numbers, the playhead's seek gesture, and — held with
+/// shift — the loop region, drawn as a band along its bottom.
 fn draw_ruler(
     ui: &Ui,
     painter: &egui::Painter,
-    view: &View,
+    view: &mut View,
     ruler: Rect,
-    meter: Meter,
+    project: &Project,
     cx: &Context<'_>,
     actions: &mut Actions,
 ) {
     let theme = cx.theme;
+    let meter = project.meter();
     painter.rect_filled(ruler, 0.0, theme.panel);
     let bar = meter.bar_length().0;
     // Label every bar, or every few once they crowd together.
@@ -705,13 +728,57 @@ fn draw_ruler(
         index += every;
     }
 
-    // Clicking or dragging along the ruler moves playback there.
+    // The loop region, along the ruler's bottom edge, lit while it repeats.
+    if let Some(region) = project.loop_region() {
+        let x0 = (ruler.left() + view.x_of(region.start)).clamp(ruler.left(), ruler.right());
+        let x1 = (ruler.left() + view.x_of(region.end)).clamp(ruler.left(), ruler.right());
+        if x1 > x0 {
+            let band = Rect::from_min_max(Pos2::new(x0, ruler.bottom() - 4.0), Pos2::new(x1, ruler.bottom()));
+            let colour = if project.loop_enabled() { theme.accent } else { theme.dim };
+            ruler_painter.rect_filled(band, 0.0, colour);
+        }
+    }
+
+    // Clicking or dragging along the ruler moves playback there; held with
+    // shift, a drag draws the loop region instead — a gesture kept apart from
+    // scrubbing since both would otherwise fight over the same drag.
     let response = ui.interact(ruler, ui.id().with("ruler"), Sense::click_and_drag());
-    if (response.clicked() || response.dragged())
+    let shift = ui.input(|i| i.modifiers.shift);
+    if shift {
+        if response.drag_started()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            view.loop_drag_start = Some(snap(view.tick_at(pos.x - ruler.left()), Some(meter.beat_length().0)));
+        }
+        if response.dragged()
+            && let (Some(start), Some(pos)) = (view.loop_drag_start, response.interact_pointer_pos())
+        {
+            let now = snap(view.tick_at(pos.x - ruler.left()), Some(meter.beat_length().0));
+            if let Some(region) = loop_drag_region(start, now) {
+                actions.commands.push(Command::SetLoopRegion { region: Some(region) });
+                if !project.loop_enabled() {
+                    actions.commands.push(Command::SetLoopEnabled { enabled: true });
+                }
+            }
+        }
+        if response.drag_stopped() {
+            actions.seal = true;
+            view.loop_drag_start = None;
+        }
+    } else if (response.clicked() || response.dragged())
         && let Some(pos) = response.interact_pointer_pos()
     {
         let tick = snap(view.tick_at(pos.x - ruler.left()), None);
         actions.transport = Some(TransportCommand::Seek(cx.timing.frame_of(tick)));
+    }
+    if project.loop_region().is_some() {
+        response.context_menu(|ui| {
+            if ui.button("Clear loop").clicked() {
+                actions.commands.push(Command::SetLoopRegion { region: None });
+                actions.commands.push(Command::SetLoopEnabled { enabled: false });
+                ui.close();
+            }
+        });
     }
 }
 
@@ -868,6 +935,20 @@ mod tests {
         let v = view(40.0, 0.0);
         let at = drop_at(&v, 5.0 * 40.0, 960.0, Some(960));
         assert_eq!(at, Tick(4 * 960));
+    }
+
+    #[test]
+    fn a_loop_drag_spans_from_where_it_started_however_it_is_dragged() {
+        // Dragged forward: the region runs from the start to the pointer.
+        let region = loop_drag_region(Tick(960), Tick(3_840)).unwrap();
+        assert_eq!(region, LoopRegion { start: Tick(960), end: Tick(3_840) });
+        // Dragged backward past where it started: still start before end, not
+        // the order the two ends were visited in.
+        let region = loop_drag_region(Tick(3_840), Tick(960)).unwrap();
+        assert_eq!(region, LoopRegion { start: Tick(960), end: Tick(3_840) });
+        // No distance covered yet: no region to show or send, rather than one
+        // collapsed to nothing that `LoopRegion` itself refuses.
+        assert_eq!(loop_drag_region(Tick(960), Tick(960)), None);
     }
 
     #[test]

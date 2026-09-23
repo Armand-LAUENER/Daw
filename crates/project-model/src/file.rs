@@ -282,6 +282,15 @@ fn migrate(value: &mut Value, from: u32) -> Result<(), FileError> {
                 let tempo = project.remove("tempo").ok_or(FileError::NotAProject)?;
                 project.insert("tempo_map".into(), json!([{ "at": 0, "tempo": tempo }]));
             }
+            // Version 10 gave the project a loop region, on or off, and a
+            // metronome. A project from before had neither: no loop drawn,
+            // both off, which is silent and how it already played.
+            9 => {
+                let project = project_of(value)?;
+                project.insert("loop_region".into(), Value::Null);
+                project.insert("loop_enabled".into(), json!(false));
+                project.insert("metronome".into(), json!(false));
+            }
             // Version 0 never existed: no file was written before the header.
             _ => return Err(FileError::NotAProject),
         }

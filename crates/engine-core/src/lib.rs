@@ -16,6 +16,7 @@ mod eq;
 mod event;
 mod graph;
 mod limiter;
+mod metronome;
 mod node;
 mod note;
 mod sequencer;
@@ -30,11 +31,13 @@ pub use eq::{BandSettings, Eq};
 pub use event::{EventQueue, EventSender, Scheduled, event_channel};
 pub use graph::{Graph, GraphBuilder, GraphError, NodeId};
 pub use limiter::{LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_MS, Limiter};
+pub use metronome::{Click, Metronome};
 pub use node::{Gain, Mute, Node, PARAM_RAMP_MS, Pan, Solo, SoloBus};
 pub use note::{Note, NoteAction, NoteEvent, NoteQueue, NoteSender, PianoRoll, note_channel, pitch_to_hz};
 pub use sequencer::Sequencer;
 pub use swap::{GraphPlayer, GraphSwapper, SWAP_FADE_MS, graph_channel};
 pub use synth::{Patch, PatchQueue, PatchSender, Synth, patch_channel};
 pub use transport::{
-    Clock, TRANSPORT_FADE_MS, Transport, TransportCommand, TransportControl, offline_transport, transport_channel,
+    Clock, Loop, MIN_LOOP_FRAMES, TRANSPORT_FADE_MS, Transport, TransportCommand, TransportControl, offline_transport,
+    transport_channel,
 };

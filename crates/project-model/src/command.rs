@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::history::Ids;
 use crate::{
     Asset, AssetId, AudioWindow, BANDS, Bus, BusId, Clip, ClipId, CompSettings, Content, DelaySettings, EqBand,
-    Instrument, Meter, NewClip, Note, NoteId, Placement, PlacementId, Project, ReverbSettings, Source, Tempo, TempoMap,
-    Tick, Track, TrackId, Window, time,
+    Instrument, LoopRegion, Meter, NewClip, Note, NoteId, Placement, PlacementId, Project, ReverbSettings, Source,
+    Tempo, TempoMap, Tick, Track, TrackId, Window, time,
 };
 
 /// A change someone asked for.
@@ -64,6 +64,20 @@ pub enum Command {
     },
     SetMeter {
         meter: Meter,
+    },
+    /// Where the transport repeats, or `None` to clear it. Dragged, so
+    /// resizing an edge is one step per gesture.
+    SetLoopRegion {
+        region: Option<LoopRegion>,
+    },
+    /// Whether the transport actually repeats the loop region when it plays
+    /// past the end — the region itself is kept either way.
+    SetLoopEnabled {
+        enabled: bool,
+    },
+    /// Whether the click sounds on each beat.
+    SetMetronome {
+        enabled: bool,
     },
     /// A tempo change from `at` onwards. Refused where there is one already —
     /// that one is changed instead — and at the start, which always has one.
@@ -256,6 +270,7 @@ impl Command {
             Self::SetPan { id, .. } => Some(Target(1, id.0, 0)),
             Self::SetMasterGain { .. } => Some(Target(2, PROJECT, 0)),
             Self::SetTempo { .. } => Some(Target(3, PROJECT, 0)),
+            Self::SetLoopRegion { .. } => Some(Target(209, PROJECT, 0)),
             Self::SetTempoChange { index, .. } => Some(Target(207, *index as u32, 0)),
             Self::MoveTempoChange { index, .. } => Some(Target(208, *index as u32, 0)),
             Self::MovePlacement { id, .. } => Some(Target(4, id.0, 0)),
@@ -277,6 +292,8 @@ impl Command {
             | Self::SetMuted { .. }
             | Self::SetSoloed { .. }
             | Self::SetMeter { .. }
+            | Self::SetLoopEnabled { .. }
+            | Self::SetMetronome { .. }
             | Self::AddTempoChange { .. }
             | Self::RemoveTempoChange { .. }
             | Self::AddBus { .. }
@@ -410,6 +427,15 @@ pub(crate) enum Edit {
     },
     SetMeter {
         meter: Meter,
+    },
+    SetLoopRegion {
+        region: Option<LoopRegion>,
+    },
+    SetLoopEnabled {
+        enabled: bool,
+    },
+    SetMetronome {
+        enabled: bool,
     },
     SetSource {
         id: TrackId,
@@ -570,6 +596,18 @@ pub(crate) fn resolve(project: &Project, ids: &mut Ids, command: Command) -> Res
                 return Err(CommandError::OutOfRange("a time signature"));
             }
             one(Edit::SetMeter { meter }, Edit::SetMeter { meter: project.meter() })
+        }
+        Command::SetLoopRegion { region } => {
+            if region.is_some_and(|r| !r.is_valid()) {
+                return Err(CommandError::OutOfRange("a loop region"));
+            }
+            one(Edit::SetLoopRegion { region }, Edit::SetLoopRegion { region: project.loop_region() })
+        }
+        Command::SetLoopEnabled { enabled } => {
+            one(Edit::SetLoopEnabled { enabled }, Edit::SetLoopEnabled { enabled: project.loop_enabled() })
+        }
+        Command::SetMetronome { enabled } => {
+            one(Edit::SetMetronome { enabled }, Edit::SetMetronome { enabled: project.metronome() })
         }
         Command::SetSource { id, source } => {
             let was = track(id)?.source;
@@ -952,6 +990,9 @@ fn apply_one(project: &mut Project, edit: &Edit) {
         Edit::SetMasterGain { gain } => project.master_gain = *gain,
         Edit::SetTempoMap { map } => project.tempo_map = map.clone(),
         Edit::SetMeter { meter } => project.meter = *meter,
+        Edit::SetLoopRegion { region } => project.loop_region = *region,
+        Edit::SetLoopEnabled { enabled } => project.loop_enabled = *enabled,
+        Edit::SetMetronome { enabled } => project.metronome = *enabled,
         Edit::SetSource { id, source } => on(*id, &mut |t| t.source = *source),
         Edit::SetCompressor { id, value } => on(*id, &mut |t| t.comp = *value),
         Edit::SetInstrument { id, value } => on(*id, &mut |t| t.instrument = *value),

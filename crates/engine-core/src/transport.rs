@@ -29,6 +29,18 @@ use rtrb::{Consumer, Producer, RingBuffer};
 /// press of play as late.
 pub const TRANSPORT_FADE_MS: f32 = 5.0;
 
+/// Where the transport repeats, in frames. `start` is always below `end`.
+///
+/// The wrap itself is not faded like a seek: a region is a deliberate,
+/// exact edit, and fading every single pass would be a stutter on anything
+/// played in time, worse than the click a loop point not chosen on a zero
+/// crossing can already make — the same trade-off a tape loop's splice makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Loop {
+    pub start: u64,
+    pub end: u64,
+}
+
 /// The timeline position, as the audio thread last published it.
 ///
 /// Shared between the audio thread, which writes it at the start of each block,
@@ -71,7 +83,16 @@ pub enum TransportCommand {
     Stop,
     /// Moves to a timeline frame, playing or not.
     Seek(u64),
+    /// Where to repeat, or `None` to stop repeating. A region shorter than
+    /// [`MIN_LOOP_FRAMES`] is refused rather than spinning the audio thread
+    /// on a wrap every handful of samples.
+    SetLoop(Option<Loop>),
 }
+
+/// The shortest a loop region may be: below this a wrap would land inside
+/// almost every block, which is real-time work for a region nobody could
+/// hear as a loop rather than a buzz.
+pub const MIN_LOOP_FRAMES: u64 = 480;
 
 /// The control side: asks for changes, and reads where playback is.
 pub struct TransportControl {
@@ -91,7 +112,7 @@ impl TransportControl {
             match command {
                 TransportCommand::Play => self.playing = true,
                 TransportCommand::Pause | TransportCommand::Stop => self.playing = false,
-                TransportCommand::Seek(_) => {}
+                TransportCommand::Seek(_) | TransportCommand::SetLoop(_) => {}
             }
         }
         sent
@@ -119,6 +140,8 @@ pub struct Transport {
     gain: f32,
     /// How far the fade moves per frame.
     step: f32,
+    /// Where playback repeats, if it does.
+    loop_region: Option<Loop>,
 }
 
 /// Opens a transport: the control side, and the side the callback keeps.
@@ -134,6 +157,7 @@ pub fn transport_channel(sample_rate: f32, capacity: usize) -> (TransportControl
         seek: None,
         gain: 0.0,
         step: 1.0 / frames,
+        loop_region: None,
     };
     (TransportControl { tx, clock, playing: false }, transport)
 }
@@ -171,6 +195,9 @@ impl Transport {
                     self.seek = Some(0);
                 }
                 TransportCommand::Seek(frame) => self.seek = Some(frame),
+                TransportCommand::SetLoop(region) => {
+                    self.loop_region = region.filter(|r| r.end > r.start && r.end - r.start >= MIN_LOOP_FRAMES);
+                }
             }
         }
         // Silent already: a jump has nothing to fade through.
@@ -181,6 +208,20 @@ impl Transport {
         }
         self.clock.publish(self.position, self.running());
         self.position
+    }
+
+    /// How many frames may still be rendered before the loop's end, if a
+    /// block starting here would otherwise cross it.
+    ///
+    /// Called after [`Self::begin`] latches this block's position. Clipping
+    /// the render to this keeps the wrap sample-accurate: the alternative
+    /// would be rendering material from beyond the loop and throwing it away,
+    /// which is what every other jump in this transport avoids by fading
+    /// instead — a loop wrap has nothing to fade, so it is cut at the sample
+    /// instead of the millisecond.
+    pub fn frames_until_loop(&self) -> Option<u64> {
+        let region = self.loop_region?;
+        (self.running() && self.position < region.end).then(|| region.end - self.position)
     }
 
     /// Fades the rendered block and moves the timeline past it.
@@ -214,6 +255,16 @@ impl Transport {
 
         if running {
             self.position += frames as u64;
+            // The wrap, not a jump: `frames_until_loop` is what keeps this
+            // landing exactly on `end` in ordinary use, so the modulo below
+            // is a safety net for a loop switched on after the fact, not the
+            // usual path.
+            if let Some(region) = self.loop_region
+                && self.position >= region.end
+            {
+                let length = region.end - region.start;
+                self.position = region.start + (self.position - region.end) % length;
+            }
         }
         if self.gain == 0.0
             && let Some(frame) = self.seek.take()
@@ -338,5 +389,71 @@ mod tests {
             assert_eq!(start, n * 128);
             transport.finish(&mut [0.0; 256], 2);
         }
+    }
+
+    /// One begin/finish pair, clipped to the loop's boundary the way a real
+    /// callback would — the sample-accurate path, not the defensive modulo.
+    fn looped_block(transport: &mut Transport, want: usize) -> u64 {
+        let start = transport.begin();
+        let span = transport.frames_until_loop().map_or(want, |left| want.min(left as usize).max(1));
+        transport.finish(&mut vec![1.0; span * 2], 2);
+        start
+    }
+
+    #[test]
+    fn a_loop_region_repeats_once_the_playhead_reaches_it() {
+        let (mut control, mut transport) = transport_channel(SR, 8);
+        control.send(TransportCommand::Play);
+        control.send(TransportCommand::SetLoop(Some(Loop { start: 1_000, end: 2_000 })));
+
+        // Starting before the region, the first pass plays through it once —
+        // 0 is as legitimate a place to start as any other — and only then
+        // does it start repeating. `want` is bigger than the region so every
+        // pass is clipped by the loop rather than by the caller's own size.
+        let starts: Vec<u64> = (0..5).map(|_| looped_block(&mut transport, 5_000)).collect();
+        assert_eq!(starts[0], 0, "the region skipped what came before it");
+        assert!(starts[1..].iter().all(|&s| s == 1_000), "{starts:?} did not settle on the region's start");
+    }
+
+    #[test]
+    fn the_wrap_lands_on_the_start_even_without_the_caller_clipping_to_it() {
+        // The modulo in `finish` is a safety net: a block that overruns the
+        // region — the loop switched on after the block was already sized,
+        // or simply not clipped by the caller — must not leave the position
+        // stuck past `end`.
+        let (mut control, mut transport) = transport_channel(SR, 8);
+        control.send(TransportCommand::SetLoop(Some(Loop { start: 1_000, end: 1_500 })));
+        control.send(TransportCommand::Seek(1_400));
+        control.send(TransportCommand::Play);
+
+        assert_eq!(transport.begin(), 1_400);
+        transport.finish(&mut vec![1.0; 200 * 2], 2);
+        // 1400 + 200 = 1600, overrunning the 1000..1500 region by 100.
+        assert_eq!(transport.begin(), 1_100);
+    }
+
+    #[test]
+    fn a_region_shorter_than_the_minimum_is_refused() {
+        let (mut control, mut transport) = transport_channel(SR, 8);
+        control.send(TransportCommand::Play);
+        control.send(TransportCommand::SetLoop(Some(Loop { start: 100, end: 100 + MIN_LOOP_FRAMES - 1 })));
+        transport.begin();
+        assert!(transport.frames_until_loop().is_none(), "a too-short region was accepted");
+        // Playback runs straight through where the refused region would have
+        // wrapped it.
+        assert_eq!(block(&mut transport, 1_000).0, 0);
+        assert_eq!(block(&mut transport, 64).0, 1_000);
+    }
+
+    #[test]
+    fn clearing_the_loop_lets_playback_run_on() {
+        let (mut control, mut transport) = transport_channel(SR, 8);
+        control.send(TransportCommand::Play);
+        control.send(TransportCommand::SetLoop(Some(Loop { start: 100, end: 200 })));
+        control.send(TransportCommand::SetLoop(None));
+        transport.begin();
+        assert!(transport.frames_until_loop().is_none(), "clearing the loop left it active");
+        block(&mut transport, 1_000);
+        assert_eq!(block(&mut transport, 64).0, 1_000, "a cleared loop still wrapped the timeline");
     }
 }

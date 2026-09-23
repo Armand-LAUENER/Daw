@@ -8,7 +8,7 @@
 use eframe::egui::{self, RichText, Ui};
 use engine_core::TransportCommand;
 use project_engine::Position;
-use project_model::{Command, Meter, Project, Source, Tempo, TrackId};
+use project_model::{Command, LoopRegion, Meter, Project, Source, Tempo, Tick, TrackId};
 
 use crate::fx_view::Strip;
 use crate::layout::Layout;
@@ -85,11 +85,19 @@ pub struct Bar<'a> {
     pub position: Position,
     pub tempo: Tempo,
     pub meter: Meter,
+    /// Where the transport repeats, drawn on the ruler; `None` until someone
+    /// has drawn one, whether or not it is on.
+    pub loop_region: Option<LoopRegion>,
+    pub loop_enabled: bool,
+    pub metronome: bool,
 }
 
 pub fn top_bar(ui: &mut Ui, theme: &Theme, themes: &[Theme], bar: &Bar<'_>, actions: &mut Actions) {
     let Bar { can_undo, can_redo, project, .. } = *bar;
-    ui.horizontal(|ui| {
+    // Wraps rather than overlapping: the bar already carries a lot, and a
+    // narrower window — or two more buttons — must push the rest to a second
+    // line rather than write over the theme picker at the right edge.
+    ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Daw").color(theme.accent).strong());
         // A dot while there is something to save, as most programs do.
         let title = format!("{}{}", project.unwrap_or("untitled"), if bar.dirty { " ●" } else { "" });
@@ -249,6 +257,23 @@ fn transport(ui: &mut Ui, theme: &Theme, bar: &Bar<'_>, actions: &mut Actions) {
             }
         },
     );
+
+    ui.separator();
+    let loop_button = ui
+        .selectable_label(bar.loop_enabled, "Loop")
+        .on_hover_text("repeat the loop region — drawn by shift-dragging the ruler");
+    if loop_button.clicked() {
+        if !bar.loop_enabled && bar.loop_region.is_none() {
+            // Turning it on with nothing drawn yet must not be a no-op: a
+            // bar at the start, which shift-dragging the ruler then moves.
+            let region = LoopRegion { start: Tick(0), end: bar.meter.bar_length() };
+            actions.commands.push(Command::SetLoopRegion { region: Some(region) });
+        }
+        actions.commands.push(Command::SetLoopEnabled { enabled: !bar.loop_enabled });
+    }
+    if ui.selectable_label(bar.metronome, "Click").on_hover_text("a click on every beat").clicked() {
+        actions.commands.push(Command::SetMetronome { enabled: !bar.metronome });
+    }
 }
 
 pub fn mixer(ui: &mut Ui, project: &Project, theme: &Theme, layout: &Layout, actions: &mut Actions) {

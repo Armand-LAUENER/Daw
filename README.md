@@ -32,7 +32,8 @@ listé dans [`docs/ROADMAP.md`](docs/ROADMAP.md).
 ## Ce que Daw sait faire
 
 - **Arrangement** : clips audio et MIDI sur une timeline, déplacés, rognés,
-  dupliqués en copie ou en clip lié ; waveforms ; tempo map à plusieurs changements.
+  dupliqués en copie ou en clip lié ; waveforms ; tempo map à plusieurs changements ;
+  région de boucle (glisser sur la règle avec Majuscule) et métronome.
 - **MIDI** : éditeur de notes avec vélocité, écoute des notes à l'édition, import de
   `.mid`, un instrument par piste (oscillateur sine/saw/square + ADSR).
 - **Mixage** : volume, pan, mute, solo, EQ paramétrique 4 bandes, compresseur avec
@@ -67,6 +68,7 @@ et des clips.
 | `Ctrl+S` | enregistrer |
 | `Ctrl+D` | dupliquer le clip sélectionné |
 | `Suppr` / `Retour arrière` | supprimer le clip ou la note sélectionnés |
+| `Maj` + glisser sur la règle | dessiner ou redimensionner la région de boucle |
 
 ## Structure
 

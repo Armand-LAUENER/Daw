@@ -254,8 +254,10 @@ fn the_transport_never_allocates() {
     for command in [
         engine_core::TransportCommand::Play,
         engine_core::TransportCommand::Seek(48_000),
+        engine_core::TransportCommand::SetLoop(Some(engine_core::Loop { start: 48_000, end: 96_000 })),
         engine_core::TransportCommand::Pause,
         engine_core::TransportCommand::Play,
+        engine_core::TransportCommand::SetLoop(None),
         engine_core::TransportCommand::Stop,
     ] {
         control.send(command);
@@ -298,6 +300,33 @@ fn the_sequencer_never_allocates_even_when_it_jumps() {
             for _ in 0..8 {
                 transport.begin();
                 sequencer.process(&mut AudioBuffer::new(&mut data, CHANNELS));
+                transport.finish(&mut data, CHANNELS);
+            }
+        });
+    }
+}
+
+#[test]
+fn the_metronome_never_allocates_even_when_it_jumps() {
+    let (mut control, mut transport) = engine_core::transport_channel(SR, 16);
+    let clock = std::sync::Arc::clone(control.clock());
+    let clicks: Vec<engine_core::Click> =
+        (0..200u64).map(|i| engine_core::Click { frame: i * 12_000, accent: i % 4 == 0 }).collect();
+    let mut metronome = engine_core::Metronome::new(clicks, clock, SR);
+    let mut data = vec![0.0f32; MAX_FRAMES * CHANNELS];
+
+    for command in [
+        engine_core::TransportCommand::Play,
+        engine_core::TransportCommand::Seek(500_000),
+        engine_core::TransportCommand::Pause,
+        engine_core::TransportCommand::Play,
+        engine_core::TransportCommand::Stop,
+    ] {
+        control.send(command);
+        assert_no_alloc(|| {
+            for _ in 0..8 {
+                transport.begin();
+                metronome.process(&mut AudioBuffer::new(&mut data, CHANNELS));
                 transport.finish(&mut data, CHANNELS);
             }
         });

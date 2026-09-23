@@ -6,7 +6,9 @@
 //! checked at all. The window is a view over this; this is not a view over the
 //! window.
 
-use engine_core::{Graph, Node, ParamId};
+use std::sync::Arc;
+
+use engine_core::{Clock, Graph, Node, ParamId};
 use project_engine::{Bindings, Change, compile, route};
 use project_model::{Command, CommandError, Project, Session, Track};
 
@@ -42,6 +44,9 @@ pub struct Studio<E: Engine> {
     session: Session,
     bindings: Bindings,
     engine: E,
+    /// The timeline clock the metronome follows. Always given here — the
+    /// studio is only ever the live app's graph, never an offline export's.
+    clock: Arc<Clock>,
     channels: usize,
     max_frames: usize,
     sample_rate: f32,
@@ -52,11 +57,19 @@ pub struct Studio<E: Engine> {
 }
 
 impl<E: Engine> Studio<E> {
-    pub fn new(engine: E, sources: &mut impl Sources, channels: usize, max_frames: usize, sample_rate: f32) -> Self {
+    pub fn new(
+        engine: E,
+        sources: &mut impl Sources,
+        clock: Arc<Clock>,
+        channels: usize,
+        max_frames: usize,
+        sample_rate: f32,
+    ) -> Self {
         let mut studio = Self {
             session: Session::new(),
             bindings: Bindings::default(),
             engine,
+            clock,
             channels,
             max_frames,
             sample_rate,
@@ -176,9 +189,16 @@ impl<E: Engine> Studio<E> {
     }
 
     fn rebuild(&mut self, sources: &mut impl Sources) {
-        let Self { session, channels, max_frames, sample_rate, .. } = self;
+        let Self { session, clock, channels, max_frames, sample_rate, .. } = self;
         let project = session.project();
-        let compiled = compile(project, |track| sources.node_for(project, track), *channels, *max_frames, *sample_rate);
+        let compiled = compile(
+            project,
+            |track| sources.node_for(project, track),
+            Some(&*clock),
+            *channels,
+            *max_frames,
+            *sample_rate,
+        );
         let Ok(compiled) = compiled else {
             // A graph the builder refuses means the project describes routing
             // that cannot run. Keeping the old graph is better than silence.
@@ -258,7 +278,8 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let mut sources = Quiet::default();
-            let studio = Studio::new(Recorder::default(), &mut sources, 2, 512, 48_000.0);
+            let clock = std::sync::Arc::new(engine_core::Clock::new());
+            let studio = Studio::new(Recorder::default(), &mut sources, clock, 2, 512, 48_000.0);
             Self { studio, sources }
         }
 

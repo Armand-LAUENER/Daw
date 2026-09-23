@@ -8,10 +8,41 @@
 //! running counter: a plan stays right however long the program has been open
 //! and wherever playback was started from.
 
-use engine_core::NoteEvent;
+use engine_core::{Click, NoteEvent};
 use project_model::{AssetId, Content, Project, Tick, TrackId};
 
 use crate::Timing;
+
+/// How far ahead the metronome's clicks are worked out: generous for any real
+/// session, and cheap however long it is — this runs once, on the control
+/// side, when the graph is built, never on the audio thread.
+///
+/// A tempo map has no end, so something has to bound the plan; three hours
+/// covers any session this build's tempo range allows in well under a million
+/// clicks. A loop played for longer than that never runs out, since its own
+/// end sits inside the horizon and every pass lands back before it.
+const METRONOME_HORIZON_S: f64 = 3.0 * 3_600.0;
+
+/// Every beat up to [`METRONOME_HORIZON_S`], in frames, with the first beat of
+/// each bar marked for the accent.
+pub fn metronome_clicks(project: &Project, timing: &Timing) -> Vec<Click> {
+    let meter = project.meter();
+    let beat = meter.beat_length();
+    let beats_per_bar = u64::from(meter.beats());
+    let horizon = (METRONOME_HORIZON_S * f64::from(timing.sample_rate)) as u64;
+
+    let mut clicks = Vec::new();
+    let mut index = 0u64;
+    loop {
+        let frame = timing.frame_of(Tick(beat.0 * index));
+        if frame > horizon {
+            break;
+        }
+        clicks.push(Click { frame, accent: index.is_multiple_of(beats_per_bar) });
+        index += 1;
+    }
+    clicks
+}
 
 /// One audio clip on the timeline, in frames at the engine's rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +116,7 @@ pub fn note_plan(project: &Project, track: TrackId, timing: &Timing) -> Vec<Note
 #[cfg(test)]
 mod tests {
     use super::*;
-    use project_model::{Command, Note, Session, Source, Tempo, Window};
+    use project_model::{Command, Meter, Note, Session, Source, Tempo, Window};
 
     const BAR: Tick = Tick(3_840);
     /// 120 BPM at 48 kHz: a beat is 24 000 frames, a bar 96 000.
@@ -161,6 +192,36 @@ mod tests {
         let at_beat = &plan[1..3];
         assert_eq!(at_beat[0].frame, at_beat[1].frame);
         assert!(!at_beat[0].is_on() && at_beat[1].is_on(), "the second note was cut off by the first one's end");
+    }
+
+    #[test]
+    fn a_click_falls_on_every_beat_accenting_the_first_of_each_bar() {
+        let session = Session::new();
+        let clicks = metronome_clicks(session.project(), &timing());
+        let frames: Vec<u64> = clicks[..5].iter().map(|c| c.frame).collect();
+        // 120 BPM, 48 kHz: a beat is 24 000 frames, 4/4 so every fourth is the
+        // first of its bar.
+        assert_eq!(frames, vec![0, 24_000, 48_000, 72_000, 96_000]);
+        let accents: Vec<bool> = clicks[..5].iter().map(|c| c.accent).collect();
+        assert_eq!(accents, vec![true, false, false, false, true]);
+    }
+
+    #[test]
+    fn a_different_meter_accents_its_own_beat() {
+        let mut session = Session::new();
+        session.apply(Command::SetMeter { meter: Meter::new(3, 4).unwrap() }).unwrap();
+        let clicks = metronome_clicks(session.project(), &timing());
+        let accents: Vec<bool> = clicks[..6].iter().map(|c| c.accent).collect();
+        assert_eq!(accents, vec![true, false, false, true, false, false]);
+    }
+
+    #[test]
+    fn the_plan_stays_inside_its_horizon() {
+        let clicks = metronome_clicks(Session::new().project(), &timing());
+        assert!(!clicks.is_empty());
+        assert!(clicks.windows(2).all(|w| w[0].frame < w[1].frame), "the clicks were not strictly increasing");
+        let horizon = (METRONOME_HORIZON_S * f64::from(timing().sample_rate)) as u64;
+        assert!(clicks.last().unwrap().frame <= horizon);
     }
 
     #[test]

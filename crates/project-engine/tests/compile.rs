@@ -23,7 +23,7 @@ impl Node for Constant {
 }
 
 fn build(session: &Session) -> Compiled {
-    compile(session.project(), |_| Box::new(Constant(LEVEL)), CHANNELS, MAX_FRAMES, SR)
+    compile(session.project(), |_| Box::new(Constant(LEVEL)), None, CHANNELS, MAX_FRAMES, SR)
         .expect("a mixer is acyclic by construction")
 }
 
@@ -197,7 +197,7 @@ fn the_master_holds_a_stack_of_tracks_under_the_ceiling() {
     for i in 0..20 {
         session.apply(Command::AddTrack { name: format!("{i}"), source: Source::default(), clip: None }).unwrap();
     }
-    let mut compiled = compile(session.project(), |_| Box::new(Constant(1.0)), CHANNELS, MAX_FRAMES, SR).unwrap();
+    let mut compiled = compile(session.project(), |_| Box::new(Constant(1.0)), None, CHANNELS, MAX_FRAMES, SR).unwrap();
 
     let mut out = vec![0.0f32; MAX_FRAMES * CHANNELS];
     for _ in 0..32 {
@@ -391,4 +391,37 @@ fn a_compressors_reduction_reaches_the_bindings() {
     // A compressor that is off has no meter.
     let plain = build(&with_tracks(1));
     assert_eq!(plain.bindings.reduction(project_engine::Metered::Track(ids(&with_tracks(1))[0])), None);
+}
+
+#[test]
+fn the_metronome_is_only_built_when_a_clock_is_given() {
+    // No clock at all is how an offline export compiles: the click must not
+    // be a stowaway in a bounced file.
+    let session = with_tracks(0);
+    let without = compile(session.project(), |_| Box::new(Constant(LEVEL)), None, CHANNELS, MAX_FRAMES, SR).unwrap();
+    assert!(without.bindings.metronome_muted().is_none());
+
+    let (_control, transport) = engine_core::transport_channel(SR, 8);
+    let with =
+        compile(session.project(), |_| Box::new(Constant(LEVEL)), Some(transport.clock()), CHANNELS, MAX_FRAMES, SR)
+            .unwrap();
+    assert!(with.bindings.metronome_muted().is_some());
+}
+
+#[test]
+fn toggling_the_metronome_reaches_the_graph_without_rebuilding_it() {
+    let session = with_tracks(0);
+    let (_control, transport) = engine_core::transport_channel(SR, 8);
+    let compiled =
+        compile(session.project(), |_| Box::new(Constant(LEVEL)), Some(transport.clock()), CHANNELS, MAX_FRAMES, SR)
+            .unwrap();
+    let change = route(&compiled.bindings, &Command::SetMetronome { enabled: true });
+    assert!(matches!(change, Change::Param { .. }), "{change:?}");
+}
+
+#[test]
+fn a_different_meter_rebuilds_since_the_metronomes_plan_follows_it() {
+    let compiled = build(&with_tracks(0));
+    let meter = project_model::Meter::new(3, 4).unwrap();
+    assert_eq!(route(&compiled.bindings, &Command::SetMeter { meter }), Change::Rebuild);
 }

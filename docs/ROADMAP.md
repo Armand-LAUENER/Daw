@@ -26,7 +26,7 @@ certaines dépendances, et de vrais utilisateurs.
 ## 2. Temps et synchronisation
 - [x] Tempo map en marches, signature, conversion exacte ticks ↔ frames
 - [ ] Rampes de tempo, changements de signature
-- [ ] Marqueurs, région de boucle, punch in/out, métronome et décompte
+- [~] Région de boucle et métronome faits ; marqueurs, punch in/out (demande l'enregistrement, absent) et décompte restent
 - [ ] Swing et groove templates
 - [ ] Ableton Link, MIDI clock in/out, MTC/LTC, synchronisation vidéo
 

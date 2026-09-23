@@ -492,6 +492,38 @@ mod tests {
     }
 
     #[test]
+    fn a_loop_region_drag_folds_into_one_step_and_the_switches_do_not() {
+        use crate::{LoopRegion, Tick};
+
+        let mut session = with_tracks(0);
+        let before = session.project().clone();
+        for end in 1..=10u64 {
+            let region = Some(LoopRegion { start: Tick(0), end: Tick(end * 960) });
+            session.apply(Command::SetLoopRegion { region }).unwrap();
+        }
+        assert_eq!(session.depth(), 1, "resizing the loop left {} steps", session.depth());
+        assert!(session.undo());
+        assert_eq!(session.project(), &before);
+
+        // Turning the loop and the click on and off are decisions, not a drag.
+        session.apply(Command::SetLoopEnabled { enabled: true }).unwrap();
+        session.apply(Command::SetLoopEnabled { enabled: false }).unwrap();
+        session.apply(Command::SetMetronome { enabled: true }).unwrap();
+        assert_eq!(session.depth(), 3);
+    }
+
+    #[test]
+    fn a_loop_region_that_does_not_end_after_it_starts_is_refused() {
+        use crate::{LoopRegion, Tick};
+
+        let mut session = with_tracks(0);
+        let region = Some(LoopRegion { start: Tick(960), end: Tick(960) });
+        assert_eq!(session.apply(Command::SetLoopRegion { region }), Err(CommandError::OutOfRange("a loop region")));
+        let backwards = Some(LoopRegion { start: Tick(960), end: Tick(0) });
+        assert!(session.apply(Command::SetLoopRegion { region: backwards }).is_err());
+    }
+
+    #[test]
     fn undoing_ends_the_gesture_so_a_later_change_is_its_own_step() {
         let mut session = with_tracks(1);
         let id = first(&session);

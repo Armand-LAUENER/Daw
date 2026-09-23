@@ -25,9 +25,9 @@ use std::sync::Arc;
 
 use eframe::egui;
 use engine_core::{
-    AudioBuffer, AutomationSender, Clock, Graph, GraphSwapper, Node, NoteAction, NoteEvent, NoteSender, ParamId, Patch,
-    PatchSender, Sequencer, Synth, TransportCommand, TransportControl, automation_channel, graph_channel, note_channel,
-    offline_transport, patch_channel, transport_channel,
+    AudioBuffer, AutomationSender, Clock, Graph, GraphSwapper, Loop, Node, NoteAction, NoteEvent, NoteSender, ParamId,
+    Patch, PatchSender, Sequencer, Synth, TransportCommand, TransportControl, automation_channel, graph_channel,
+    note_channel, offline_transport, patch_channel, transport_channel,
 };
 use engine_dsp::{Adsr, SineOsc, Waveform};
 use engine_io::{AudioEngine, EngineOptions, Stats, default_output_config, map_frames};
@@ -234,6 +234,10 @@ struct App {
     sources: FileSources,
     /// Play, pause, stop, and where the timeline is.
     transport: TransportControl,
+    /// The loop last sent to the transport, in frames — so a region kept the
+    /// same is not resent every frame, and a tempo or loop change is caught
+    /// however it happened (an edit, an undo, a project opened).
+    sent_loop: Option<Loop>,
     /// Notes heard while editing.
     preview: NoteSender,
     /// Sounds for the notes heard, one per track's instrument.
@@ -309,12 +313,18 @@ impl App {
             let frames = out.len() / channels.max(1);
             let mut done = 0;
             while done < frames {
-                let span = (frames - done).min(MAX_GRAPH_FRAMES);
-                let stereo = &mut mix[..span * GRAPH_CHANNELS];
                 // The timeline position is published before the graph renders,
                 // so every clip in it reads the same one; the fade after it is
                 // what makes a stopped transport silent.
                 timeline.begin();
+                let mut span = (frames - done).min(MAX_GRAPH_FRAMES);
+                // A pass never renders past where a loop would wrap: the wrap
+                // itself is not faded, so the alternative would be rendering
+                // material from beyond it and throwing that away.
+                if let Some(left) = timeline.frames_until_loop() {
+                    span = span.min(left as usize).max(1);
+                }
+                let stereo = &mut mix[..span * GRAPH_CHANNELS];
                 player.process_automated(stereo, &mut queue, frame);
                 timeline.finish(stereo, GRAPH_CHANNELS);
                 // Added after the transport's fade, so it sounds when stopped.
@@ -335,8 +345,14 @@ impl App {
         let stats = Arc::clone(&engine.stats);
         let mut sources =
             FileSources { library: Library::new(), rate, sample_rate, clock: Arc::clone(transport.clock()) };
-        let studio =
-            Studio::new(LiveEngine { params, swapper }, &mut sources, GRAPH_CHANNELS, MAX_GRAPH_FRAMES, sample_rate);
+        let studio = Studio::new(
+            LiveEngine { params, swapper },
+            &mut sources,
+            Arc::clone(transport.clock()),
+            GRAPH_CHANNELS,
+            MAX_GRAPH_FRAMES,
+            sample_rate,
+        );
 
         println!(
             "host {} | device {}\n{} Hz, {} ch, {} | buffer: {}",
@@ -366,6 +382,7 @@ impl App {
             fx_track: None,
             sources,
             transport,
+            sent_loop: None,
             preview,
             patches,
             patched: None,
@@ -565,6 +582,9 @@ impl App {
         let compiled = project_engine::compile(
             project,
             |track| offline.node_for(project, track),
+            // No clock, and so no metronome: an export bounces the music,
+            // never the click that helped someone play it.
+            None,
             GRAPH_CHANNELS,
             MAX_GRAPH_FRAMES,
             self.sources.sample_rate,
@@ -807,6 +827,23 @@ impl App {
             self.transport.send(command);
         }
     }
+
+    /// Keeps the transport's loop in step with the project: its region,
+    /// whether it is on, and the tempo that turns ticks into frames — any of
+    /// which can move where a tick lands. Called once a frame rather than
+    /// wired to particular commands, so an undo or an opened project catches
+    /// it the same as a drag on the ruler.
+    fn sync_loop(&mut self) {
+        let project = self.studio.project();
+        let region = project.loop_enabled().then(|| project.loop_region()).flatten().map(|r| {
+            let timing = Timing::new(project.tempo_map(), self.sources.rate);
+            Loop { start: timing.frame_of(r.start), end: timing.frame_of(r.end) }
+        });
+        if region != self.sent_loop {
+            self.transport.send(TransportCommand::SetLoop(region));
+            self.sent_loop = region;
+        }
+    }
 }
 
 impl App {
@@ -931,6 +968,9 @@ impl eframe::App for App {
                 position,
                 tempo: project.tempo(),
                 meter: project.meter(),
+                loop_region: project.loop_region(),
+                loop_enabled: project.loop_enabled(),
+                metronome: project.metronome(),
             };
             ui::top_bar(ui, &theme, &self.themes, &bar, &mut actions);
         });
@@ -1039,6 +1079,7 @@ impl eframe::App for App {
         self.dialogs(&ctx);
         self.poll_export();
         self.carry_out(actions);
+        self.sync_loop();
         // Anything the engine had no room for is tried again here rather than
         // dropped, so the graph cannot stay out of step with the mixer.
         self.studio.poll(&mut self.sources);

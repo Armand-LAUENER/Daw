@@ -1,6 +1,6 @@
 {
   "format": "daw-project",
-  "version": 9,
+  "version": 10,
   "next_ids": {
     "track": 2,
     "clip": 2,
@@ -20,6 +20,9 @@
       "unit": 4
     },
     "master_gain": 1.0,
+    "loop_region": null,
+    "loop_enabled": false,
+    "metronome": false,
     "track_order": [
       0,
       1

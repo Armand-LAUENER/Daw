@@ -229,6 +229,25 @@ pub(crate) fn meter_valid(meter: Meter) -> bool {
     meter.is_valid()
 }
 
+/// A stretch of the timeline the transport can repeat.
+///
+/// Ticks, like everything else the model places in time: a loop drawn around
+/// two bars stays around those two bars when the tempo changes, instead of
+/// drifting as frames would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopRegion {
+    pub start: Tick,
+    pub end: Tick,
+}
+
+impl LoopRegion {
+    /// Whether this is a region at all: `start` strictly before `end`, so the
+    /// transport always has somewhere to go back to.
+    pub fn is_valid(self) -> bool {
+        self.start < self.end
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

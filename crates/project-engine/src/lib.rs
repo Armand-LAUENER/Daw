@@ -27,8 +27,8 @@ pub use plan::{AudioSpan, audio_spans, note_plan};
 pub use time::{Position, Timing};
 
 use engine_core::{
-    BandSettings, Compress, Echo, Eq, Gain, Graph, GraphBuilder, GraphError, Limiter, Mute, Node, NodeId, Pan, ParamId,
-    ReductionMeter, Room, Solo, SoloBus,
+    BandSettings, Clock, Compress, Echo, Eq, Gain, Graph, GraphBuilder, GraphError, Limiter, Metronome, Mute, Node,
+    NodeId, Pan, ParamId, ReductionMeter, Room, Solo, SoloBus,
 };
 use engine_dsp::{CompressorSettings, Shape};
 use project_model::{BANDS, BandShape, BusId, Command, Project, Track, TrackId};
@@ -82,6 +82,9 @@ pub struct BusBinding {
 #[derive(Debug, Clone, Default)]
 pub struct Bindings {
     master_gain: Option<ParamId>,
+    /// Set only when the graph was built with a clock to follow — never for
+    /// an offline render, which must not carry the click into a bounce.
+    metronome_muted: Option<ParamId>,
     /// The tempo and rate the graph was built at, to turn a delay's ticks
     /// into frames.
     timing: Option<Timing>,
@@ -107,6 +110,10 @@ impl Bindings {
 
     pub fn master_gain(&self) -> Option<ParamId> {
         self.master_gain
+    }
+
+    pub fn metronome_muted(&self) -> Option<ParamId> {
+        self.metronome_muted
     }
 
     pub fn tracks(&self) -> &[TrackBinding] {
@@ -140,10 +147,16 @@ pub struct Compiled {
 /// it has no clips — so the caller decides, which is also what lets the same
 /// project be compiled with real audio in the app and with a test tone here.
 ///
+/// `metronome_clock` is `Some` for a graph that will actually be played —
+/// which is what lets the click follow the timeline — and `None` for an
+/// offline render: an export bounces the music, never the count-in that
+/// helped someone play it.
+///
 /// Runs on the control side: it allocates, and it may fail.
 pub fn compile(
     project: &Project,
     mut source_for: impl FnMut(&Track) -> Box<dyn Node>,
+    metronome_clock: Option<&Arc<Clock>>,
     channels: usize,
     max_frames: usize,
     sample_rate: f32,
@@ -245,12 +258,23 @@ pub fn compile(
         });
     }
 
+    // Before the master's own fader, exactly like a track: a click should
+    // feel the master gain, not sneak around it.
+    let metronome_muted = metronome_clock.map(|clock| {
+        let clicks = plan::metronome_clicks(project, &timing);
+        let click = builder.add(Box::new(Metronome::new(clicks, Arc::clone(clock), sample_rate)));
+        let muted = builder.add(Box::new(Mute::new(!project.metronome(), sample_rate)));
+        builder.connect(click, muted).connect(muted, master);
+        ParamId::new(muted, Mute::PARAM_MUTED)
+    });
+
     let ceiling = builder.add(Box::new(Limiter::new(CEILING, channels, sample_rate)));
     builder.connect(master, ceiling).output(ceiling);
 
     let graph = builder.build(channels, max_frames)?;
     let bindings = Bindings {
         master_gain: Some(ParamId::new(master, Gain::PARAM_GAIN)),
+        metronome_muted,
         timing: Some(timing),
         tracks,
         buses,
@@ -423,9 +447,17 @@ pub fn route(bindings: &Bindings, command: &Command) -> Change {
         | Command::MoveTempoChange { .. }
         | Command::RemoveTempoChange { .. }
         // A different instrument is a different synth.
-        | Command::SetInstrument { .. } => Change::Rebuild,
-        // Names, and a meter that only changes how bars are counted.
-        Command::RenameTrack { .. } | Command::RenameClip { .. } | Command::SetMeter { .. } => Change::Nothing,
+        | Command::SetInstrument { .. }
+        // The metronome's plan is built from the meter: which beat is a
+        // bar's first, and how far apart they fall.
+        | Command::SetMeter { .. } => Change::Rebuild,
+        // Names.
+        Command::RenameTrack { .. } | Command::RenameClip { .. } => Change::Nothing,
+        // The loop region reaches the transport directly, never the graph.
+        Command::SetLoopRegion { .. } | Command::SetLoopEnabled { .. } => Change::Nothing,
+        Command::SetMetronome { enabled } => {
+            bindings.metronome_muted().map_or(Change::Rebuild, |param| Change::Param { param, value: flag(!*enabled) })
+        }
         Command::SetGain { id, gain } => aimed(*id, |b| b.gain, *gain),
         Command::SetPan { id, pan } => aimed(*id, |b| b.pan, pan.clamp(-1.0, 1.0)),
         Command::SetMuted { id, muted } => aimed(*id, |b| b.muted, flag(*muted)),
