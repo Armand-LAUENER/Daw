@@ -18,6 +18,8 @@
 //! movement of a fader would mean a ten-millisecond crossfade per mouse frame.
 //! [`route`] is where that distinction is made, once.
 
+use std::sync::Arc;
+
 mod plan;
 mod time;
 
@@ -26,7 +28,7 @@ pub use time::{Position, Timing};
 
 use engine_core::{
     BandSettings, Compress, Echo, Eq, Gain, Graph, GraphBuilder, GraphError, Limiter, Mute, Node, NodeId, Pan, ParamId,
-    Room, Solo, SoloBus,
+    ReductionMeter, Room, Solo, SoloBus,
 };
 use engine_dsp::{CompressorSettings, Shape};
 use project_model::{BANDS, BandShape, BusId, Command, Project, Track, TrackId};
@@ -87,6 +89,15 @@ pub struct Bindings {
     buses: Vec<BusBinding>,
     /// Each send's level, by track and bus.
     sends: Vec<(TrackId, BusId, ParamId)>,
+    /// The compressors that are on, and how much each is turning down.
+    meters: Vec<(Metered, Arc<ReductionMeter>)>,
+}
+
+/// Whose compressor a meter belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metered {
+    Track(TrackId),
+    Bus(BusId),
 }
 
 impl Bindings {
@@ -104,6 +115,12 @@ impl Bindings {
 
     pub fn bus(&self, id: BusId) -> Option<&BusBinding> {
         self.buses.iter().find(|b| b.id == id)
+    }
+
+    /// How much a compressor is turning down right now, in dB. `None` when
+    /// it is off, or this graph was built before it was switched on.
+    pub fn reduction(&self, of: Metered) -> Option<f32> {
+        self.meters.iter().find(|(m, _)| *m == of).map(|(_, meter)| meter.db())
     }
 
     pub fn send(&self, track: TrackId, bus: BusId) -> Option<ParamId> {
@@ -142,11 +159,15 @@ pub fn compile(
     // for its sends, its effects, its fader and mute, into the master. No
     // solo node: a return stays open when a track is soloed, or soloing a
     // track would take its reverb away.
+    let mut meters = Vec::new();
     let mut buses = Vec::with_capacity(project.buses().len());
     for bus in project.buses() {
         let input = builder.add(Box::new(Gain::new(1.0, sample_rate)));
-        let (last, [comp, delay, reverb]) =
+        let (last, [comp, delay, reverb], meter) =
             effect_chain(&mut builder, input, &bus.comp, &bus.delay, &bus.reverb, true, timing, channels, sample_rate);
+        if let Some(meter) = meter {
+            meters.push((Metered::Bus(bus.id), meter));
+        }
         let gain = builder.add(Box::new(Gain::new(bus.gain, sample_rate)));
         let muted = builder.add(Box::new(Mute::new(bus.muted, sample_rate)));
         builder.connect(last, gain).connect(gain, muted).connect(muted, master);
@@ -176,7 +197,7 @@ pub fn compile(
         let eq = builder.add(Box::new(Eq::new(&bands, channels, sample_rate)));
         builder.connect(source, eq);
         // The effects that are on, in order, after the equaliser.
-        let (last, [comp, delay, reverb]) = effect_chain(
+        let (last, [comp, delay, reverb], meter) = effect_chain(
             &mut builder,
             eq,
             &track.comp,
@@ -187,6 +208,9 @@ pub fn compile(
             channels,
             sample_rate,
         );
+        if let Some(meter) = meter {
+            meters.push((Metered::Track(track.id), meter));
+        }
         let gain = builder.add(Box::new(Gain::new(track.gain, sample_rate)));
         let pan = builder.add(Box::new(Pan::new(track.pan, sample_rate)));
         let muted = builder.add(Box::new(Mute::new(track.muted, sample_rate)));
@@ -231,6 +255,7 @@ pub fn compile(
         tracks,
         buses,
         sends,
+        meters,
     };
     Ok(Compiled { graph: Box::new(graph), bindings })
 }
@@ -249,8 +274,11 @@ fn effect_chain(
     timing: Timing,
     channels: usize,
     sample_rate: f32,
-) -> (NodeId, [Option<NodeId>; 3]) {
-    let comp = comp.on.then(|| builder.add(Box::new(Compress::new(comp_settings(comp), sample_rate))));
+) -> (NodeId, [Option<NodeId>; 3], Option<Arc<ReductionMeter>>) {
+    let meter = comp.on.then(|| Arc::new(ReductionMeter::new()));
+    let comp = meter.as_ref().map(|meter| {
+        builder.add(Box::new(Compress::new(comp_settings(comp), sample_rate).with_meter(Arc::clone(meter))))
+    });
     let delay = delay.on.then(|| {
         let time = timing.frame_of(delay.time) as f32;
         let echo = Echo::new(channels, time, delay.feedback, delay.mix, sample_rate);
@@ -265,7 +293,7 @@ fn effect_chain(
         builder.connect(last, effect);
         last = effect;
     }
-    (last, [comp, delay, reverb])
+    (last, [comp, delay, reverb], meter)
 }
 
 /// How an effect's settings reach the engine: as parameters when it is in the

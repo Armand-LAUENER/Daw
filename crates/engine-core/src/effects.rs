@@ -5,6 +5,9 @@
 //! effect is in the chain at all is not a parameter: switching one on or off
 //! rebuilds the graph, and the swap's crossfade covers the change.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use engine_dsp::{Compressor, CompressorSettings, Delay, Reverb};
 
 use crate::{AudioBuffer, Node};
@@ -30,8 +33,29 @@ fn per_frame(buffer: &mut AudioBuffer<'_>, mut f: impl FnMut(&mut [f32])) {
     }
 }
 
+/// How much a compressor is turning down, in dB, as its audio thread last
+/// saw it. Written once per block, read by whoever draws a meter: an atomic
+/// holding the bits of an `f32`, so neither side waits for the other.
+#[derive(Debug, Default)]
+pub struct ReductionMeter(AtomicU32);
+
+impl ReductionMeter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The largest reduction during the last block, in dB, positive.
+    pub fn db(&self) -> f32 {
+        f32::from_bits(self.0.load(Ordering::Relaxed))
+    }
+
+    fn set(&self, db: f32) {
+        self.0.store(db.to_bits(), Ordering::Relaxed);
+    }
+}
+
 /// A compressor, its channels linked.
-pub struct Compress(Compressor);
+pub struct Compress(Compressor, Option<Arc<ReductionMeter>>);
 
 impl Compress {
     pub const PARAM_THRESHOLD: u32 = 0;
@@ -41,7 +65,13 @@ impl Compress {
     pub const PARAM_MAKEUP: u32 = 4;
 
     pub fn new(settings: CompressorSettings, sample_rate: f32) -> Self {
-        Self(Compressor::new(settings, sample_rate))
+        Self(Compressor::new(settings, sample_rate), None)
+    }
+
+    /// Reports its reduction to `meter` after every block.
+    pub fn with_meter(mut self, meter: Arc<ReductionMeter>) -> Self {
+        self.1 = Some(meter);
+        self
     }
 }
 
@@ -59,14 +89,21 @@ impl Node for Compress {
 
     fn process(&mut self, buffer: &mut AudioBuffer<'_>) {
         let comp = &mut self.0;
+        let mut most = 0.0f32;
         per_frame(buffer, |frame| {
             // The loudest channel decides, so the image does not lean.
             let peak = frame.iter().fold(0.0f32, |m, s| m.max(s.abs()));
             let gain = comp.gain_for(peak);
+            most = most.max(comp.reduction());
             for sample in frame {
                 *sample *= gain;
             }
         });
+        // The block's deepest reduction, not its last: a meter read at 60
+        // frames a second would otherwise miss a transient between reads.
+        if let Some(meter) = &self.1 {
+            meter.set(most);
+        }
     }
 }
 
@@ -164,6 +201,21 @@ mod tests {
         let (left, right) = (data[4_799], data[9_599]);
         assert!(left < 0.8 * 0.5, "the loud side was not reduced: {left}");
         assert!((left / right - 8.0).abs() < 1e-3, "the balance moved: {}", left / right);
+    }
+
+    #[test]
+    fn the_meter_reports_the_reduction() {
+        let settings =
+            CompressorSettings { threshold_db: -20.0, ratio: 4.0, attack_ms: 1.0, release_ms: 50.0, makeup_db: 0.0 };
+        let meter = Arc::new(ReductionMeter::new());
+        let mut node = Compress::new(settings, SR).with_meter(Arc::clone(&meter));
+        let mut quiet = vec![0.01f32; 960];
+        node.process(&mut AudioBuffer::new(&mut quiet, 2));
+        assert_eq!(meter.db(), 0.0, "a quiet signal showed a reduction");
+        let mut loud = vec![0.5f32; 9_600];
+        node.process(&mut AudioBuffer::new(&mut loud, 2));
+        // -6 dBFS, 14 dB over at 4:1: 10.5 dB down once settled.
+        assert!((meter.db() - 10.5).abs() < 0.5, "meter read {}", meter.db());
     }
 
     #[test]

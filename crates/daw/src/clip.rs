@@ -113,9 +113,14 @@ impl Node for Lane {
     fn process(&mut self, buffer: &mut AudioBuffer<'_>) {
         let (frames, channels) = (buffer.frames(), buffer.channels());
         // The buffer arrives silenced, so a clip not playing in this block has
-        // nothing to write. A stopped clock still has a position, and the
-        // transport's fade is what keeps it quiet — this only has to be right
-        // about where each file is.
+        // nothing to write. Nor does anything while the transport is stopped:
+        // the clock stands still, so every block would be the same slice of
+        // the file again — silenced at the output by the transport's fade,
+        // but not before it had filled every delay and reverb downstream with
+        // a buzz that would ring out on the next play.
+        if !self.clock.is_running() {
+            return;
+        }
         let now = self.clock.position();
         let block_end = now + frames as u64;
 
@@ -175,11 +180,27 @@ mod tests {
 
     /// A clock standing at `frame`, and the transport that owns it — kept so
     /// the clock can be moved on.
+    /// A clock standing at `frame`, running as it would while playing.
     fn clock_at(frame: u64) -> (Arc<Clock>, Transport) {
         let (mut control, mut transport) = transport_channel(48_000.0, 4);
         control.send(TransportCommand::Seek(frame));
+        control.send(TransportCommand::Play);
         transport.begin();
         (Arc::clone(control.clock()), transport)
+    }
+
+    #[test]
+    fn a_stopped_transport_sends_nothing_downstream() {
+        // Stopped, the clock stands still: playing the same slice every block
+        // would fill the effects after it with a buzz.
+        let (mut control, mut transport) = transport_channel(48_000.0, 4);
+        control.send(TransportCommand::Seek(0));
+        transport.begin();
+        let mut clip = Lane::new(
+            vec![Played { audio: audio(vec![1.0; 8], 1), start: 0, offset: 0, length: None }],
+            Arc::clone(control.clock()),
+        );
+        assert!(render(&mut clip, 4, 1).iter().all(|s| *s == 0.0), "a stopped lane played its file");
     }
 
     fn render(clip: &mut Lane, frames: usize, channels: usize) -> Vec<f32> {

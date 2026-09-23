@@ -850,10 +850,15 @@ impl eframe::App for App {
             && let Some(track) = self.fx_track
         {
             let project = self.studio.project();
+            let metered = match track {
+                fx_view::Strip::Track(id) => project_engine::Metered::Track(id),
+                fx_view::Strip::Bus(id) => project_engine::Metered::Bus(id),
+            };
+            let reduction = self.studio.bindings().reduction(metered);
             let still_open = egui::Panel::bottom("fx")
                 .resizable(true)
                 .default_size(200.0)
-                .show(root, |ui| fx_view::show(ui, project, track, &theme, &mut actions))
+                .show(root, |ui| fx_view::show(ui, project, track, reduction, &theme, &mut actions))
                 .inner;
             if !still_open {
                 self.fx_track = None;

@@ -372,3 +372,23 @@ fn a_send_level_is_a_parameter_but_a_new_send_is_a_rebuild() {
     let first = Command::SetSend { track: ids(&bare)[0], bus, level: Some(0.3) };
     assert_eq!(route(&compiled.bindings, &first), Change::Rebuild);
 }
+
+#[test]
+fn a_compressors_reduction_reaches_the_bindings() {
+    // The whole path the interface reads: node, meter, bindings.
+    let mut session = with_tracks(1);
+    let id = ids(&session)[0];
+    let comp = project_model::CompSettings { on: true, threshold: -40.0, ratio: 10.0, ..Default::default() };
+    session.apply(Command::SetCompressor { track: id, value: comp }).unwrap();
+    let mut compiled = build(&session);
+    let metered = project_engine::Metered::Track(id);
+    assert_eq!(compiled.bindings.reduction(metered), Some(0.0), "a meter before any audio should read nothing");
+    settled(&mut compiled, 100);
+    let reduction = compiled.bindings.reduction(metered).unwrap();
+    // The test source sits about 10 dB down, 30 over the threshold at 10:1.
+    assert!(reduction > 20.0, "the meter read {reduction} dB");
+
+    // A compressor that is off has no meter.
+    let plain = build(&with_tracks(1));
+    assert_eq!(plain.bindings.reduction(project_engine::Metered::Track(ids(&with_tracks(1))[0])), None);
+}

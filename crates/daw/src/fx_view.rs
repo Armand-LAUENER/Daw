@@ -42,7 +42,16 @@ pub enum Strip {
 }
 
 /// Draws the effects of a track or a bus. Returns false once it should close.
-pub fn show(ui: &mut Ui, project: &Project, strip: Strip, theme: &Theme, actions: &mut Actions) -> bool {
+/// `reduction` is how much the compressor is turning down right now, in dB,
+/// when it is on and playing.
+pub fn show(
+    ui: &mut Ui,
+    project: &Project,
+    strip: Strip,
+    reduction: Option<f32>,
+    theme: &Theme,
+    actions: &mut Actions,
+) -> bool {
     let (name, comp, delay, reverb) = match strip {
         Strip::Track(id) => match project.track(id) {
             Some(t) => (t.name.clone(), t.comp, t.delay, t.reverb),
@@ -88,7 +97,7 @@ pub fn show(ui: &mut Ui, project: &Project, strip: Strip, theme: &Theme, actions
                     actions.commands.push(Command::SetInstrument { track: t.id, value: inst });
                 }
             }
-            sealed |= column(ui, |ui| compressor(ui, &mut c, theme));
+            sealed |= column(ui, |ui| compressor(ui, &mut c, reduction, theme));
             sealed |= column(ui, |ui| delay_column(ui, &mut d, theme, strip));
             sealed |= column(ui, |ui| reverb_column(ui, &mut r, theme));
             if let Some(t) = track {
@@ -221,11 +230,32 @@ fn instrument(ui: &mut Ui, i: &mut Instrument, theme: &Theme) -> bool {
     picked || moves.iter().any(|(_, released)| *released)
 }
 
+/// How much the compressor is turning down: a bar growing from the right,
+/// as gain reduction is drawn on hardware, over 24 dB.
+fn reduction_meter(ui: &mut Ui, db: f32, theme: &Theme) {
+    const RANGE_DB: f32 = 24.0;
+    ui.horizontal(|ui| {
+        ui.add_sized([64.0, 14.0], egui::Label::new("reduction"));
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(SLIDER_WIDTH, 10.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 2.0, theme.control);
+        let fraction = (db / RANGE_DB).clamp(0.0, 1.0);
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(rect.right() - rect.width() * fraction, rect.top()),
+            rect.right_bottom(),
+        );
+        ui.painter().rect_filled(bar, 2.0, theme.soloed);
+        ui.label(RichText::new(format!("-{db:.1} dB")).monospace().small().color(theme.dim));
+    });
+}
+
 /// Each column edits its settings in place and says whether a gesture ended:
 /// a switch or a pick is a decision of its own, sealed at once; a slider
 /// seals when it is let go.
-fn compressor(ui: &mut Ui, c: &mut CompSettings, theme: &Theme) -> bool {
+fn compressor(ui: &mut Ui, c: &mut CompSettings, reduction: Option<f32>, theme: &Theme) -> bool {
     let toggled = heading(ui, "Compressor", &mut c.on, theme);
+    if let Some(db) = reduction {
+        reduction_meter(ui, db, theme);
+    }
     let moves = [
         slider(ui, "threshold", &mut c.threshold, CompSettings::THRESHOLD, false, " dB"),
         slider(ui, "ratio", &mut c.ratio, CompSettings::RATIO, true, ":1"),

@@ -71,6 +71,11 @@ impl<E: Engine> Studio<E> {
         self.session.project()
     }
 
+    /// Where the playing graph's controls and meters are.
+    pub fn bindings(&self) -> &Bindings {
+        &self.bindings
+    }
+
     /// The project with its history, for saving.
     pub fn session(&self) -> &Session {
         &self.session
