@@ -25,7 +25,9 @@ use crate::peaks::Peaks;
 pub type Shared = Arc<DecodedAudio>;
 
 /// Files already read, so a rebuild costs nothing.
-#[derive(Debug, Default)]
+/// Cloning shares the decoded audio: an export renders from the same files
+/// the live graph plays, without reading them again.
+#[derive(Debug, Default, Clone)]
 pub struct Library {
     entries: Vec<(PathBuf, Shared, Arc<Peaks>)>,
 }

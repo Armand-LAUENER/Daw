@@ -138,7 +138,25 @@ pub fn transport_channel(sample_rate: f32, capacity: usize) -> (TransportControl
     (TransportControl { tx, clock, playing: false }, transport)
 }
 
+/// A transport for rendering offline: playing from the first frame at full
+/// level, with nobody to ask it anything.
+///
+/// No fade in: a live start fades so a press of play does not click, but a
+/// render starts before any sound, and fading would clip the attack of
+/// whatever begins at zero.
+pub fn offline_transport(sample_rate: f32) -> Transport {
+    let (_control, mut transport) = transport_channel(sample_rate, 1);
+    transport.wanted = true;
+    transport.gain = 1.0;
+    transport
+}
+
 impl Transport {
+    /// The clock this transport publishes to, for the nodes that follow it.
+    pub fn clock(&self) -> &Arc<Clock> {
+        &self.clock
+    }
+
     /// Takes in what was asked for and publishes where this block starts.
     ///
     /// Called before the graph renders the block, so every node reading the
@@ -224,6 +242,16 @@ mod tests {
         let mut data = vec![1.0; frames * 2];
         transport.finish(&mut data, 2);
         (start, data)
+    }
+
+    #[test]
+    fn an_offline_transport_plays_from_the_first_frame_at_full_level() {
+        let mut transport = offline_transport(SR);
+        let (start, data) = block(&mut transport, 64);
+        assert_eq!(start, 0);
+        assert!(data.iter().all(|&s| s == 1.0), "an offline render faded in");
+        assert_eq!(block(&mut transport, 64).0, 64);
+        assert!(transport.clock().is_running());
     }
 
     #[test]

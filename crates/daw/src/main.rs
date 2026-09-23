@@ -9,6 +9,7 @@
 mod clip;
 mod editor;
 mod eq_view;
+mod export;
 mod fx_view;
 mod import;
 mod layout;
@@ -26,7 +27,7 @@ use eframe::egui;
 use engine_core::{
     AudioBuffer, AutomationSender, Clock, Graph, GraphSwapper, Node, NoteAction, NoteEvent, NoteSender, ParamId, Patch,
     PatchSender, Sequencer, Synth, TransportCommand, TransportControl, automation_channel, graph_channel, note_channel,
-    patch_channel, transport_channel,
+    offline_transport, patch_channel, transport_channel,
 };
 use engine_dsp::{Adsr, SineOsc, Waveform};
 use engine_io::{AudioEngine, EngineOptions, Stats, default_output_config, map_frames};
@@ -252,6 +253,10 @@ struct App {
     naming: Option<String>,
     /// Closing was agreed to: the next close request goes through.
     closing: bool,
+    /// The export window's name and format, while it is up.
+    export_dialog: Option<(String, export::Format)>,
+    /// An export rendering in the background.
+    exporting: Option<export::Job>,
     /// Where the project was last saved or opened from. `None` until then,
     /// and the first save picks a name.
     project_path: Option<PathBuf>,
@@ -370,6 +375,8 @@ impl App {
             confirm: None,
             naming: None,
             closing: false,
+            export_dialog: None,
+            exporting: None,
             project_path: None,
             stats,
             _engine: engine,
@@ -524,6 +531,68 @@ impl App {
         }
     }
 
+    /// Renders the project to a WAV file beside it, on a thread of its own.
+    ///
+    /// The graph is compiled here like the live one, from the same decoded
+    /// files, but follows an offline transport: it plays from the first frame
+    /// as fast as the machine allows, whatever the live transport is doing.
+    fn export(&mut self, typed: &str, format: export::Format) {
+        let Some(stem) = projects::safe_stem(typed) else {
+            return self.report("an export needs a name".into());
+        };
+        let folder = match self.project_path.as_deref().and_then(Path::parent) {
+            Some(folder) => folder.to_path_buf(),
+            None => match projects::folder() {
+                Ok(folder) => folder,
+                Err(e) => return self.report(format!("cannot choose where to export: {e}")),
+            },
+        };
+        let path = folder.join(format!("{stem}.wav"));
+
+        let rate = self.sources.rate;
+        let transport = offline_transport(self.sources.sample_rate);
+        let mut offline = FileSources {
+            library: self.sources.library.clone(),
+            rate,
+            sample_rate: self.sources.sample_rate,
+            clock: Arc::clone(transport.clock()),
+        };
+        let project = self.studio.project();
+        let end = export::content_end(project, &Timing::new(project.tempo_map(), rate), &offline.library);
+        if end == 0 {
+            return self.report("nothing is placed on the timeline to export".into());
+        }
+        let compiled = project_engine::compile(
+            project,
+            |track| offline.node_for(project, track),
+            GRAPH_CHANNELS,
+            MAX_GRAPH_FRAMES,
+            self.sources.sample_rate,
+        );
+        match compiled {
+            Ok(compiled) => {
+                println!("exporting {}", path.display());
+                self.exporting = Some(export::Job::start(compiled.graph, transport, end, 1_024, rate, path, format));
+            }
+            Err(e) => self.report(format!("cannot build the export: {e:?}")),
+        }
+    }
+
+    /// Picks up an export that has finished, and says how it went.
+    fn poll_export(&mut self) {
+        let Some(job) = self.exporting.as_mut() else { return };
+        let Some(result) = job.finished() else { return };
+        let path = job.path.clone();
+        self.exporting = None;
+        match result {
+            Ok(()) => {
+                println!("exported {}", path.display());
+                self.trouble = Some(format!("exported to {}", path.display()));
+            }
+            Err(e) => self.report(format!("{}: {e}", path.display())),
+        }
+    }
+
     /// Whether the project has changed since it was last saved or opened.
     fn dirty(&self) -> bool {
         self.studio.session().revision() != self.saved_revision
@@ -599,6 +668,33 @@ impl App {
             }
         }
 
+        if let Some((mut name, mut format)) = self.export_dialog.take() {
+            let mut keep = true;
+            let mut go = false;
+            egui::Window::new("Export")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("A WAV file, beside the project:");
+                    ui.text_edit_singleline(&mut name);
+                    ui.horizontal(|ui| {
+                        for option in export::Format::ALL {
+                            ui.selectable_value(&mut format, option, option.name());
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        go |= ui.button("Export").clicked();
+                        keep &= !ui.button("Cancel").clicked();
+                    });
+                });
+            if go {
+                self.export(&name, format);
+            } else if keep {
+                self.export_dialog = Some((name, format));
+            }
+        }
+
         if let Some(mut name) = self.naming.take() {
             let mut keep = true;
             let mut save = false;
@@ -666,6 +762,10 @@ impl App {
             let current =
                 self.project_path.as_deref().and_then(Path::file_stem).map(|n| n.to_string_lossy().into_owned());
             self.naming = Some(current.unwrap_or_default());
+        }
+        if actions.export && self.exporting.is_none() {
+            let name = self.project_path.as_deref().and_then(Path::file_stem).map(|n| n.to_string_lossy().into_owned());
+            self.export_dialog = Some((name.unwrap_or_else(|| "untitled".into()), export::Format::Pcm24));
         }
         if let Some(path) = actions.open {
             self.request(Pending::Open(path));
@@ -825,6 +925,7 @@ impl eframe::App for App {
                 project: name.as_deref(),
                 dirty: self.dirty(),
                 folder: folder.as_deref(),
+                exporting: self.exporting.as_ref().map(export::Job::fraction),
                 arrange: self.arrange,
                 playing: self.transport.is_playing(),
                 position,
@@ -936,6 +1037,7 @@ impl eframe::App for App {
         });
 
         self.dialogs(&ctx);
+        self.poll_export();
         self.carry_out(actions);
         // Anything the engine had no room for is tried again here rather than
         // dropped, so the graph cannot stay out of step with the mixer.
@@ -944,7 +1046,7 @@ impl eframe::App for App {
         // The status strip reads counters the audio thread keeps moving, so the
         // window has to come back even when nobody touches it.
         // Faster while playing, so the counter moves smoothly.
-        let busy = self.transport.clock().is_running() || !self.releases.is_empty();
+        let busy = self.transport.clock().is_running() || !self.releases.is_empty() || self.exporting.is_some();
         let every = if busy { 30 } else { 200 };
         ctx.request_repaint_after(std::time::Duration::from_millis(every));
     }

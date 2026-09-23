@@ -48,6 +48,8 @@ pub struct Actions {
     pub open: Option<std::path::PathBuf>,
     /// A new, empty project was asked for.
     pub new_project: bool,
+    /// The export window was asked for.
+    pub export: bool,
     /// Play, pause, stop or seek. Not a [`Command`]: where the playhead is
     /// belongs to the engine, not to the project, and never enters the history.
     pub transport: Option<TransportCommand>,
@@ -74,6 +76,8 @@ pub struct Bar<'a> {
     pub dirty: bool,
     /// The projects folder, for the Open menu.
     pub folder: Option<&'a std::path::Path>,
+    /// How far an export has got, 0 to 1, while one runs.
+    pub exporting: Option<f32>,
     /// Whether the arrangement is showing, rather than the mixer.
     pub arrange: bool,
     /// Whether play was the last thing asked of the transport.
@@ -124,6 +128,21 @@ pub fn top_bar(ui: &mut Ui, theme: &Theme, themes: &[Theme], bar: &Bar<'_>, acti
         }
         if ui.button("Save as…").clicked() {
             actions.save_as = true;
+        }
+        match bar.exporting {
+            // One at a time: the button waits for the one running.
+            Some(fraction) => {
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .desired_width(90.0)
+                        .text(format!("export {:.0}%", fraction * 100.0)),
+                );
+            }
+            None => {
+                if ui.button("Export").on_hover_text("render the song to a WAV file").clicked() {
+                    actions.export = true;
+                }
+            }
         }
 
         if ui.add_enabled(can_undo, egui::Button::new("Undo")).clicked() {

@@ -50,14 +50,20 @@ pub fn list(folder: &Path) -> Vec<Listed> {
     found
 }
 
-/// A file name from what a person typed: letters, digits, spaces, dashes and
-/// underscores kept, anything a file system might refuse replaced by a dash.
-/// `None` when nothing usable is left.
+/// A project file name from what a person typed. `None` when nothing
+/// usable is left.
 pub fn file_name(typed: &str) -> Option<String> {
+    safe_stem(typed).map(|stem| format!("{stem}.{EXTENSION}"))
+}
+
+/// What a person typed, made safe to name a file with: letters, digits,
+/// spaces, dashes and underscores kept, anything a file system might refuse
+/// replaced by a dash. `None` when nothing usable is left.
+pub fn safe_stem(typed: &str) -> Option<String> {
     let cleaned: String =
         typed.trim().chars().map(|c| if c.is_alphanumeric() || " -_".contains(c) { c } else { '-' }).collect();
     let cleaned = cleaned.trim_matches(|c: char| c == '-' || c.is_whitespace()).to_string();
-    (!cleaned.is_empty()).then(|| format!("{cleaned}.{EXTENSION}"))
+    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 /// `untitled.daw`, or the first `untitled-N.daw` that does not exist yet, so

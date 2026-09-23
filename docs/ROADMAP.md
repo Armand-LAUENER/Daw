@@ -16,7 +16,7 @@ certaines dépendances, et de vrais utilisateurs.
 - [x] Callback temps réel sans allocation ni verrou, échange de graphe crossfadé, automation au sample près
 - [ ] Traitement multicœur du graphe (branches indépendantes en parallèle, work-stealing)
 - [ ] Compensation de latence (PDC) sur tous les chemins
-- [~] Moteur de rendu hors temps réel, plus rapide que le temps réel et déterministe (export, freeze, bounce)
+- [x] Moteur de rendu hors temps réel, plus rapide que le temps réel et déterministe (export ; freeze et bounce à venir)
 - [ ] Streaming disque des longs fichiers au lieu d'un décodage complet
 - [ ] Pilotes ASIO (Windows), CoreAudio (macOS), JACK / PipeWire (Linux) ; changement de périphérique et de buffer à chaud, hot-plug
 - [ ] Entrées audio, monitoring, compensation de latence d'enregistrement
@@ -106,7 +106,7 @@ certaines dépendances, et de vrais utilisateurs.
 - [ ] Accessibilité, localisation, HiDPI
 
 ## 13. Export
-- [~] WAV (16 bits avec dither, 24 bits, 32 bits flottant), rendu hors temps réel
+- [x] WAV (16 bits avec dither TPDF, 24 bits, 32 bits flottant), rendu hors temps réel en arrière-plan
 - [ ] AIFF, FLAC, MP3, AAC ; normalisation LUFS
 - [ ] Stems, multipiste, export d'une région
 

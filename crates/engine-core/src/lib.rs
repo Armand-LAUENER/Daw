@@ -35,4 +35,6 @@ pub use note::{Note, NoteAction, NoteEvent, NoteQueue, NoteSender, PianoRoll, no
 pub use sequencer::Sequencer;
 pub use swap::{GraphPlayer, GraphSwapper, SWAP_FADE_MS, graph_channel};
 pub use synth::{Patch, PatchQueue, PatchSender, Synth, patch_channel};
-pub use transport::{Clock, TRANSPORT_FADE_MS, Transport, TransportCommand, TransportControl, transport_channel};
+pub use transport::{
+    Clock, TRANSPORT_FADE_MS, Transport, TransportCommand, TransportControl, offline_transport, transport_channel,
+};
