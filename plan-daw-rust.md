@@ -247,6 +247,12 @@ Chargement d'au moins un plugin VST3 ou CLAP réel, traitement audio à travers 
 
 ---
 
+## Roadmap complète
+
+La liste technique de ce qui sépare Daw d'un DAW professionnel, domaine par domaine, est dans [`docs/ROADMAP.md`](docs/ROADMAP.md). Ce plan en garde l'ordre de travail.
+
+---
+
 ## Ordre révisé (2026-09-22)
 
 Les phases 0 à 3 sont faites et validées sur matériel ; la 4 est entamée et utilisable. L'ordre du plan d'origine tenait pour un projet qu'on n'avait pas encore commencé. Ce qu'on sait maintenant le change sur deux points.
